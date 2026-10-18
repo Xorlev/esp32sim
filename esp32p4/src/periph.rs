@@ -1,0 +1,672 @@
+//! ESP32-P4 peripherals.
+//!
+//! One `device_set!` table with BASE 0, so a block number is the top 20 bits of its address:
+//! `0x500ca` is UART0 at 0x500CA000, `0x20800` the CLIC at 0x20800000. Base addresses are IDF
+//! v5.5.3 components/soc/esp32p4/register/hw_ver1/soc/reg_base.h and include/soc/clic_reg.h.
+//! The shared models (UART, USB-Serial/JTAG, systimer, timer groups, SPI flash controller,
+//! efuse) come from `esp-periph`; the chip-only blocks are written here.
+
+use emu_core::{ClockDomain, ClockTree};
+use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Misc, RegRam, WriteEffect};
+use esp_periph::{Efuse, Gpio, Rng, Sha, SpiMem, Systimer, TimerGroup, Uart, UartLayout, UsbSerialJtag};
+use esp_periph::{RST_POWERON, RST_SW_CPU, RST_SW_SYS};
+
+/// The emulator's time base: the rev < 3 application clock, CPLL 360 MHz
+/// (IDF v5.5.3 sdkconfig CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360). One instruction is one cycle.
+pub const CPU_HZ: u64 = 360_000_000;
+
+/// Interrupt sources, numbered as IDF v5.5.3 components/soc/esp32p4/include/soc/interrupts.h
+/// numbers them; the interrupt matrix has one map register per source at 4 * n
+/// (register/hw_ver1/soc/interrupt_core0_reg.h). rev < 3 has 128 sources.
+pub mod src {
+    pub const USB_SERIAL_JTAG: usize = 22;
+    pub const UART0: usize = 31; pub const UART1: usize = 32;
+    pub const TG0_T0: usize = 46; pub const TG0_T1: usize = 47;
+    pub const TG1_T0: usize = 49; pub const TG1_T1: usize = 50;
+    pub const SYSTIMER_TARGET0: usize = 53;
+    pub const GPIO_INTR0: usize = 74;
+    /// HP_SYSTEM_CPU_INT_FROM_CPU_0..3: the FreeRTOS yield and the IPC interrupts
+    pub const FROM_CPU0: usize = 79;
+    pub const COUNT: usize = 128;
+    /// The name IDF gives a source, for diagnostics.
+    pub fn name(s: usize) -> &'static str {
+        match s {
+            USB_SERIAL_JTAG => "USB_SERIAL_JTAG", UART0 => "UART0", UART1 => "UART1", TG0_T0 => "TG0_T0", TG0_T1 => "TG0_T1",
+            TG1_T0 => "TG1_T0", TG1_T1 => "TG1_T1", 53 => "SYSTIMER_TARGET0", 54 => "SYSTIMER_TARGET1", 55 => "SYSTIMER_TARGET2",
+            GPIO_INTR0 => "GPIO_INTR0", 79 => "FROM_CPU_INTR0", 80 => "FROM_CPU_INTR1", 81 => "FROM_CPU_INTR2", 82 => "FROM_CPU_INTR3",
+            _ => "?",
+        }
+    }
+}
+
+/// Consecutive RNG_DATA reads after which the spin is reported.
+const RNG_SPIN_REPORT: u32 = 1 << 16;
+
+/// CLIC interrupt IDs: 0-15 are the core's own, IDF's CPU interrupt lines 0-31 are IDs 16-47
+/// (IDF v5.5.3 include/soc/clic_reg.h CLIC_EXT_INTR_NUM_OFFSET, hal/include/hal/interrupt_clic_ll.h).
+pub const CLIC_IDS: usize = 48;
+pub const CLIC_EXT_OFFSET: u32 = 16;
+
+/// The two interrupt matrices (0x500D6000 core 0, +0x800 core 1): a map register per source
+/// holding the CLIC ID it raises, then INTR_STATUS_0..3 at 0x200 (read-only, filled from the
+/// source state in `pre_access`), CLOCK_GATE at 0x210 and DATE at 0x3FC.
+/// IDF v5.5.3 register/hw_ver1/soc/interrupt_core0_reg.h:1550-1616.
+pub struct IntMatrix { pub map: [[u32; src::COUNT]; 2], pub status: [u32; 4], ram: RegRam }
+impl Default for IntMatrix { fn default() -> Self { Self::new() } }
+impl IntMatrix {
+    pub fn new() -> Self {
+        let mut ram = RegRam::new();
+        for core in 0..2 { ram.write(core * 0x800 + 0x210, 1); ram.write(core * 0x800 + 0x3fc, 0x0200_3020); }   // REG_CLK_EN, DATE
+        IntMatrix { map: [[0; src::COUNT]; 2], status: [0; 4], ram }
+    }
+}
+impl Device for IntMatrix {
+    fn read(&mut self, off: u32) -> u32 {
+        let (core, o) = ((off >> 11) as usize & 1, off & 0x7ff);
+        match o {
+            0x000..=0x1fc => self.map[core][(o / 4) as usize],
+            0x200..=0x20c => self.status[((o - 0x200) / 4) as usize],
+            _ => self.ram.read(off),
+        }
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        let (core, o) = ((off >> 11) as usize & 1, off & 0x7ff);
+        match o {
+            0x000..=0x1fc => self.map[core][(o / 4) as usize] = v & 0x3f,
+            0x200..=0x20c => {}
+            _ => self.ram.write(off, v),
+        }
+        WriteEffect::INTMAP
+    }
+}
+
+/// One core's CLIC register block. `CLIC_INT_CTRL(i)` packs IP (bit 0), IE (bit 8), the
+/// attributes (SHV bit 16, TRIG bits 18:17, MODE bits 23:22) and CTL (bits 31:24); with
+/// NLBITS = 3 the level is CTL[7:5], the unimplemented low bits reading as ones.
+/// IDF v5.5.3 include/soc/clic_reg.h.
+#[derive(Clone)]
+pub struct ClicCore {
+    /// CLIC_INT_CONFIG.MNLBITS (bits 4:1); NVBITS reads 1
+    pub mnlbits: u32,
+    /// CLIC_INT_THRESH: on rev < 3 the machine-mode threshold is this byte, bits 31:24
+    /// (IDF v5.5.3 riscv/include/esp_private/interrupt_clic.h:50-58)
+    pub thresh: u32,
+    /// IE, the attributes and CTL of each ID; IP is kept apart
+    pub ctrl: [u32; CLIC_IDS],
+    /// edge-triggered IDs: IP latched by an edge, written by software
+    pub ip_latch: u64,
+    /// IDs whose interrupt-matrix input is asserted now
+    pub input: u64,
+}
+impl Default for ClicCore { fn default() -> Self { ClicCore { mnlbits: 0, thresh: 0, ctrl: [3 << 22; CLIC_IDS], ip_latch: 0, input: 0 } } }
+impl ClicCore {
+    fn edge(&self, id: usize) -> bool { self.ctrl[id] & (1 << 17) != 0 }
+    pub fn pending(&self, id: usize) -> bool { if self.edge(id) { self.ip_latch & (1 << id) != 0 } else { self.input & (1 << id) != 0 } }
+    pub fn enabled(&self, id: usize) -> bool { self.ctrl[id] & (1 << 8) != 0 }
+    /// The 8-bit level of an ID: CTL with the bits below NLBITS read as ones.
+    pub fn level(&self, id: usize) -> u32 { (self.ctrl[id] >> 24) | 0x1f }
+    pub fn vectored(&self, id: usize) -> bool { self.ctrl[id] & (1 << 16) != 0 }
+    /// The highest-level enabled, pending ID above the threshold, lowest ID first on a tie: what
+    /// the core would take with `mstatus.MIE` set and no interrupt level of its own.
+    pub fn candidate(&self) -> Option<(usize, u32)> {
+        let thresh = self.thresh >> 24;
+        let mut best: Option<(usize, u32)> = None;
+        for id in 0..CLIC_IDS {
+            if !self.enabled(id) || !self.pending(id) { continue; }
+            let l = self.level(id);
+            if l > thresh && best.is_none_or(|(_, b)| l > b) { best = Some((id, l)); }
+        }
+        best
+    }
+    /// A new matrix input: edge-triggered IDs latch the rising edges (TRIG bit 18 selects the
+    /// falling edge, not used by IDF).
+    pub fn set_input(&mut self, input: u64) {
+        let rising = input & !self.input;
+        for id in 0..CLIC_IDS { if rising & (1 << id) != 0 && self.edge(id) { self.ip_latch |= 1 << id; } }
+        self.input = input;
+    }
+    fn read(&self, off: u32) -> u32 {
+        match off {
+            0x0 => 1 | (self.mnlbits & 0x1e),                                                     // INT_CONFIG: NVBITS = 1
+            0x4 => CLIC_IDS as u32 | 3 << 21,                                                     // INT_INFO: NUM_INT 48, CTLBITS 3
+            0x8 => self.thresh,
+            0x1000..=0x10bc => { let id = ((off - 0x1000) / 4) as usize; self.ctrl[id] | self.pending(id) as u32 }
+            _ => 0,
+        }
+    }
+    fn write(&mut self, off: u32, v: u32) {
+        match off {
+            0x0 => self.mnlbits = v & 0x1e,
+            0x8 => self.thresh = v & 0xff00_0000,
+            0x1000..=0x10bc => {
+                let id = ((off - 0x1000) / 4) as usize;
+                self.ctrl[id] = (v & 0xff07_0100) | 3 << 22;                                       // MODE reads machine mode
+                if v & 1 != 0 { self.ip_latch |= 1 << id; } else { self.ip_latch &= !(1 << id); }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The CLIC of both cores: core 0's at 0x20800000 (configuration) and 0x20801000 (one control
+/// word per ID), core 1's at +0x10000 (IDF v5.5.3 include/soc/clic_reg.h DUALCORE_CLIC_CTRL_OFF).
+/// Silicon decodes these addresses per core: each core sees its own block at 0x20800000 and the
+/// other's at +0x10000. The bus has no core context, so this is core 0's view; core 1 does not
+/// run yet. The registers are complete, but no interrupt reaches the core: taking one needs the
+/// core's CLIC mode (`mtvt` vectoring, `mintstatus`, the level in `mcause`), which it does not have.
+#[derive(Default)]
+pub struct Clic { pub core: [ClicCore; 2], log: bool }
+impl Device for Clic {
+    fn read(&mut self, off: u32) -> u32 { self.core[(off >> 16) as usize & 1].read(off & 0xffff) }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        if self.log { eprintln!("[clic] core{} {:#06x} <- {:#010x}", (off >> 16) & 1, off & 0xffff, v); }
+        self.core[(off >> 16) as usize & 1].write(off & 0xffff, v);
+        WriteEffect::INTMAP
+    }
+    fn debug(&mut self, on: bool) { self.log = on; }
+}
+
+/// The L1/L2 cache controller (0x3FF10000). Configuration reads back, from the register
+/// defaults; every operation finishes at once, so its DONE bit reads 1 and its start bit
+/// clears; a freeze is done as soon as it is asked for.
+/// IDF v5.5.3 register/hw_ver1/soc/cache_reg.h.
+pub struct Cache { ram: RegRam }
+impl Default for Cache { fn default() -> Self { Self::new() } }
+impl Cache {
+    /// Non-zero register defaults (cache_reg.h, the `default:` of each field).
+    const DEFAULTS: [(u32, u32); 28] = [
+        (0x00c, 0x1), (0x010, 0x40), (0x014, 0x8), (0x018, 0x100), (0x01c, 0x8), (0x024, 0x55555), (0x028, 0x55555),
+        (0x030, 0x33333), (0x034, 0x33333), (0x044, 0x3fff3fff), (0x054, 0x3fff3fff), (0x064, 0x3fff3fff), (0x074, 0x3fff3fff),
+        (0x084, 0x3fff3fff), (0x09c, 0x1f), (0x264, 0x4000_0000), (0x270, 0x10), (0x278, 0x400), (0x27c, 0x8),
+        (0x284, 0x50_0000), (0x288, 0x50_0000), (0x290, 0x30_0000), (0x294, 0x30_0000), (0x2a4, 0xffff_ffff),
+        (0x3bc, 0xf), (0x3c8, 0x4000_0000), (0x3d4, 0x1), (0x3fc, 0x0230_4130),
+    ];
+    const PRELOAD: [u32; 6] = [0x0a8, 0x0b4, 0x0c0, 0x0cc, 0x0d8, 0x2a8];
+    const AUTOLOAD: [u32; 6] = [0x0e4, 0x0f8, 0x10c, 0x120, 0x134, 0x2b4];
+    pub fn new() -> Self { let mut ram = RegRam::new(); for (o, v) in Self::DEFAULTS { ram.write(o, v); } Cache { ram } }
+}
+impl Device for Cache {
+    fn read(&mut self, off: u32) -> u32 {
+        let v = self.ram.read(off);
+        match off {
+            0x02c => (v & 0x1_1111) << 2 | v & !(0x1_1111 << 2),     // L1 FREEZE_CTRL: each FREEZE_DONE follows its FREEZE_EN
+            0x28c => (v & 1 << 20) << 2 | v & !(1 << 22),            // L2 FREEZE_CTRL: FREEZE_DONE follows FREEZE_EN
+            0x088 => v | 1 << 2,                                      // LOCK_CTRL: LOCK_DONE
+            0x098 => v | 1 << 4,                                      // SYNC_CTRL: SYNC_DONE
+            o if Self::PRELOAD.contains(&o) || Self::AUTOLOAD.contains(&o) => v | 1 << 1,   // PRELOAD_DONE, AUTOLOAD_DONE
+            _ => v,
+        }
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        let v = match off {
+            0x088 => v & !3,                                          // LOCK_ENA, UNLOCK_ENA self-clear
+            0x098 => v & !0xf,                                        // INVALIDATE/CLEAN/WRITEBACK(_INVALIDATE)_ENA self-clear
+            o if Self::PRELOAD.contains(&o) => v & !1,                // PRELOAD_ENA self-clears
+            _ => v,
+        };
+        self.ram.write(off, v);
+        WriteEffect::NONE
+    }
+}
+
+/// HP_SYSTEM (0x500E5000): the four software interrupts the cores raise on each other
+/// (CPU_INT_FROM_CPU_0..3 at 0x10, bit 0) and the core-stall status.
+/// IDF v5.5.3 register/hw_ver1/soc/hp_system_reg.h:40-88, 362-380.
+#[derive(Default)]
+pub struct HpSys { pub from_cpu: u32, ram: RegRam }
+impl Device for HpSys {
+    fn read(&mut self, off: u32) -> u32 {
+        match off {
+            0x10..=0x1c => (self.from_cpu >> ((off - 0x10) / 4)) & 1,
+            0x64 => 0,                                                // CPU_CORESTALLED_ST: no core stalled
+            _ => self.ram.read(off),
+        }
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        match off {
+            0x10..=0x1c => { let b = (off - 0x10) / 4; if v & 1 != 0 { self.from_cpu |= 1 << b } else { self.from_cpu &= !(1 << b) } }
+            _ => self.ram.write(off, v),
+        }
+        WriteEffect::NONE
+    }
+    fn irq_sources(&self) -> u64 { (self.from_cpu & 0xf) as u64 }
+}
+
+/// HP_SYS_CLKRST (0x500E6000): clock dividers, gates and resets. Configuration reads back, from
+/// the register defaults for the fields the boot reads before writing them; the divider-update
+/// strobe clears at once and every PLL calibration reports done.
+/// IDF v5.5.3 register/hw_ver1/soc/hp_sys_clkrst_reg.h:29-50 (ROOT_CLK_CTRL0), the
+/// SOC_CLK_CTRL0 and HP_RST_EN0 defaults, 2989-3040 (ANA_PLL_CTRL0).
+pub struct HpClkRst { ram: RegRam }
+impl Default for HpClkRst { fn default() -> Self { Self::new() } }
+impl HpClkRst {
+    pub const SOC_CLK_CTRL0: u32 = 0x14;
+    pub const HP_RST_EN0: u32 = 0xc0;
+    pub fn new() -> Self {
+        let mut ram = RegRam::new();
+        ram.write(Self::SOC_CLK_CTRL0, 0xe6df_97af);                  // CORE1_CPU_CLK_EN (bit 4) off
+        ram.write(Self::HP_RST_EN0, 0x100);                            // RST_EN_CORE1_GLOBAL (bit 8) on
+        HpClkRst { ram }
+    }
+    /// Core 1 runs once its clock is on and its global reset released (hal/esp32p4/include/hal/cpu_utility_ll.h).
+    pub fn core1_released(&self) -> bool { self.ram.read(Self::SOC_CLK_CTRL0) & (1 << 4) != 0 && self.ram.read(Self::HP_RST_EN0) & (1 << 8) == 0 }
+}
+impl Device for HpClkRst {
+    fn read(&mut self, off: u32) -> u32 {
+        let v = self.ram.read(off);
+        match off {
+            0x04 => v & !(1 << 4),                                    // ROOT_CLK_CTRL0.SOC_CLK_DIV_UPDATE
+            0xbc => v | 0x155,                                        // ANA_PLL_CTRL0: PLLA, CPU, SDIO, SYS PLL and MSPI CAL_END
+            _ => v,
+        }
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect { self.ram.write(off, v); WriteEffect::NONE }
+}
+
+/// The always-on LP blocks as one device: LP_SYSTEM at 0x000 (software reset, core 1's boot
+/// address, the store registers), LP_CLKRST at 0x1000 (reset cause, per-core software reset),
+/// LP_TIMER at 0x2000 (the RTC counter). All of it survives a chip reset.
+/// IDF v5.5.3 register/hw_ver1/soc/lp_system_reg.h:48-152, 838; lp_clkrst_reg.h:231-473;
+/// lp_timer_reg.h.
+pub struct LpAon {
+    pub ram: [RegRam; 3],
+    pub reset_cause: u32,
+    pub sw_reset: bool,
+    /// RTC slow-clock ticks since power-on and the value latched by an UPDATE
+    pub slow_ticks: u64,
+    pub time_latch: u64,
+}
+impl Default for LpAon { fn default() -> Self { Self::new() } }
+impl LpAon {
+    pub const BOOT_ADDR_HP_CORE1: u32 = 0x164;
+    pub fn new() -> Self {
+        let mut ram = [RegRam::new(), RegRam::new(), RegRam::new()];
+        ram[0].write(0x08, 0x1fff_c7f8);                              // LP_SYSTEM_REG_SYS_CTRL default
+        LpAon { ram, reset_cause: RST_POWERON, sw_reset: false, slow_ticks: 0, time_latch: 0 }
+    }
+    fn request_reset(&mut self, cause: u32) { self.reset_cause = cause; self.sw_reset = true; }
+    pub fn core1_boot_addr(&self) -> u32 { self.ram[0].read(Self::BOOT_ADDR_HP_CORE1) }
+}
+impl Device for LpAon {
+    fn read(&mut self, off: u32) -> u32 {
+        let (blk, o) = ((off >> 12) as usize, off & 0xfff);
+        match (blk, o) {
+            (0, 0x08) => self.ram[0].read(o) & !(1 << 1),             // SYS_SW_RST reads 0
+            (1, 0x10) => (self.ram[1].read(o) & !(0x3f << 7)) | (self.reset_cause & 0x3f) << 7,   // RESET_CAUSE.HPCORE0_RESET_CAUSE
+            (1, 0x14) => self.ram[1].read(o) & !(1 << 13 | 1 << 29),  // HPCPU_RESET_CTRL0: HPCORE0/1_SW_RESET read 0
+            (2, 0x10) => self.ram[2].read(o) & !(1 << 28),            // LP_TIMER_UPDATE self-clears
+            (2, 0x14) => self.time_latch as u32,                      // LP_TIMER_MAIN_BUF0_LOW
+            (2, 0x18) => (self.time_latch >> 32) as u32,              // LP_TIMER_MAIN_BUF0_HIGH
+            (b, o) if b < 3 => self.ram[b].read(o),
+            _ => 0,
+        }
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        let (blk, o) = ((off >> 12) as usize, off & 0xfff);
+        match (blk, o) {
+            (0, 0x08) => { if v & (1 << 1) != 0 { self.request_reset(RST_SW_SYS); } self.ram[0].write(o, v & !(1 << 1)); }
+            (1, 0x14) => { if v & (1 << 13) != 0 { self.request_reset(RST_SW_CPU); } self.ram[1].write(o, v & !(1 << 13 | 1 << 29)); }
+            (2, 0x10) => { if v & (1 << 28) != 0 { self.time_latch = self.slow_ticks; } self.ram[2].write(o, v); }
+            (b, o) if b < 3 => self.ram[b].write(o, v),
+            _ => {}
+        }
+        WriteEffect::NONE
+    }
+    fn clock(&self) -> Option<ClockDomain> { Some(ClockDomain::RtcSlow) }
+    fn tick(&mut self, ticks: u64) { self.slow_ticks += ticks; }
+}
+
+/// The analog I2C master (I2C_ANA_MST, 0x50124000): the regi2c path to the PLL, bias and SAR
+/// trim registers, a CTRL word per host — [7:0] block, [15:8] register, [23:16] data, [24]
+/// write, [25] busy. A transfer completes at once; written values read back per (block,
+/// register), which is how the clock code reads back the CPU PLL divider it programmed.
+/// IDF v5.5.3 components/esp_rom/patches/esp_rom_regi2c_esp32p4.c, register/hw_ver1/soc/i2c_ana_mst_reg.h.
+#[derive(Default)]
+pub struct AnaMst { ram: RegRam, pub ana: esp_periph::Regi2c }
+impl Device for AnaMst {
+    fn read(&mut self, off: u32) -> u32 {
+        match off {
+            0x00 | 0x04 => self.ana.read(0, self.ram.read(off), |_| &0),
+            _ => self.ram.read(off),
+        }
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        if off == 0x00 || off == 0x04 { self.ana.write(0, v); }
+        self.ram.write(off, v);
+        WriteEffect::NONE
+    }
+}
+
+/// ASSIST_DEBUG (0x3FF06000): the ROM prints core 0's recorded PC as `Saved PC` after a reset.
+/// IDF v5.5.3 register/hw_ver1/soc/assist_debug_reg.h: CORE_0_RCD_PDEBUGPC at 0x48.
+#[derive(Default)]
+pub struct AssistDebug { pub saved_pc: u32, ram: RegRam }
+impl Device for AssistDebug {
+    fn read(&mut self, off: u32) -> u32 { match off { 0x48 => self.saved_pc, _ => self.ram.read(off) } }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect { self.ram.write(off, v); WriteEffect::NONE }
+}
+
+/// The systimer counts XTAL / 2.5 = 16 MHz (IDF v5.5.3 include/soc/soc_caps.h
+/// SOC_SYSTIMER_FIXED_DIVIDER), which is 22.5 CPU cycles at 360 MHz: it is fed XTAL ticks (9
+/// cycles) and steps two counts per five of them, so it keeps exact time.
+#[derive(Default)]
+pub struct SystimerP4 { pub st: Systimer, frac: u64 }
+impl Device for SystimerP4 {
+    fn read(&mut self, off: u32) -> u32 { self.st.read(off) }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect { self.st.write(off, v); WriteEffect::NONE }
+    fn irq_sources(&self) -> u64 { Device::irq_sources(&self.st) }
+    fn clock(&self) -> Option<ClockDomain> { Some(ClockDomain::Xtal) }
+    fn tick(&mut self, xtal: u64) {
+        self.frac += xtal * 2;
+        let n = self.frac / 5;
+        self.frac %= 5;
+        if n > 0 { self.st.tick(n); }
+    }
+    fn has_deadline(&self) -> bool { true }
+    fn next_deadline(&self) -> Option<u64> { self.st.next_deadline().map(|t| (t * 5).saturating_sub(self.frac).div_ceil(2)) }
+}
+
+/// The cache side of a memory controller (SPI_MEM_C for flash, SPI_MEM_S for PSRAM):
+/// SMEM_AXI_ADDR_CTRL (0x178) reports its AXI FIFOs empty, which the ROM's `SPI_init` and IDF's
+/// `psram_ctrlr_ll_wait_all_transaction_done` wait for; the rest is the shared model or register RAM.
+/// IDF v5.5.3 register/hw_ver1/soc/spi_mem_c_reg.h:1675-1720, spi_mem_s_reg.h:2168-2200.
+pub struct MspiCache<D: Device>(pub D);
+impl<D: Device> Device for MspiCache<D> {
+    fn read(&mut self, off: u32) -> u32 { match off { 0x178 => self.0.read(off) | 0xfc00_0000, _ => self.0.read(off) } }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect { self.0.write(off, v) }
+    fn debug(&mut self, on: bool) { self.0.debug(on) }
+}
+
+/// The efuse block as this P4 reads it: wafer and block revision in RD_MAC_SYS_2 (0x4C), the MAC
+/// in RD_MAC_SYS_0/1 (0x44/0x48), every security efuse zero.
+/// IDF v5.5.3 register/hw_ver1/soc/efuse_struct.h:553-624, hal/esp32p4/include/hal/efuse_ll.h:80-110.
+pub fn efuse_p4(mac: [u8; 6], wafer: (u32, u32), blk: (u32, u32)) -> Efuse {
+    let mut e = Efuse::new(mac);
+    e.write(0x48, (mac[0] as u32) << 8 | mac[1] as u32);
+    e.write(0x4c, (wafer.1 & 0xf) | (wafer.0 & 3) << 4 | (blk.1 & 7) << 8 | (blk.0 & 3) << 11 | (wafer.0 >> 2 & 1) << 23);
+    e.write(0x6c, 0);
+    e
+}
+
+/// A flash controller with the reference board's GigaDevice part answering RDID: manufacturer
+/// 0xC8, memory type 0x40 (its console prints `detected chip: gd`); the capacity byte follows
+/// the flash size. PSRAM has a controller of its own on this chip.
+fn flash_controller(spi1: bool) -> SpiMem {
+    let mut s = SpiMem::new(spi1);
+    s.has_psram = false;
+    s.jedec = [0xc8, 0x40, 0x18];
+    s
+}
+
+pub struct Peripherals {
+    pub uart: [Uart; 2],
+    pub usb: UsbSerialJtag,
+    pub systimer: SystimerP4,
+    pub timg: [TimerGroup; 2],
+    pub gpio: Gpio,
+    pub io_mux: RegRam,
+    pub efuse: Efuse,
+    /// SPI_MEM_C: the flash controller's cache side (the MMU registers are the bus's)
+    pub spi0: MspiCache<SpiMem>,
+    /// SPI_MEM_S: the PSRAM controller's cache side (its MMU registers are the bus's)
+    pub psram0: MspiCache<RegRam>,
+    /// SPI1_MEM_C: the flash controller's command side
+    pub spi1: SpiMem,
+    /// SHA accelerator: the ROM checks the bootloader's appended SHA-256 with it
+    pub sha: Sha,
+    pub intmtx: IntMatrix,
+    pub clic: Clic,
+    pub cache: Cache,
+    pub hp_sys: HpSys,
+    pub hp_clkrst: HpClkRst,
+    pub lp: LpAon,
+    pub ana_mst: AnaMst,
+    pub assist_debug: AssistDebug,
+    /// WDEV_RND_REG = LP_SYSTEM_REG_RNG_DATA (0x501101A4) on rev < 3
+    /// (IDF v5.5.3 register/hw_ver1/soc/wdev_reg.h:16, lp_system_reg.h:1251)
+    pub rng: Rng,
+    /// RNG_DATA reads with no other register access between them
+    rng_spin: u32,
+    /// register RAM behind unmodelled blocks, first-touch logging, pc attribution
+    pub misc: Misc,
+    pub spi_exec: bool,
+    clock: ClockTree<4>,
+    last_status: [u32; 4],
+}
+
+// Every peripheral, its 4 KB block (address >> 12) and its interrupt sources.
+// Clocks: XTAL 40 MHz for the systimer and the timer groups (TIMG clock source XTAL,
+// include/soc/clk_tree_defs.h), RC_SLOW 136 kHz (SOC_CLK_RC_SLOW_FREQ_APPROX) for the LP timer.
+device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Xtal, 9), (ClockDomain::Apb, 9), (ClockDomain::RtcSlow, 2647), (ClockDomain::Cpu, 1)];
+    0x20800 "CLIC" (clic) => [];
+    0x20801 "CLIC_CTRL" alias (clic) delta 0x1000 => [];
+    0x20810 "CLIC_OTHER" alias (clic) delta 0x10000 => [];
+    0x20811 "CLIC_OTHER_CTRL" alias (clic) delta 0x11000 => [];
+    0x3ff06 "ASSIST_DEBUG" (assist_debug) => [];
+    0x3ff10 "CACHE" (cache) => [];
+    0x5008c "FLASH_SPI0" (spi0) => [];
+    0x5008d "FLASH_SPI1" (spi1) => [];
+    0x5008e "PSRAM_MSPI0" (psram0) => [];
+    0x50091 "SHA" (sha) => [];
+    0x500c2 "TIMG0" (timg[0]) => [src::TG0_T0, src::TG0_T1];
+    0x500c3 "TIMG1" (timg[1]) => [src::TG1_T0, src::TG1_T1];
+    0x500ca "UART0" (uart[0]) => [src::UART0];
+    0x500cb "UART1" (uart[1]) => [src::UART1];
+    0x500d2 "USB_SERIAL_JTAG" (usb) => [src::USB_SERIAL_JTAG];
+    0x500d6 "INTMTX" (intmtx) => [];
+    0x500e0 "GPIO" (gpio) => [src::GPIO_INTR0];
+    0x500e1 "IO_MUX" (io_mux) => [];
+    0x500e2 "SYSTIMER" (systimer) => [src::SYSTIMER_TARGET0, src::SYSTIMER_TARGET0 + 1, src::SYSTIMER_TARGET0 + 2];
+    0x500e5 "HP_SYS" (hp_sys) => [src::FROM_CPU0, src::FROM_CPU0 + 1, src::FROM_CPU0 + 2, src::FROM_CPU0 + 3];
+    0x500e6 "HP_SYS_CLKRST" (hp_clkrst) => [];
+    0x50110 "LP_RNG" (rng) @ 0x1a4..=0x1a7 => [];
+    0x50110 "LP_SYS" (lp) => [];
+    0x50111 "LP_CLKRST" alias (lp) delta 0x1000 => [];
+    0x50112 "LP_TIMER" alias (lp) delta 0x2000 => [];
+    0x50124 "I2C_ANA_MST" (ana_mst) => [];
+    0x5012d "EFUSE" (efuse) => [];
+}
+
+impl DeviceSet for Peripherals {
+    const BASE: u32 = 0;
+    fn block_name(block: u32) -> &'static str { Peripherals::block_name(block) }
+    fn misc(&self) -> &Misc { &self.misc }
+    fn misc_mut(&mut self) -> &mut Misc { &mut self.misc }
+    fn pre_access(&mut self, block: u32, off: u32, write: bool) {
+        // INTR_STATUS_0..3 read the source state.
+        if block == 0x500d6 && !write && (0x200..=0x20c).contains(&(off & 0x7ff)) { self.intmtx.status = self.source_status(); }
+        if block == 0x50110 && off == 0x1a4 && !write {
+            self.rng.now = self.clock.cycles() as u32;
+            self.rng_spin += 1;
+            // IDF v5.5.3 bootloader_support/src/bootloader_random.c:41-60 reads it until the cycle
+            // count (`rdcycle`) has advanced 1440 cycles; a cycle CSR that never moves spins here.
+            if self.rng_spin == RNG_SPIN_REPORT { eprintln!("[esp32p4] RNG_DATA read {} times with nothing else in between at pc {:#010x}: bootloader_fill_random waits for `rdcycle` (CSR 0xC00) to advance, and the core model returns 0 for it", RNG_SPIN_REPORT, self.misc.cur_pc); }
+        } else {
+            self.rng_spin = 0;
+        }
+    }
+}
+
+impl Peripherals {
+    pub fn new(mac: [u8; 6], wafer: (u32, u32)) -> Self {
+        Peripherals {
+            uart: [Uart::new(UartLayout::C6), Uart::new(UartLayout::C6)], usb: UsbSerialJtag::new(CPU_HZ), systimer: SystimerP4::default(),
+            timg: [TimerGroup::new(), TimerGroup::new()], gpio: { let mut g = Gpio::new(); g.strap = 0x30f; g }, io_mux: RegRam::new(),
+            efuse: efuse_p4(mac, wafer, (0, 3)),
+            spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true),
+            sha: Sha::new(), intmtx: IntMatrix::new(), clic: Clic::default(), cache: Cache::new(), hp_sys: HpSys::default(), hp_clkrst: HpClkRst::new(),
+            lp: LpAon::new(), ana_mst: AnaMst::default(), assist_debug: AssistDebug::default(), rng: Rng::new(), rng_spin: 0,
+            misc: Misc::new(), spi_exec: false, clock: Self::new_clock(), last_status: [0; 4],
+        }
+    }
+
+    /// Block names for `--log-periph`, from IDF v5.5.3 register/hw_ver1/soc/reg_base.h.
+    pub fn block_name(block: u32) -> &'static str {
+        match block {
+            0x20800 | 0x20801 => "CLIC", 0x20810 | 0x20811 => "CLIC_OTHER", 0x20000..=0x2ffff => "CPU_SUBSYSTEM",
+            0x3ff04 => "TRACE0", 0x3ff05 => "TRACE1", 0x3ff06 => "ASSIST_DEBUG", 0x3ff0e => "L2MEM_MON", 0x3ff0f => "TCM_MON", 0x3ff10 => "CACHE",
+            0x50000..=0x5003f => "USB_OTG_HS", 0x50040..=0x5007f => "USB_OTG_FS", 0x50080 => "USB_WRAP", 0x50081 => "DW_GDMA", 0x50082 => "REGDMA",
+            0x50083 => "SDMMC", 0x50084 => "H264", 0x50085 => "AHB_DMA", 0x50086 => "JPEG", 0x50087 => "PPA", 0x50088 => "DMA2D",
+            0x50089 => "KEYMNG", 0x5008a => "AXI_DMA", 0x5008c => "FLASH_SPI0", 0x5008d => "FLASH_SPI1", 0x5008e => "PSRAM_MSPI0",
+            0x5008f => "PSRAM_MSPI1", 0x50090 => "AES", 0x50091 => "SHA", 0x50092 => "RSA", 0x50093 => "ECC", 0x50094 => "DS",
+            0x50095 => "HMAC", 0x50096 => "ECDSA", 0x50098..=0x5009b => "EMAC", 0x5009c => "USBPHY", 0x5009d => "DDRPHY", 0x5009e => "PVT",
+            0x5009f => "CSI", 0x500a0 => "DSI", 0x500a1 => "ISP", 0x500a2 => "RMT", 0x500a3 => "BITSCRAMBLER", 0x500a4 => "AXI_ICM",
+            0x500a5 => "HP_PERI_PMS", 0x500a6 => "DMA_PMS", 0x500a7 => "H264_DMA2D",
+            0x500c0 => "MCPWM0", 0x500c1 => "MCPWM1", 0x500c2 => "TIMG0", 0x500c3 => "TIMG1", 0x500c4 => "I2C0", 0x500c5 => "I2C1",
+            0x500c6 => "I2S0", 0x500c7 => "I2S1", 0x500c8 => "I2S2", 0x500c9 => "PCNT", 0x500ca => "UART0", 0x500cb => "UART1",
+            0x500cc => "UART2", 0x500cd => "UART3", 0x500ce => "UART4", 0x500cf => "PARL_IO", 0x500d0 => "SPI2", 0x500d1 => "SPI3",
+            0x500d2 => "USB_SERIAL_JTAG", 0x500d3 => "LEDC", 0x500d5 => "SOC_ETM", 0x500d6 => "INTMTX", 0x500d7 => "TWAI0",
+            0x500d8 => "TWAI1", 0x500d9 => "TWAI2", 0x500da => "I3C_MST", 0x500db => "I3C_SLV", 0x500dc => "LCD_CAM", 0x500de => "ADC",
+            0x500df => "UHCI", 0x500e0 => "GPIO", 0x500e1 => "IO_MUX", 0x500e2 => "SYSTIMER", 0x500e3 => "MEM_MON",
+            0x500e4 => "AUDIO_ADDC", 0x500e5 => "HP_SYS", 0x500e6 => "HP_SYS_CLKRST",
+            0x50110 => "LP_SYS", 0x50111 => "LP_CLKRST", 0x50112 => "LP_TIMER", 0x50113 => "LP_ANA_PERI", 0x50114 => "LP_HUK",
+            0x50115 => "PMU", 0x50116 => "LP_WDT", 0x50118 => "LP_MAILBOX", 0x50119 => "RTC", 0x50120 => "LP_PERI",
+            0x50121 => "LP_UART", 0x50122 => "LP_I2C", 0x50123 => "LP_SPI", 0x50124 => "I2C_ANA_MST", 0x50125 => "LP_I2S",
+            0x50127 => "LP_ADC", 0x50128 => "LP_TOUCH", 0x5012a => "LP_GPIO", 0x5012b => "LP_IOMUX", 0x5012c => "LP_INTR",
+            0x5012d => "EFUSE", 0x5012e => "LP_PERI_PMS", 0x5012f => "LP_TSENSOR",
+            _ => "?",
+        }
+    }
+
+    pub fn read32(&mut self, addr: u32) -> u32 { mmio::read32(self, addr) }
+
+    pub fn write32(&mut self, addr: u32, v: u32) {
+        let fx = mmio::write32(self, addr, v);
+        if fx.contains(WriteEffect::SPI_EXEC) { self.spi_exec = true; }
+    }
+
+    /// Advance every clocked device by `cycles` CPU cycles.
+    pub fn tick(&mut self, cycles: u64) { Dispatch::tick(self, cycles); }
+    /// CPU cycles until the earliest device deadline, `u32::MAX` when nothing is armed.
+    pub fn cycles_until_timer(&self) -> u32 { Dispatch::cycles_until_deadline(self) }
+    pub fn source_status(&self) -> [u32; 4] { Dispatch::source_status(self) }
+
+    /// Present the asserted sources to each core's CLIC through its matrix. Returns true if any
+    /// source changed.
+    pub fn refresh_lines(&mut self) -> bool {
+        let st = self.source_status();
+        let changed = st != self.last_status;
+        self.last_status = st;
+        for core in 0..2 {
+            let mut input = 0u64;
+            for (w, &word) in st.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let s = w * 32 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let id = self.intmtx.map[core][s] as usize;
+                    if id < CLIC_IDS { input |= 1 << id; }
+                }
+            }
+            self.clic.core[core].set_input(input);
+        }
+        changed
+    }
+
+    /// Sources routed to a core's CLIC ID.
+    pub fn sources_of(&self, core: usize, id: u32) -> Vec<usize> { (0..src::COUNT).filter(|&s| self.intmtx.map[core & 1][s] == id).collect() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systimer_keeps_16_mhz_on_xtal_ticks() {
+        let mut t = SystimerP4::default();
+        t.st.write(0x0, 1 << 30);                                     // unit 0 counting
+        for _ in 0..1000 { Device::tick(&mut t, 7); }                 // 7000 XTAL ticks at 40 MHz = 175 us
+        assert_eq!(t.st.unit[0], 2800);                               // 175 us at 16 MHz
+        t.st.write(0x34, 0); t.st.write(0x20, 2810); t.st.write(0x50, 1); t.st.write(0x0, 1 << 30 | 1 << 24);
+        assert_eq!(t.next_deadline(), Some(25));                      // 10 counts = 25 XTAL ticks
+        Device::tick(&mut t, 24);
+        assert_eq!(t.st.unit[0], 2809);
+        Device::tick(&mut t, 1);
+        assert_eq!(t.st.unit[0], 2810);
+        t.st.write(0x64, 1);
+        assert_eq!(Device::irq_sources(&t), 1);
+    }
+
+    #[test]
+    fn clic_takes_strictly_above_threshold_and_latches_edges() {
+        let mut c = ClicCore::default();
+        let id = 16 + 6;
+        c.write(0x1000 + 4 * id as u32, 1 << 8 | 1 << 29);            // IE, level 1, level-triggered
+        c.set_input(1 << id);
+        assert_eq!(c.read(0x1000 + 4 * id as u32) & 1, 1);
+        assert_eq!(c.candidate(), Some((id, 0x3f)));
+        c.write(0x8, 0x3f << 24);                                     // threshold level 1 masks level 1
+        assert_eq!(c.candidate(), None);
+        c.write(0x8, 0x1f << 24);
+        assert_eq!(c.candidate(), Some((id, 0x3f)));
+        c.set_input(0);
+        assert_eq!(c.candidate(), None);
+        let e = 16 + 7;
+        c.write(0x1000 + 4 * e as u32, 1 << 8 | 1 << 17 | 3 << 29);  // edge-triggered, level 3
+        c.set_input(1 << e);
+        c.set_input(0);
+        assert_eq!(c.candidate(), Some((e, 0x7f)));
+        c.write(0x1000 + 4 * e as u32, 1 << 8 | 1 << 17 | 3 << 29);  // software clears IP
+        assert_eq!(c.candidate(), None);
+        assert_eq!(c.read(0x0), 1);
+        assert_eq!(c.read(0x4), 48 | 3 << 21);
+        assert_eq!(c.read(0x1000) >> 22 & 3, 3);
+    }
+
+    #[test]
+    fn matrix_routes_sources_to_clic_ids_per_core() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        p.write32(0x500d_6000 + 4 * src::FROM_CPU0 as u32, 16 + 9);
+        p.write32(0x2080_1000 + 4 * 25, 1 << 8 | 1 << 29);
+        p.write32(0x500e_5010, 1);
+        assert!(p.refresh_lines());
+        assert_eq!(p.clic.core[0].candidate(), Some((25, 0x3f)));
+        assert_eq!(p.clic.core[1].candidate(), None);
+        assert_eq!(p.read32(0x500d_6200 + 4 * (src::FROM_CPU0 as u32 / 32)) >> (src::FROM_CPU0 % 32) & 1, 1);
+        assert_eq!(p.sources_of(0, 25), [src::FROM_CPU0]);
+        p.write32(0x500e_5010, 0);
+        p.refresh_lines();
+        assert_eq!(p.clic.core[0].candidate(), None);
+    }
+
+    #[test]
+    fn cache_operations_finish_at_once() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        p.write32(0x3ff1_0098, 1);                                    // invalidate
+        assert_eq!(p.read32(0x3ff1_0098), 1 << 4);
+        p.write32(0x3ff1_028c, 1 << 20);
+        assert_eq!(p.read32(0x3ff1_028c), 1 << 20 | 1 << 22);
+        p.write32(0x3ff1_002c, 1 << 16);
+        assert_eq!(p.read32(0x3ff1_002c), 1 << 16 | 1 << 18);
+        assert_eq!(p.read32(0x3ff1_0278), 0x400);
+    }
+
+    #[test]
+    fn efuse_reports_v1_0_and_block_v0_3() {
+        let e = efuse_p4([0x30, 0xed, 0xa0, 0x00, 0x11, 0x22], (1, 0), (0, 3));
+        assert_eq!(e.read(0x4c), 0x310);
+        assert_eq!(e.read(0x44), 0xa000_1122);
+        assert_eq!(e.read(0x48), 0x30ed);
+    }
+
+    #[test]
+    fn core1_starts_held_in_reset() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        assert!(!p.hp_clkrst.core1_released());
+        let clk = p.read32(0x500e_6014);
+        p.write32(0x500e_6014, clk | 1 << 4);
+        assert!(!p.hp_clkrst.core1_released());
+        p.write32(0x500e_60c0, 0);
+        assert!(p.hp_clkrst.core1_released());
+    }
+
+    #[test]
+    fn lp_reset_cause_and_software_reset() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        assert_eq!(p.read32(0x5011_1010) >> 7 & 0x3f, RST_POWERON);
+        p.write32(0x5011_1014, 1 << 13);
+        assert!(p.lp.sw_reset);
+        assert_eq!(p.lp.reset_cause, RST_SW_CPU);
+        assert_eq!(p.read32(0x5011_1014) & 1 << 13, 0);
+    }
+}

@@ -3,11 +3,12 @@ use esp_soc::{Soc, SocBus};
 
 const FLASH_SIZE: usize = 0x20000;
 
-fn buses() -> [Box<dyn SocBus>; 3] {
+fn buses() -> [Box<dyn SocBus>; 4] {
     [
         Box::new(esp32c3::bus::SocBus::new(FLASH_SIZE, [0; 6])),
         Box::new(esp32c6::bus::SocBus::new(FLASH_SIZE, [0; 6])),
         Box::new(esp32s3::bus::SocBus::new(FLASH_SIZE, 0, [0; 6])),
+        Box::new(esp32p4::bus::SocBus::new(FLASH_SIZE, [0; 6], (1, 0))),
     ]
 }
 
@@ -48,7 +49,7 @@ fn check_last_flash_page(bus: &mut dyn SocBus, window_end: u32, page_size: usize
 
 #[test]
 fn mapped_segments_must_fit_the_whole_virtual_window() {
-    let ends = [esp32c3::bus::IBUS_HIGH, esp32c6::bus::FLASH_HIGH, esp32s3::bus::IBUS_HIGH];
+    let ends = [esp32c3::bus::IBUS_HIGH, esp32c6::bus::FLASH_HIGH, esp32s3::bus::IBUS_HIGH, esp32p4::bus::FLASH_HIGH];
     for (mut bus, end) in buses().into_iter().zip(ends) {
         check_last_flash_page(&mut *bus, end, 0x10000);
     }
@@ -111,4 +112,24 @@ fn c6_plic_and_intpri_share_host_input_interrupt_state() {
     bus.irq_dirty = false;
     bus.gpio_set_input(0, false);
     assert!(bus.irq_dirty);
+}
+
+/// The P4's sources reach its CLIC registers, but no interrupt is presented to the core: the
+/// core model has no CLIC mode yet.
+#[test]
+fn p4_host_input_reaches_the_clic_but_not_the_core() {
+    let mut bus = esp32p4::bus::SocBus::new(1, [0; 6], (1, 0));
+    let source = esp32p4::periph::src::USB_SERIAL_JTAG as u32;
+    bus.periph.write32(0x500d_6000 + source * 4, 16 + 3);
+    bus.periph.write32(0x2080_1000 + (16 + 3) * 4, 1 << 8 | 1 << 29);
+    bus.periph.usb.int_ena = 1 << 2;
+    bus.irq_dirty = false;
+    bus.serial_input(b"a");
+    assert!(bus.irq_dirty);
+    bus.refresh_irq();
+    assert_eq!(bus.periph.clic.core[0].candidate(), Some((16 + 3, 0x3f)));
+    let mut pending = [None, None];
+    esp32p4::P4::irqs(&bus, &mut pending);
+    assert_eq!(pending, [None, None]);
+    assert_eq!(bus.irq_sources_of(0, 3), [source as usize]);
 }

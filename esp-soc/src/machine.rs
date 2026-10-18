@@ -298,7 +298,7 @@ impl<S: Soc> Machine<S> {
     }
 
     /// Cold boot from the mask ROM reset vector (needs ROM + flash image with bootloader).
-    pub fn boot_rom(&mut self) { self.cores[0].reset(); }
+    pub fn boot_rom(&mut self) { S::reset_core(&mut self.cores[0], 0); }
 
     /// Chip reset (software / watchdog): cores back to the reset vector, digital peripherals
     /// re-initialised; SRAM, RTC memories, efuses and the RTC-domain registers survive, as on

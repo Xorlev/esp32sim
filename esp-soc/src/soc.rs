@@ -52,6 +52,9 @@ pub trait Soc: 'static {
     const CORES: usize;
     /// How far time jumps when every core sleeps (at most; deadlines and limits cut it).
     const IDLE_CHUNK: u64;
+    /// Whether a run boots from the mask ROM and shows UART0 unless told otherwise; the others
+    /// default to `--boot app` and both consoles.
+    const ROM_BOOT_DEFAULT: bool = Self::CORES == 1;
     /// Symbols, in order of preference, that start the ROM's RAM-initialiser table.
     const ROM_DATA_TABLE: &'static [&'static str];
     /// Symbols, in order of preference, that end it.
