@@ -281,6 +281,37 @@ fn a_timed_read_hands_the_slave_descriptors_back_after_its_wire_time() {
     assert_ne!(cs.p4.bus.read32(SDMMC + 0x44).unwrap() & 1 << 3, 0, "DATA_OVER on the P4 by then");
 }
 
+/// EN low for less than the C6's t_RST (50 µs) does not reset it: the chip runs on from where it
+/// was, as when a GPIO is made an output a moment before its level is written.
+#[test]
+fn a_short_en_pulse_does_not_reset_the_c6() {
+    let mut cs = spinning(Config::default());
+    cs.run_until(50_000).unwrap();
+    cs.p4.bus.write32(GPIO + 0x18, 1 << 22).unwrap();                 // OUT1_W1TC: GPIO 54 low
+    cs.p4.bus.write32(GPIO + 0x30, 1 << 22).unwrap();                 // ENABLE1_W1TS
+    cs.run_until(70_000).unwrap();
+    assert!(cs.c6.borrow().held);
+    cs.p4.bus.write32(GPIO + 0x14, 1 << 22).unwrap();                 // high again, 20 µs later
+    cs.run_until(100_000).unwrap();
+    let c = cs.c6.borrow();
+    assert_eq!((c.power_ups, c.en_glitches, c.held), (0, 1, false), "ridden out");
+    assert_eq!(c.now_cycles(), c6_cycle_of_ns(100_000), "and caught up with the shared clock");
+    assert_eq!(c.m.cores[0].pc(), 0x4080_0000, "still in its loop, not back in the ROM");
+}
+
+#[test]
+fn the_faults_parse() {
+    use esp32sim::cosim::{Fault, FaultKind, When};
+    assert_eq!(Fault::parse("read-crc@40").unwrap(), Fault { kind: FaultKind::ReadCrc, when: When::Nth { n: 40, byte: None } });
+    assert_eq!(Fault::parse("read-crc@40:1024").unwrap().when, When::Nth { n: 40, byte: Some(1024) });
+    assert_eq!(Fault::parse("wedge@4s").unwrap(), Fault { kind: FaultKind::Wedge, when: When::At { ns: 4_000_000_000, len: 0 } });
+    assert_eq!(Fault::parse("token-stall@3.5s+200ms").unwrap().when, When::At { ns: 3_500_000_000, len: 200_000_000 });
+    assert_eq!(Fault::parse("spurious-irq@1500us+20us").unwrap().when, When::At { ns: 1_500_000, len: 20_000 });
+    for bad in ["read-crc@0", "read-crc@4s", "wedge@40", "melt@1s", "wedge", "token-stall@1s+x"] { assert!(Fault::parse(bad).is_err(), "{bad}"); }
+    let s = CoprocSpec::parse("c6:app=a.bin,fault=dead-bus@2s,fault=resp-crc@7").unwrap();
+    assert_eq!(s.faults.iter().map(|f| f.kind).collect::<Vec<_>>(), [FaultKind::DeadBus, FaultKind::RespCrc]);
+}
+
 #[test]
 fn the_coproc_spec_parses_its_keys() {
     let s = CoprocSpec::parse("c6:bootloader=b.bin,ptable=p.bin,app=a.bin,otadata=o.bin@0xe000,stub=bb_init=0,stub=0x4200=1,en=!53,slice-us=5,flash-mb=8,mac=02:00:00:00:00:01").unwrap();
@@ -385,4 +416,138 @@ fn external_oxidrive_brings_up_wifi_through_the_c6() {
     assert!(c6_lines.iter().any(|l| l.contains("Sta mode connected")), "the C6 did not join the access point");
     // the virtual network's DHCP lease, which the firmware logs once WiFi is up
     assert!(p4_lines.iter().any(|l| l.contains("10.0.2.15")), "no lease through the C6");
+}
+
+// ------------------------------------------------------------------ faults, on the hosted pair
+
+/// The hosted pair with `faults`, run to `secs`: the P4's console lines, the C6's.
+fn faulted(faults: &[&str], secs: f64) -> (CoSim, Vec<String>, Vec<String>) {
+    let mut cs = hosted_pair(Config::default());
+    cs.c6.borrow_mut().faults.plan = faults.iter().map(|f| esp32sim::cosim::Fault::parse(f).unwrap()).collect();
+    cs.run_until((secs * 1e9) as u64).unwrap();
+    let (mut p4, mut c6) = (Vec::new(), Vec::new());
+    for (from_c6, l) in cs.lines.drain(..) { if from_c6 { c6.push(l) } else { p4.push(l) } }
+    assert_eq!(cs.c6.borrow().faults.fired.len(), faults.len(), "every fault fired");
+    (cs, p4, c6)
+}
+fn has(lines: &[String], s: &str) -> bool { lines.iter().any(|l| l.contains(s)) }
+fn after(lines: &[String], first: &str, then: &str) -> bool { lines.iter().skip_while(|l| !l.contains(first)).any(|l| l.contains(then)) }
+
+/// The C6 resets itself while the link is busy: its slave forgets the card, the RPC in flight is
+/// never answered, and ESP-Hosted's host gives up on it after 5 s, restarts the P4 and resets the
+/// C6 on GPIO 54 to start again.
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn a_c6_reset_mid_traffic_ends_in_a_host_restart() {
+    let mut cs = hosted_pair(Config::default());
+    cs.run_until(2_030_000_000).unwrap();
+    cs.c6.borrow_mut().m.bus.request_reset(esp_periph::RST_SW_SYS);
+    cs.run_until(10_000_000_000).unwrap();
+    let (p4, c6): (Vec<_>, Vec<_>) = cs.lines.drain(..).partition(|l| !l.0);
+    let (p4, c6): (Vec<String>, Vec<String>) = (p4.into_iter().map(|l| l.1).collect(), c6.into_iter().map(|l| l.1).collect());
+    assert!(has(&c6, "rst:0x3 (LP_SW_HPSYS)"), "the C6 came back through its ROM");
+    assert!(has(&p4, "Response not received for [0x118](Req_WifiStart)"), "the RPC in flight is lost");
+    assert!(after(&p4, "Rebooting...", "Reset slave using GPIO[54]"), "the host restarts and resets the C6");
+    let c = cs.c6.borrow();
+    assert_eq!((c.resets, c.power_ups, cs.summary.p4_resets, cs.summary.en_changes), (1, 2, 1, 4));
+    assert!(c6.iter().filter(|l| l.contains("Sta mode connected")).count() == 1 && after(&c6, "rst:0x1 (POWERON)", "Sta mode connected"), "joined again after the reset");
+}
+
+/// A CMD53 FIFO read fails its CRC after the slave gave the data: the packet (an RPC response) is
+/// lost, the RPC times out after 5 s, and the station example aborts and restarts the P4.
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn fault_read_crc_loses_the_packet_and_the_rpc_times_out() {
+    let (cs, p4, _) = faulted(&["read-crc@5"], 8.0);
+    assert!(has(&p4, "sdmmc_send_cmd returned 0x109") && has(&p4, "Failed to read data"));
+    assert!(has(&p4, "Response not received for [0x11c](Req_WifiSetConfig)"));
+    assert_eq!(cs.summary.p4_resets, 1, "the station example aborts");
+}
+
+/// The same with a data timeout (ESP_ERR_TIMEOUT, 0x107).
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn fault_read_timeout_loses_the_packet() {
+    let (cs, p4, _) = faulted(&["read-timeout@5"], 8.0);
+    assert!(has(&p4, "sdmmc_send_cmd returned 0x107") && has(&p4, "Failed to read data"));
+    assert_eq!(cs.summary.p4_resets, 1);
+}
+
+/// The combined register read fails: ESP-Hosted posts a transport failure and restarts the host
+/// at once (H_TRANSPORT_RESTART_ON_FAILURE); the restarted pair takes its lease again.
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn fault_reg_read_crc_restarts_the_host() {
+    let (cs, p4, _) = faulted(&["reg-read-crc@10"], 6.0);
+    assert!(has(&p4, "failed to read registers"));
+    assert!(after(&p4, "failed to read registers", "wifi station: got ip:10.0.2.15"), "up again after the restart");
+    let c = cs.c6.borrow();
+    assert_eq!((cs.summary.p4_resets, c.power_ups), (1, 2), "the C6 reset again by GPIO 54, once");
+    assert_eq!((c.en_glitches, cs.summary.en_changes), (1, 6), "and EN glitched for a slice as the restarted P4 made the pin an output");
+}
+
+/// A write's CRC status reports an error (the card drops the block), or never comes (the card
+/// took it): ESP-Hosted retries the write and the lease comes on time.
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn fault_write_errors_are_retried() {
+    for (fault, code) in [("write-crc@5", "0x109"), ("write-nostatus@5", "0x107")] {
+        let (cs, p4, _) = faulted(&[fault], 4.0);
+        assert!(has(&p4, &format!("sdmmc_send_cmd returned {code}")) && has(&p4, "Failed to send data"), "{fault}");
+        assert!(has(&p4, "I (3771) wifi station: got ip:10.0.2.15"), "{fault}: the lease on time");
+        assert_eq!(cs.summary.p4_resets, 0);
+    }
+}
+
+/// One command lost on the way (RTO) or answered with a bad CRC after the slave acted on it: one
+/// error, and the link goes on.
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn fault_a_lost_or_garbled_command_is_survived() {
+    for (fault, code) in [("cmd-timeout@100", "0x107"), ("resp-crc@100", "0x109")] {
+        let (cs, p4, _) = faulted(&[fault], 4.0);
+        assert!(has(&p4, &format!("sdmmc_send_cmd returned {code}")), "{fault}");
+        assert!(has(&p4, "wifi station: got ip:10.0.2.15"), "{fault}");
+        assert_eq!(cs.summary.p4_resets, 0);
+    }
+}
+
+/// The C6's CPU stops while its SDIO hardware answers on, or the bus goes dead, or one DAT1 edge
+/// is lost: ESP-Hosted's receive task waits for an interrupt without a timeout, so the host stalls
+/// without a word, no error and no restart, and the lease never comes.
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn fault_a_wedged_slave_a_dead_bus_or_a_lost_edge_stall_the_host_silently() {
+    for fault in ["wedge@2.5s", "dead-bus@2.5s", "drop-irq@2.05s"] {
+        let (mut cs, p4, _) = faulted(&[fault], 8.0);
+        assert!(!has(&p4, "got ip") && !p4.iter().any(|l| l.starts_with("E (")), "{fault}: silence");
+        assert_eq!(p4.last().map(String::as_str), Some("I (2091) H_API: esp_wifi_remote_connect"), "{fault}");
+        assert_eq!(cs.summary.p4_resets, 0, "{fault}");
+        if fault.starts_with("wedge") { assert_eq!(cs.c6.borrow().now_cycles(), c6_cycle_of_ns(2_500_000_000), "the C6 stopped where it was"); }
+        if fault.starts_with("drop") {
+            assert!(!cs.p4.bus.periph.gpio.g.level(15), "D1 low: the slave interrupts");
+            assert_eq!(cs.p4.bus.read32(SDMMC + 0x44).unwrap() & 1 << 17, 0, "but RINTSTS never saw the edge");
+        }
+    }
+}
+
+/// D1 low for 20 ms with nothing pending: the host reads the registers, finds nothing, and the
+/// lease comes as without it.
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn fault_a_spurious_interrupt_is_harmless() {
+    let (cs, p4, _) = faulted(&["spurious-irq@2.5s+20ms"], 4.0);
+    assert!(has(&p4, "I (3771) wifi station: got ip:10.0.2.15") && !p4.iter().any(|l| l.starts_with("E (")));
+    assert_eq!(cs.summary.p4_resets, 0);
+}
+
+/// TOKEN1 shows no free receive buffer from before the host's first write until 2.5 s: the host
+/// polls it with growing intervals (sdio_is_write_buffer_available) and its traffic waits, so the
+/// lease comes half a second late.
+#[test]
+#[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn fault_exhausted_slave_buffers_hold_the_host_back() {
+    let (cs, p4, _) = faulted(&["token-stall@1s+1.5s"], 5.0);
+    assert!(has(&p4, "I (4271) wifi station: got ip:10.0.2.15"), "half a second late");
+    assert!(cs.c6.borrow().m.bus.periph.optional.sdio.stats.commands > 150, "TOKEN1 polled");
 }

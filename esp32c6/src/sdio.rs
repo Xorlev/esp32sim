@@ -200,6 +200,12 @@ pub struct SdioSlave {
     blksz: [u16; 3],
     xfer: Option<Xfer>,
     pub stats: SdioStats,
+    /// TOKEN1 as the host reads it, held at this value (a test's fault: the receive buffers look
+    /// exhausted while the driver goes on loading them)
+    pub token1_hold: Option<u32>,
+    /// receive buffers the host has filled since the driver last wrote TOKEN1
+    tx_closed: u32,
+    token1_base: u32,
     log: bool,
 }
 
@@ -214,7 +220,7 @@ impl SdioSlave {
             cfg_data0: CFG_DATA0_RESET, cfg_data1: CFG_DATA1_RESET, hinf: RegRam::new(), conf0: 0, int_raw: 0, int_ena: 0, token: [0; 2], len: 0,
             rx: RxLink::default(), tx: TxLink::default(), rx_kick: false, new_packet_armed: false, host_len: 0, defer_to: None, deferred: Vec::new(), slc, host_raw: 0, host_ena: 0, host_ram: RegRam::new(),
             state: CardState::Inactive, rca: 0, ioe: 0, ien: 0, bus_ctrl: 0, ehs: false, blksz: [512; 3], xfer: None,
-            stats: SdioStats::default(), log: false,
+            stats: SdioStats::default(), token1_hold: None, tx_closed: 0, token1_base: 0, log: false,
         }
     }
 
@@ -228,6 +234,14 @@ impl SdioSlave {
     pub fn host_interrupt(&self) -> bool {
         self.cfg_data1 & SDIO_ENABLE != 0 && self.cfg_data1 & SDIO_INT_MASK == 0 && self.ien & 0x03 == 0x03 && self.func1_pending()
     }
+
+    /// Bytes left in the CMD53 data phase in progress.
+    pub fn transfer_left(&self) -> u32 { self.xfer.map_or(0, |x| x.left) }
+    /// SLC0TOKEN1's count, as the driver has it.
+    pub fn token1(&self) -> u32 { self.token[1] }
+    /// TOKEN1 as an exhausted slave would show it: every buffer loaded since the driver last wrote
+    /// TOKEN1 filled, none free.
+    pub fn token1_exhausted(&self) -> u32 { self.token1_base.wrapping_add(self.tx_closed) & 0xfff }
 
     /// The data lines the card drives: 4 after CCCR Bus Width 10b, else 1 (§6.9).
     pub fn bus_width(&self) -> u8 { if self.bus_ctrl & 3 == 2 { 4 } else { 1 } }
@@ -452,6 +466,7 @@ impl SdioSlave {
         self.effect(mem, Effect::Int(sint::TX_DONE | if eof { sint::TX_SUC_EOF } else { 0 }));
         if self.log { eprintln!("[sdio] tx buffer {:#010x}: {} bytes{}", self.tx.cur, self.tx.fill, if eof { ", EOF" } else { "" }); }
         (self.tx.last, self.tx.cur, self.tx.fill) = (self.tx.cur, d.next, 0);
+        self.tx_closed = self.tx_closed.wrapping_add(1);
     }
 
     /// A byte the host reads with CMD52 or a CMD53 below the FIFO, with the bookkeeping behind
@@ -543,7 +558,7 @@ impl SdioSlave {
     /// An SLCHOST register as both sides read it.
     fn host_word(&self, off: u32) -> u32 {
         match off {
-            host::TOKEN_RDATA => (self.token[1] & 0xfff) << 16 | (self.token[0] & 0xfff),
+            host::TOKEN_RDATA => (self.token1_hold.unwrap_or(self.token[1]) & 0xfff) << 16 | (self.token[0] & 0xfff),
             host::INT_RAW => self.host_raw,
             host::INT_ST => self.host_raw & self.host_ena,
             // LEN_CHECK (31:20) reads 0: what the hardware puts there is not documented
@@ -614,6 +629,7 @@ impl SdioSlave {
                 let t = &mut self.token[((off - slc::TOKEN0) / 4) as usize];
                 let wdata = v & 0xfff;
                 if v & slc::TOKEN_WR != 0 { *t = wdata; }
+                if v & slc::TOKEN_WR != 0 && off == slc::TOKEN1 { (self.token1_base, self.tx_closed) = (wdata, 0); }
                 if v & slc::TOKEN_INC != 0 { *t = (*t + 1) & 0xfff; }
                 if v & slc::TOKEN_INC_MORE != 0 { *t = (*t + wdata) & 0xfff; }
             }
@@ -699,6 +715,14 @@ impl crate::bus::SocBus {
     }
     /// The machine cycle a queued hand-back is due.
     pub fn sdio_next_due(&self) -> Option<u64> { self.periph.optional.sdio.next_due() }
+    /// Carry out every queued hand-back, as if the time had passed (a co-processor whose CPU has
+    /// stopped while its DMA goes on).
+    #[cold]
+    #[inline(never)]
+    pub fn sdio_apply_all(&mut self) {
+        let mut mem = Sram { base: crate::bus::SRAM_LOW, bytes: &mut self.sram };
+        if self.periph.optional.sdio.apply_due(u64::MAX, &mut mem) { self.sdio_settle(); }
+    }
     /// Carry out the hand-backs that have come due.
     #[cold]
     #[inline(never)]

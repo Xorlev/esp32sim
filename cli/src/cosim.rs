@@ -49,6 +49,10 @@ pub struct Config {
 /// ESP_HOSTED_SDIO_GPIO_RESET_SLAVE, default 54 on the ESP32-P4), active high: low resets
 /// (CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH, "Low will trigger reset").
 pub const DEFAULT_EN_PIN: u8 = 54;
+/// The shortest EN low that resets the C6: t_RST, 50 µs (ESP32-C6 Series Datasheet, "Chip
+/// Power-up and Reset"). A GPIO set to output before its level is written can glitch EN for a
+/// slice.
+pub const EN_RESET_NS: u64 = 50_000;
 /// 10 µs: an SDIO interrupt waits at most this long for the P4 to see it.
 pub const DEFAULT_SLICE_NS: u64 = 10_000;
 
@@ -63,6 +67,10 @@ pub struct Coproc {
     origin: u64,
     /// EN is low: the chip is held in reset and runs nothing
     pub held: bool,
+    /// when EN went low
+    held_at: u64,
+    /// EN pulses shorter than a reset takes, which the chip rode out
+    pub en_glitches: u64,
     /// why the C6 stopped for good, if it did
     pub halted: Option<String>,
     reboot: bool,
@@ -74,11 +82,13 @@ pub struct Coproc {
     pub resets: u64,
     /// commands whose time the C6 had already passed: the two clocks disagree
     pub late_commands: u64,
+    /// the faults the link injects, and their state
+    pub faults: FaultState,
 }
 
 impl Coproc {
     pub fn new(m: C6Machine) -> Self {
-        Coproc { m, origin: 0, held: false, halted: None, reboot: true, console_mask: 2, console: Vec::new(), power_ups: 0, resets: 0, late_commands: 0 }
+        Coproc { m, origin: 0, held: false, held_at: 0, en_glitches: 0, halted: None, reboot: true, console_mask: 2, console: Vec::new(), power_ups: 0, resets: 0, late_commands: 0, faults: FaultState::default() }
     }
 
     /// Where the C6 stands on the shared clock, in its own cycles.
@@ -93,6 +103,10 @@ impl Coproc {
     /// host started hands its descriptors back. A chip in reset or stopped stays where it is.
     pub fn advance_to(&mut self, ns: u64) {
         let target = c6_cycle_of_ns(ns);
+        if self.faults.wedged {
+            self.m.bus.sdio_apply_all();
+            return;
+        }
         loop {
             if self.m.bus.sdio_next_due().is_some_and(|d| d <= self.m.bus.cycles()) { self.m.bus.sdio_apply_due(); }
             if !self.running() || self.now_cycles() >= target { break; }
@@ -111,12 +125,14 @@ impl Coproc {
     /// EN low at `ns`: the C6 runs up to then and stops.
     fn hold(&mut self, ns: u64) {
         self.advance_to(ns);
-        self.held = true;
+        (self.held, self.held_at) = (true, ns);
     }
 
-    /// EN high at `ns`: a power-on reset, the chip starting again from its ROM.
+    /// EN high at `ns`: a power-on reset, the chip starting again from its ROM, if EN was low
+    /// long enough to reset it; after a shorter pulse the chip runs on.
     fn release(&mut self, ns: u64) {
         self.held = false;
+        if ns - self.held_at < EN_RESET_NS { self.en_glitches += 1; return; }
         if self.halted.is_some() { return; }
         self.m.reboot();
         self.m.bus.set_reset_cause(esp_periph::RST_POWERON);
@@ -146,35 +162,233 @@ impl SdDevice for SdioLink {
         let mut c = self.0.borrow_mut();
         if c6_cycle_of_ns(now) < c.now_cycles() { c.late_commands += 1; }
         c.advance_to(now);
-        if !c.running() { return Err(SdCmdError::NoResponse); }
+        if !c.running() || c.faults.dead { return Err(SdCmdError::NoResponse); }
+        let fault = c.faults.on_command(now, cmd, arg);
+        if fault == Some(FaultKind::CmdTimeout) { return Err(SdCmdError::NoResponse); }
         let r = c.m.bus.sdio_command(cmd, arg);
         c.m.sync_irq();
-        r
+        match (fault, r) {
+            (Some(FaultKind::RespCrc), Ok(resp)) => Err(SdCmdError::Crc(resp)),
+            (_, r) => r,
+        }
     }
     /// The bytes move now; the slave hands its descriptors back when the C6 reaches `now`, the
     /// end of the data phase on the bus (at once unless the bus is timed or the C6 is behind).
     fn read_data(&mut self, now: u64, buf: &mut [u8]) -> Result<(), SdDataError> {
         let mut c = self.0.borrow_mut();
-        if !c.running() { return Err(SdDataError::Timeout); }
+        if !c.running() || c.faults.dead { return Err(SdDataError::Timeout); }
         let done = c.machine_cycle_of_ns(now);
         let r = c.m.bus.sdio_read_data(buf, done);
         c.m.sync_irq();
-        r
+        r?;
+        let last = c.m.bus.periph.optional.sdio.transfer_left() == 0;
+        match c.faults.on_read_block(buf.len(), last) {
+            Some(FaultKind::ReadTimeout) => Err(SdDataError::Timeout),
+            Some(_) => Err(SdDataError::Crc),
+            None => Ok(()),
+        }
     }
     fn write_data(&mut self, now: u64, data: &[u8]) -> Result<(), SdDataError> {
         let mut c = self.0.borrow_mut();
-        if !c.running() { return Err(SdDataError::NoCrcStatus); }
+        if !c.running() || c.faults.dead { return Err(SdDataError::NoCrcStatus); }
+        let fault = c.faults.on_write_block();
+        if fault == Some(FaultKind::WriteCrc) { return Err(SdDataError::Crc); }
         let done = c.machine_cycle_of_ns(now);
         let r = c.m.bus.sdio_write_data(data, done);
         c.m.sync_irq();
+        if fault == Some(FaultKind::WriteNoStatus) { return Err(SdDataError::NoCrcStatus); }
         r
     }
-    fn bus_width(&self) -> Option<u8> { let c = self.0.borrow(); c.running().then(|| c.m.bus.sdio_bus_width()) }
-    fn interrupt(&self) -> bool { let c = self.0.borrow(); c.running() && c.m.bus.sdio_interrupt() }
+    fn bus_width(&self) -> Option<u8> { let c = self.0.borrow(); (c.running() && !c.faults.dead).then(|| c.m.bus.sdio_bus_width()) }
+    fn interrupt(&self) -> bool {
+        let c = self.0.borrow();
+        c.running() && !c.faults.dead && (c.faults.spurious || c.m.bus.sdio_interrupt())
+    }
+    fn edge_lost(&self) -> bool { self.0.borrow().faults.drop_edge.take() }
     fn io(&self) -> bool { true }
     fn name(&self) -> &str { "esp32c6" }
 }
 
+/// A fault the link injects. Each fires at a point the run itself fixes, the Nth command or data
+/// transfer of its kind or a shared time, never a host clock or randomness, so a run with faults
+/// is as reproducible as one without.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultKind {
+    /// the Nth CMD53 read of function 1's FIFO: the slave gives its data (all of it, or up to byte
+    /// K), the host sees a data CRC error
+    ReadCrc,
+    /// the same with a data read timeout
+    ReadTimeout,
+    /// the Nth CMD53 read of the register window (ESP-Hosted's combined INT_RAW..PKT_LEN read)
+    /// fails its CRC
+    RegReadCrc,
+    /// the Nth CMD53 write to the FIFO: the card reports a CRC error and drops the block
+    WriteCrc,
+    /// the card takes the Nth write's data, its CRC status never comes
+    WriteNoStatus,
+    /// the Nth command never reaches the slave: a response timeout
+    CmdTimeout,
+    /// the slave carries the Nth command out; its response fails its CRC
+    RespCrc,
+    /// from a time on the C6's CPU stops; its SDIO hardware goes on answering, TOKEN and PKT_LEN
+    /// frozen with it
+    Wedge,
+    /// from a time on nothing answers on the bus
+    DeadBus,
+    /// the first DAT1 assertion from a time on goes unlatched by the host (D1 still low)
+    DropIrq,
+    /// D1 held low for a while with nothing pending
+    SpuriousIrq,
+    /// TOKEN1, as the host reads it, shows no free receive buffer for a while (the buffers the
+    /// host has filled, none since loaded), while the driver goes on loading them
+    TokenStall,
+}
+
+/// When a fault fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum When {
+    /// the Nth (from 1) of its kind; for a read, `byte` limits the data given before the error
+    Nth { n: u64, byte: Option<u32> },
+    /// from `ns` on the shared clock, for `len` ns where the fault is a window
+    At { ns: u64, len: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fault { pub kind: FaultKind, pub when: When }
+
+const FAULT_NAMES: [(&str, FaultKind); 12] = [
+    ("read-crc", FaultKind::ReadCrc), ("read-timeout", FaultKind::ReadTimeout), ("reg-read-crc", FaultKind::RegReadCrc),
+    ("write-crc", FaultKind::WriteCrc), ("write-nostatus", FaultKind::WriteNoStatus), ("cmd-timeout", FaultKind::CmdTimeout),
+    ("resp-crc", FaultKind::RespCrc), ("wedge", FaultKind::Wedge), ("dead-bus", FaultKind::DeadBus), ("drop-irq", FaultKind::DropIrq),
+    ("spurious-irq", FaultKind::SpuriousIrq), ("token-stall", FaultKind::TokenStall),
+];
+
+impl FaultKind {
+    pub fn name(self) -> &'static str { FAULT_NAMES.iter().find(|f| f.1 == self).unwrap().0 }
+    /// Counted (the Nth transfer or command) rather than timed.
+    pub fn counted(self) -> bool {
+        matches!(self, FaultKind::ReadCrc | FaultKind::ReadTimeout | FaultKind::RegReadCrc | FaultKind::WriteCrc | FaultKind::WriteNoStatus | FaultKind::CmdTimeout | FaultKind::RespCrc)
+    }
+}
+
+/// `1500us`, `2ms`, `3.25s`: emulated nanoseconds.
+fn parse_ns(t: &str) -> Option<u64> {
+    let (num, scale) = if let Some(n) = t.strip_suffix("us") { (n, 1e3) } else if let Some(n) = t.strip_suffix("ms") { (n, 1e6) } else { (t.strip_suffix('s')?, 1e9) };
+    let v: f64 = num.parse().ok()?;
+    (v >= 0.0).then(|| (v * scale).round() as u64)
+}
+
+impl Fault {
+    /// `KIND@N[:K]` for the counted kinds (`read-crc@40`, `read-crc@40:1024`), `KIND@TIME[+LEN]`
+    /// for the timed ones (`wedge@4s`, `token-stall@3.5s+200ms`).
+    pub fn parse(spec: &str) -> Result<Fault, String> {
+        let (name, when) = spec.split_once('@').ok_or_else(|| format!("{spec}: expected KIND@WHEN"))?;
+        let kind = FAULT_NAMES.iter().find(|f| f.0 == name).map(|f| f.1)
+            .ok_or_else(|| format!("{name}: unknown fault ({})", FAULT_NAMES.iter().map(|f| f.0).collect::<Vec<_>>().join(", ")))?;
+        let when = if kind.counted() {
+            let (n, byte) = match when.split_once(':') { Some((n, k)) => (n, Some(k.parse().map_err(|_| format!("{spec}: bad byte {k}"))?)), None => (when, None) };
+            When::Nth { n: n.parse().ok().filter(|&n| n > 0).ok_or_else(|| format!("{spec}: expected a count from 1"))?, byte }
+        } else {
+            let (t, len) = when.split_once('+').map_or((when, None), |(t, l)| (t, Some(l)));
+            let ns = parse_ns(t).ok_or_else(|| format!("{spec}: expected a time such as 3.5s or 200ms"))?;
+            let len = match len { Some(l) => parse_ns(l).ok_or_else(|| format!("{spec}: bad length {l}"))?, None => 0 };
+            When::At { ns, len }
+        };
+        Ok(Fault { kind, when })
+    }
+}
+
+/// The faults of a run and where they stand.
+#[derive(Debug, Default)]
+pub struct FaultState {
+    pub plan: Vec<Fault>,
+    /// what fired, when: (fault, shared ns)
+    pub fired: Vec<(Fault, u64)>,
+    commands: u64,
+    fifo_reads: u64,
+    reg_reads: u64,
+    writes: u64,
+    now: u64,
+    /// the data phase in progress fails: its kind, and the bytes still given before the error
+    data: Option<(FaultKind, u32)>,
+    pub wedged: bool,
+    pub dead: bool,
+    pub spurious: bool,
+    drop_edge: std::cell::Cell<bool>,
+    /// which timed faults are on
+    active: Vec<bool>,
+}
+
+impl FaultState {
+    fn fire(&mut self, f: Fault) { self.fired.push((f, self.now)); }
+
+    /// A command at `now`: the counted command faults, and the CMD53 data faults armed for the
+    /// data phase it starts.
+    fn on_command(&mut self, now: u64, cmd: u8, arg: u32) -> Option<FaultKind> {
+        if self.plan.is_empty() { return None; }
+        self.now = now;
+        self.commands += 1;
+        self.data = None;
+        let mut hit = None;
+        if cmd == 53 && arg >> 28 & 7 == 1 {
+            let (write, fifo) = (arg >> 31 != 0, arg >> 9 & 0x1_ffff >= esp32c6::sdio::FIFO_START);
+            let (counter, kinds): (u64, &[FaultKind]) = match (write, fifo) {
+                (false, true) => { self.fifo_reads += 1; (self.fifo_reads, &[FaultKind::ReadCrc, FaultKind::ReadTimeout]) }
+                (false, false) => { self.reg_reads += 1; (self.reg_reads, &[FaultKind::RegReadCrc]) }
+                (true, true) => { self.writes += 1; (self.writes, &[FaultKind::WriteCrc, FaultKind::WriteNoStatus]) }
+                (true, false) => (0, &[]),
+            };
+            if let Some(f) = self.plan.iter().copied().find(|f| kinds.contains(&f.kind) && matches!(f.when, When::Nth { n, .. } if n == counter)) {
+                let byte = match f.when { When::Nth { byte: Some(b), .. } => b, _ => u32::MAX };
+                self.data = Some((f.kind, byte));
+                self.fire(f);
+            }
+        }
+        let commands = self.commands;
+        if let Some(f) = self.plan.iter().copied().find(|f| matches!(f.kind, FaultKind::CmdTimeout | FaultKind::RespCrc) && f.when == When::Nth { n: commands, byte: None }) {
+            self.fire(f);
+            hit = Some(f.kind);
+        }
+        hit
+    }
+
+    /// After the slave gave a block of a read (`last`: the transfer's end): whether it fails. A
+    /// read fails at the block holding byte K, else at its last block, the slave's data given.
+    fn on_read_block(&mut self, len: usize, last: bool) -> Option<FaultKind> {
+        let (kind, limit) = self.data?;
+        let hit = if limit == u32::MAX { last } else { len as u32 > limit };
+        self.data = if hit { None } else { Some((kind, limit.saturating_sub(len as u32))) };
+        hit.then_some(kind)
+    }
+
+    /// The timed faults at a slice end `t`. True when the slave's TOKEN1 hold changes, with the
+    /// value to hold.
+    fn at_slice_end(&mut self, t: u64) -> Option<bool> {
+        if self.plan.is_empty() { return None; }
+        self.now = t;
+        self.active.resize(self.plan.len(), false);
+        let mut token = None;
+        for i in 0..self.plan.len() {
+            let f = self.plan[i];
+            let When::At { ns, len } = f.when else { continue };
+            let on = t >= ns && (len == 0 || t < ns + len || matches!(f.kind, FaultKind::Wedge | FaultKind::DeadBus | FaultKind::DropIrq));
+            if on == self.active[i] || (self.active[i] && matches!(f.kind, FaultKind::Wedge | FaultKind::DeadBus | FaultKind::DropIrq)) { continue; }
+            self.active[i] = on;
+            if on { self.fire(f); }
+            match f.kind {
+                FaultKind::Wedge => self.wedged = true,
+                FaultKind::DeadBus => self.dead = true,
+                FaultKind::DropIrq => self.drop_edge.set(true),
+                FaultKind::SpuriousIrq => self.spurious = on,
+                FaultKind::TokenStall => token = Some(on),
+                _ => {}
+            }
+        }
+        token
+    }
+
+    fn on_write_block(&mut self) -> Option<FaultKind> { self.data.take().map(|d| d.0) }
+}
 /// `--coproc c6:KEY=VALUE,...`: the co-processor's images and wiring.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CoprocSpec {
@@ -187,6 +401,8 @@ pub struct CoprocSpec {
     pub en_pin: Option<u8>, pub en_inverted: bool, pub slice_ns: Option<u64>,
     /// where the C6's console goes instead of stdout
     pub console: Option<String>,
+    /// faults the link injects (`fault=KIND@WHEN`, repeatable)
+    pub faults: Vec<Fault>,
 }
 
 impl CoprocSpec {
@@ -221,7 +437,8 @@ impl CoprocSpec {
                 }
                 "slice-us" => s.slice_ns = Some(v.parse::<u64>().ok().filter(|&u| u > 0).ok_or_else(|| format!("slice-us: {v}"))?.saturating_mul(1000)),
                 "console" => s.console = Some(v.into()),
-                _ => return Err(format!("unknown key {k:?} (bootloader, ptable, app, otadata, elf, stub, rom, flash-mb, mac, en, slice-us, console)")),
+                "fault" => s.faults.push(Fault::parse(v)?),
+                _ => return Err(format!("unknown key {k:?} (bootloader, ptable, app, otadata, elf, stub, rom, flash-mb, mac, en, slice-us, console, fault)")),
             }
         }
         if s.app.is_none() { return Err("app=FILE is needed".into()); }
@@ -309,6 +526,13 @@ impl CoSim {
     /// EN is sampled here only, so it takes effect up to a slice late and a pulse shorter than a
     /// slice can be missed (ESP-Hosted's is 10 ms).
     fn exchange(&mut self, t: u64) {
+        {
+            let mut c = self.c6.borrow_mut();
+            if let Some(hold) = c.faults.at_slice_end(t) {
+                let sdio = &mut c.m.bus.periph.optional.sdio;
+                sdio.token1_hold = hold.then(|| sdio.token1_exhausted());
+            }
+        }
         self.p4.bus.sync_sdio();
         self.p4.sync_irq();
         let en = self.en_level();

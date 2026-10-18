@@ -73,6 +73,8 @@ pub trait SdDevice {
     /// An SDIO function, whose DAT1 carries its interrupt between transfers (SDIO Simplified
     /// Specification v3.00 §8.1.2).
     fn io(&self) -> bool { false }
+    /// Asked as DAT1 goes low: true makes the host miss this edge, D1 still low (a fault).
+    fn edge_lost(&self) -> bool { false }
     fn name(&self) -> &str;
     fn set_log(&mut self, _on: bool) {}
 }
@@ -304,8 +306,9 @@ impl Sdmmc {
     pub fn poll_sdio(&mut self) -> bool {
         let before = self.rintsts;
         for slot in 0..SLOTS {
-            let irq = self.route[slot].and_then(|i| self.devices.get(i)).is_some_and(|d| d.io() && d.interrupt());
-            if irq && !self.sdio_irq[slot] { self.rintsts |= int::SDIO_SLOT0 << slot; }
+            let dev = self.route[slot].and_then(|i| self.devices.get(i));
+            let irq = dev.is_some_and(|d| d.io() && d.interrupt());
+            if irq && !self.sdio_irq[slot] && !dev.is_some_and(|d| d.edge_lost()) { self.rintsts |= int::SDIO_SLOT0 << slot; }
             self.sdio_irq[slot] = irq;
         }
         self.rintsts != before

@@ -287,6 +287,7 @@ fn run_cosim(o: &Opts) {
     let mut c6_file = spec.console.as_ref().map(|p| std::fs::File::create(p).unwrap_or_else(|e| usage_error(&format!("--coproc console={p}: {e}"))));
     let prefix = o.console_prefix;
     let mut cs = cosim::CoSim::new(p4, c6, cfg);
+    cs.c6.borrow_mut().faults.plan = spec.faults.clone();
     let t0 = std::time::Instant::now();
     let stdout = std::io::stdout();
     let mut stop = Stop::Halted;
@@ -314,7 +315,9 @@ fn run_cosim(o: &Opts) {
     let stale = if st.stale_new_packets > 0 { format!(", {} packets announced before their length", st.stale_new_packets) } else { String::new() };
     eprintln!("[c6] sdio: {} commands, {} bytes to the host, {} from it, {} underflows, {} overflows{stale}", st.commands, st.to_host, st.from_host, st.underflows, st.overflows);
     { let r = c.m.bus.report(); if !r.is_empty() { for l in r.lines() { eprintln!("[c6] {l}"); } } }
+    for (f, ns) in &c.faults.fired { eprintln!("[cosim] fault {} fired at {:.6}s", fault_label(f), *ns as f64 / 1e9); }
     let late = if c.late_commands > 0 { format!(", {} commands late for the C6", c.late_commands) } else { String::new() };
+    let late = if c.en_glitches > 0 { format!("{late}, {} EN pulses too short to reset the C6", c.en_glitches) } else { late };
     eprintln!("[cosim] {} slices, {} EN changes, {} P4 resets{late}{}", cs.summary.slices, cs.summary.en_changes, cs.summary.p4_resets, cs.summary.stopped.as_ref().map(|s| format!("; stopped: {s}")).unwrap_or_default());
 }
 
@@ -400,6 +403,15 @@ fn setup_s3(o: &Opts) -> esp32s3::Machine {
 
 /// `--wifi SPEC` with `--net`: the virtual access point's configuration and, for `--net nat`,
 /// the NAT to the host, the same for every chip.
+fn fault_label(f: &cosim::Fault) -> String {
+    match f.when {
+        cosim::When::Nth { n, byte: Some(k) } => format!("{}@{n}:{k}", f.kind.name()),
+        cosim::When::Nth { n, byte: None } => format!("{}@{n}", f.kind.name()),
+        cosim::When::At { ns, len: 0 } => format!("{}@{}s", f.kind.name(), ns as f64 / 1e9),
+        cosim::When::At { ns, len } => format!("{}@{}s+{}s", f.kind.name(), ns as f64 / 1e9, len as f64 / 1e9),
+    }
+}
+
 /// `--wifi` and `--net MODE[,epoch=UNIX_SECONDS]`: the access point, and the NAT for `nat` (or
 /// `user`); `epoch` fixes the virtual network's clock (its SNTP answers) at power-on.
 fn wifi_config(spec: &str, net: &str, net_log: bool) -> (esp_soc::wifi::ApConfig, Option<esp_soc::nat::Nat>) {
