@@ -116,7 +116,11 @@ pub fn mosquitto_conf(port: u16, passwd: &Path) -> String {
 
 /// mosquitto with one user. `MOSQUITTO` names the broker, `MOSQUITTO_PASSWD`, `MOSQUITTO_SUB`
 /// and `MOSQUITTO_PUB` the clients.
-pub struct Mosquitto { pub svc: Service, pub user: String, pub pass: String }
+pub struct Mosquitto { pub svc: Service, pub client: MqttClient }
+
+/// The broker's address and the user, for its command-line clients.
+#[derive(Clone, Debug)]
+pub struct MqttClient { pub port: u16, pub user: String, pub pass: String }
 
 impl Mosquitto {
     pub fn start(user: &str, pass: &str) -> Result<Mosquitto, String> {
@@ -130,19 +134,21 @@ impl Mosquitto {
         let mut cmd = Command::new(broker);
         cmd.arg("-c").arg(&conf);
         let svc = Service::start("mosquitto", cmd, port, &dir, Duration::from_secs(10))?;
-        Ok(Mosquitto { svc, user: user.into(), pass: pass.into() })
+        Ok(Mosquitto { svc, client: MqttClient { port, user: user.into(), pass: pass.into() } })
     }
+}
 
-    fn client(&self, tool: &str) -> Result<Command, String> {
+impl MqttClient {
+    fn tool(&self, tool: &str) -> Result<Command, String> {
         let mut c = Command::new(mosquitto_tool(tool)?);
-        c.args(["-h", "127.0.0.1", "-p", &self.svc.port.to_string(), "-u", &self.user, "-P", &self.pass]);
+        c.args(["-h", "127.0.0.1", "-p", &self.port.to_string(), "-u", &self.user, "-P", &self.pass]);
         Ok(c)
     }
 
     /// The retained messages on `topics` (filters allowed), as (topic, payload): what a client
     /// subscribing now is sent first. Waits up to `wait` for them.
     pub fn retained(&self, topics: &[&str], wait: Duration) -> Result<Vec<(String, String)>, String> {
-        let mut c = self.client("mosquitto_sub")?;
+        let mut c = self.tool("mosquitto_sub")?;
         c.args(["-v", "--retained-only", "-W", &wait.as_secs().max(1).to_string()]);
         for t in topics { c.args(["-t", t]); }
         let out = c.stdin(Stdio::null()).output().map_err(|e| format!("mosquitto_sub: {e}"))?;
@@ -154,7 +160,7 @@ impl Mosquitto {
     }
 
     pub fn publish(&self, topic: &str, payload: &str) -> Result<(), String> {
-        run_tool(self.client("mosquitto_pub")?.args(["-t", topic, "-m", payload]), "").map(|_| ())
+        run_tool(self.tool("mosquitto_pub")?.args(["-t", topic, "-m", payload]), "").map(|_| ())
     }
 }
 
@@ -165,7 +171,9 @@ fn samba_tool(var: &str, name: &str) -> Result<PathBuf, String> {
 
 /// smbd's configuration: a standalone server on 127.0.0.1:`port`, every directory it keeps state
 /// in under `dir`, SMB 2.1 to 3.1.1 with signing required, and one share writable by the user
-/// that `users.map` maps to `unix_user`.
+/// that `users.map` maps to `unix_user`. `vfs mkdir use tmp name` is off: samba 4.25 makes a
+/// directory under a temporary name with mode 0 and renames it into place, and on macOS that
+/// rename fails (EACCES), leaving a mode-0 directory and the client ACCESS_DENIED.
 pub fn samba_conf(dir: &Path, port: u16, share: &str, unix_user: &str) -> String {
     let d = dir.display();
     format!("[global]
@@ -186,6 +194,7 @@ pub fn samba_conf(dir: &Path, port: u16, share: &str, unix_user: &str) -> String
   pid directory = {d}/pid
   ncalrpc dir = {d}/ncalrpc
   log file = {d}/log/smbd.log
+  vfs mkdir use tmp name = no
   disable spoolss = yes
   load printers = no
 [{share}]
@@ -266,7 +275,7 @@ fn the_service_configurations_keep_to_loopback_and_their_directory() {
     for l in smb.lines().filter(|l| l.contains(" dir") || l.contains("directory") || l.contains("file =") || l.contains("path =")) {
         assert!(l.split_once(" = ").is_some_and(|(_, v)| v.starts_with("/tmp/svc/") || v.starts_with("tdbsam:/tmp/svc/")), "{l}");
     }
-    for want in ["smb ports = 4445", "interfaces = 127.0.0.1", "bind interfaces only = yes", "server signing = mandatory", "server max protocol = SMB3_11", "[archive]", "valid users = someone"] {
+    for want in ["smb ports = 4445", "interfaces = 127.0.0.1", "bind interfaces only = yes", "server signing = mandatory", "server max protocol = SMB3_11", "vfs mkdir use tmp name = no", "[archive]", "valid users = someone"] {
         assert!(smb.contains(want), "{want}");
     }
     let mq = mosquitto_conf(1884, Path::new("/tmp/svc/passwd"));
@@ -281,14 +290,15 @@ fn external_samba_and_mosquitto_serve_a_test_client() {
     let smb = Samba::start("archive", "esp32sim", "esp32sim-smb").unwrap_or_else(|e| panic!("{e}"));
     let src = smb.svc.dir.join("hello.txt");
     std::fs::write(&src, b"hello over SMB3").unwrap();
-    smb.smbclient(&format!("put {} hello.txt", src.display())).unwrap_or_else(|e| panic!("{e}"));
+    smb.smbclient(&format!("put {} hello.txt; mkdir a; mkdir a/b; put {} a/b/hello.txt", src.display(), src.display())).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(std::fs::read(smb.path().join("hello.txt")).unwrap(), b"hello over SMB3");
+    assert_eq!(std::fs::read(smb.path().join("a/b/hello.txt")).unwrap(), b"hello over SMB3", "a file in a directory the client made");
     assert!(smb.smbclient("ls").unwrap().contains("hello.txt"));
     let mq = Mosquitto::start("esp32sim", "esp32sim-mqtt").unwrap_or_else(|e| panic!("{e}"));
-    mq.publish("esp32sim/test", "retained?").unwrap_or_else(|e| panic!("{e}"));
-    let none = mq.retained(&["esp32sim/#"], Duration::from_secs(1)).unwrap();
+    mq.client.publish("esp32sim/test", "retained?").unwrap_or_else(|e| panic!("{e}"));
+    let none = mq.client.retained(&["esp32sim/#"], Duration::from_secs(1)).unwrap();
     assert!(none.is_empty(), "a message published without -r is not retained: {none:?}");
-    run_tool(mq.client("mosquitto_pub").unwrap().args(["-r", "-t", "esp32sim/test", "-m", "kept"]), "").unwrap();
-    let kept = mq.retained(&["esp32sim/#"], Duration::from_secs(1)).unwrap();
+    run_tool(mq.client.tool("mosquitto_pub").unwrap().args(["-r", "-t", "esp32sim/test", "-m", "kept"]), "").unwrap();
+    let kept = mq.client.retained(&["esp32sim/#"], Duration::from_secs(1)).unwrap();
     assert_eq!(kept, [("esp32sim/test".to_string(), "kept".to_string())]);
 }

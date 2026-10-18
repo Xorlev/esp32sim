@@ -569,3 +569,11 @@ impl CoSim {
         lines(&mut self.c6.borrow_mut().console, true, &mut self.lines);
     }
 }
+
+/// The pair as a USB host's port: the cable is the P4's, and time passes for both chips. A run
+/// ends on a slice boundary, at most a slice past the time asked for.
+impl esp_soc::usb_host::UsbPort for CoSim {
+    fn link(&mut self) -> Option<&mut esp_periph::usb_otg::UsbLink> { self.p4.bus.usb_link() }
+    fn run_until(&mut self, t_ns: u64) -> Result<(), String> { CoSim::run_until(self, t_ns).map_err(|s| format!("the P4 stopped: {s:?}")) }
+    fn console(&mut self, text: &str) { self.p4.bus.uart_input(0, text.as_bytes()); }
+}

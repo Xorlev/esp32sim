@@ -124,3 +124,31 @@ impl Volume {
         files
     }
 }
+
+/// Check the volume of a card image with the system's FAT checker, without changing it: the
+/// partition from LBA 2048 is copied out (sparse) and `FSCK_FAT` (a command), else macOS's
+/// `/sbin/fsck_msdos -n` or Linux's `fsck.fat -n`, run on the copy. Its output, or why it failed.
+pub fn fsck(image: &Path) -> Result<String, String> {
+    let tool = std::env::var("FSCK_FAT").ok()
+        .or_else(|| ["/sbin/fsck_msdos", "/usr/sbin/fsck.fat", "/sbin/fsck.fat", "/usr/sbin/fsck.vfat"].iter().find(|p| Path::new(p).exists()).map(|p| p.to_string()))
+        .ok_or("no FAT checker: set FSCK_FAT or install fsck_msdos (macOS) or dosfstools (Linux)")?;
+    let mut src = std::fs::File::open(image).map_err(|e| format!("{}: {e}", image.display()))?;
+    let vol = image.with_extension("volume");
+    let mut dst = std::fs::File::create(&vol).map_err(|e| format!("{}: {e}", vol.display()))?;
+    let len = src.metadata().unwrap().len() - PARTITION_LBA * SECTOR;
+    dst.set_len(len).unwrap();
+    src.seek(SeekFrom::Start(PARTITION_LBA * SECTOR)).unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut at = 0u64;
+    while at < len {
+        let n = src.read(&mut buf).unwrap();
+        if n == 0 { break; }
+        if buf[..n].iter().any(|&b| b != 0) { dst.seek(SeekFrom::Start(at)).unwrap(); dst.write_all(&buf[..n]).unwrap(); }
+        at += n as u64;
+    }
+    drop(dst);
+    let out = std::process::Command::new(&tool).arg("-n").arg(&vol).output().map_err(|e| format!("{tool}: {e}"))?;
+    let _ = std::fs::remove_file(&vol);
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.success() { Ok(text) } else { Err(format!("{tool} -n: {}\n{text}", out.status)) }
+}
