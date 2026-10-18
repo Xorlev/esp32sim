@@ -752,3 +752,40 @@ fn a_timed_bus_raises_command_and_data_done_when_the_bits_are_through() {
     h.advance(data_end + 50_000);
     assert_eq!(h.read(reg::RINTSTS), int::CMD_DONE | int::DATA_OVER | int::BCI);
 }
+
+/// An SDIO function whose interrupt the test sets.
+struct Function(std::rc::Rc<std::cell::Cell<bool>>);
+impl SdDevice for Function {
+    fn command(&mut self, _now: u64, _cmd: u8, _arg: u32) -> Result<SdResponse, SdCmdError> { Ok(SdResponse::Short(0)) }
+    fn read_data(&mut self, _buf: &mut [u8]) -> Result<(), SdDataError> { Ok(()) }
+    fn write_data(&mut self, _now: u64, _data: &[u8]) -> Result<(), SdDataError> { Ok(()) }
+    fn interrupt(&self) -> bool { self.0.get() }
+    fn io(&self) -> bool { true }
+    fn name(&self) -> &str { "function" }
+}
+
+/// RINTSTS's SDIO bit for the slot is set when DAT1 goes low, once per assertion: cleared while
+/// DAT1 stays low it stays clear (IDF reads the D1 pin for the level, `sdmmc_host_io_int_wait`).
+/// A memory card on the other slot never raises it.
+#[test]
+fn an_sdio_interrupt_is_latched_on_its_falling_edge() {
+    let mut h = Sdmmc::new(SdmmcLayout::Esp32p4);
+    let line = std::rc::Rc::new(std::cell::Cell::new(false));
+    let card = h.attach(Box::new(card()));
+    let f = h.attach(Box::new(Function(line.clone())));
+    h.route = [Some(card), Some(f)];
+    h.write(reg::INTMASK, int::SDIO_SLOT0 << 1);
+    h.write(reg::CTRL, CTRL_INT_ENABLE);
+    assert!(!h.poll_sdio() && !h.irq());
+    line.set(true);
+    assert!(h.poll_sdio());
+    assert_eq!(h.read(reg::RINTSTS), int::SDIO_SLOT0 << 1, "slot 1's bit, not slot 0's");
+    assert!(h.irq());
+    h.write(reg::RINTSTS, int::SDIO_SLOT0 << 1);
+    assert!(!h.poll_sdio(), "still low: no new edge");
+    assert_eq!(h.read(reg::RINTSTS), 0);
+    line.set(false);
+    h.poll_sdio();
+    line.set(true);
+    assert!(h.poll_sdio(), "released and asserted again: a new edge");
+}
