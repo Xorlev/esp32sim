@@ -11,7 +11,7 @@ pub(super) trait MachineApi {
     fn write_flash(&mut self, off: usize, d: &[u8]) -> Result<(), String>;
     fn boot(&mut self, app_direct: bool) -> Result<(), String>;
     fn board_name(&self) -> String;
-    /// The chip, as the `Soc` names it (`esp32s3`, `esp32c3`, `esp32c6`, `esp32`).
+    /// The chip, as the `Soc` names it (`esp32s3`, `esp32c3`, `esp32c6`, `esp32`, `esp32p4`).
     fn chip(&self) -> &'static str;
     fn web(&self) -> Option<&WebServer>;
     fn run_slice(&mut self, cycles: u32) -> u32;
@@ -82,6 +82,7 @@ pub(super) enum MachineKind {
     C3(Box<esp32c3::Machine>),
     C6(Box<esp32c6::Machine>),
     Esp32(Box<esp32::Machine>),
+    P4(Box<esp32p4::Machine>),
 }
 
 impl MachineKind {
@@ -93,13 +94,13 @@ impl MachineKind {
 impl std::ops::Deref for MachineKind {
     type Target = dyn MachineApi;
     fn deref(&self) -> &Self::Target {
-        match self { Self::S3(m) => m.as_ref(), Self::C3(m) => m.as_ref(), Self::C6(m) => m.as_ref(), Self::Esp32(m) => m.as_ref() }
+        match self { Self::S3(m) => m.as_ref(), Self::C3(m) => m.as_ref(), Self::C6(m) => m.as_ref(), Self::Esp32(m) => m.as_ref(), Self::P4(m) => m.as_ref() }
     }
 }
 
 impl std::ops::DerefMut for MachineKind {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        match self { Self::S3(m) => m.as_mut(), Self::C3(m) => m.as_mut(), Self::C6(m) => m.as_mut(), Self::Esp32(m) => m.as_mut() }
+        match self { Self::S3(m) => m.as_mut(), Self::C3(m) => m.as_mut(), Self::C6(m) => m.as_mut(), Self::Esp32(m) => m.as_mut(), Self::P4(m) => m.as_mut() }
     }
 }
 

@@ -20,6 +20,7 @@ Try it in your browser, nothing to install: https://mikroverk.github.io/esp32sim
 | ESP32-C3 | RISC-V RV32IMC | draft | console only |
 | ESP32-C6 | RISC-V RV32IMAC | draft | Waveshare ESP32-C6-LCD-1.47, with the 802.15.4 radio |
 | ESP32 (classic) | 2 x Xtensa LX6 | early | LilyGO TTGO T-Display |
+| ESP32-P4 (rev < 3) | 2 x RISC-V RV32IMAFC | early | console only |
 
 ## Features
 
@@ -63,7 +64,7 @@ FW=web/wasm/fw/public                       # demo firmware included in the repo
 ```
 
 This boots the Atech synth firmware, plays a short script, and saves the audio to `out.wav` and
-the display to `tft.png`. Use `esp32sim-c3`, `esp32sim-c6` or `--chip esp32` for the other chips.
+the display to `tft.png`. Use `esp32sim-c3`, `esp32sim-c6`, `esp32sim-p4` or `--chip esp32` for the other chips.
 
 [Getting started](docs/getting-started.md) covers the rest: your own ESP-IDF builds, each chip,
 WiFi, scripts, the browser build and debugging.
