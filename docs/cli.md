@@ -206,11 +206,13 @@ esp32sim-p4 --flash-mb 2 --bootloader p4-bootloader.bin --ptable p4-ptable.bin -
 | `en=N`, `en=!N` | the P4 GPIO the C6's EN follows (54): driven low holds the C6 in reset, driven high or not driven (the pull-up) lets it run; `!` inverts the line |
 | `slice-us=N` | the lock-step slice (10): how late, at most, the slave's SDIO interrupt reaches the P4 |
 | `console=F` | write the C6's console to F instead of stdout |
+| `fault=KIND@WHEN` (repeatable) | inject a fault on the SDIO link at a point the run fixes: `read-crc@N[:K]`, `read-timeout@N` (the Nth FIFO read fails after the slave gave its data, or at the block holding byte K), `reg-read-crc@N` (the Nth register-window read), `write-crc@N`, `write-nostatus@N` (the Nth FIFO write), `cmd-timeout@N`, `resp-crc@N` (the Nth command), `wedge@T` (the C6's CPU stops, its SDIO hardware answers on), `dead-bus@T`, `drop-irq@T` (one DAT1 edge unlatched), `spurious-irq@T+D`, `token-stall@T+D` (TOKEN1 shows no free buffer); T and D as `3.5s`, `200ms`, `1500us`. See [esp32p4.md](esp32p4.md), "Faults" |
 
 Both consoles go to stdout a line at a time, in the order the slices produced them: the P4's as
 they are (`[p4] ` in front with `--console-prefix`), the C6's UART0 with `[c6] ` in front. The
 end-of-run report adds the C6's lines (`[c6] stop:`, its SDIO counts, its WiFi and network counts)
-and `[cosim]` (slices, EN changes). `--debug sdio` prints the C6 slave's commands and DMA,
+and `[cosim]` (slices, EN changes, P4 resets; when there are any, commands that found the C6
+ahead of them, EN pulses too short to reset it, and each fault with the time it fired). `--debug sdio` prints the C6 slave's commands and DMA,
 `--debug sdmmc` the P4 host's commands. `--max-seconds` is rounded up to a whole slice;
 `--max-insns` does not apply.
 

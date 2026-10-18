@@ -125,8 +125,10 @@ car's next writes landing intact.
 
 - **4a, done**: the C6's SDIO slave model (`esp32c6/src/sdio.rs`), SDIO functions and DAT1 on the
   P4's SDMMC host, the lock-step pair with EN on GPIO 54 (`cli/src/cosim.rs`, `--coproc`), golden
-  `hosted-p4`: IDF's station example takes a lease through ESP-Hosted 2.12.13; oxidrive's WiFi
-  comes up (esp32p4.md, "The co-processor").
+  `hosted-p4`: IDF's station example takes a lease through ESP-Hosted 2.12.13; its raw
+  throughput test both ways (goldens `hosted_rawtp_rx`, `hosted_rawtp_tx`); deterministic fault
+  hooks on the link with ESP-Hosted's reaction to each; oxidrive's WiFi comes up (esp32p4.md,
+  "The co-processor").
 - **4b**: an MQTT broker and an SMB2 server behind the NAT, oxidrive provisioned for them, then
   the archive window (esp32p4.md, "Handoff: where milestone 4b starts").
 

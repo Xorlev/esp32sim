@@ -688,8 +688,9 @@ major.minor differ (transport_drv.c, `compare_fw_version`); it prints nothing he
 2.12. The station's RPCs follow, the C6 joins the access point, and the P4's lwIP takes a lease
 through the link 3.77 s after power-up. The golden pins both consoles in the order the slices
 produced them, the P4's instruction count, the C6's run and its SDIO, WiFi and network counts.
-The C6's WiFi model drops 19 frames for want of a free descriptor in those 4 s; the station gets
-through regardless. Co-simulating costs about a second of CPU per emulated second while the
+19 frames go by before the C6's driver has given its MAC a receive ring (beacons before the
+radio is on; the report counts them apart from frames that find no free descriptor, of which
+there are none). Co-simulating costs about a second of CPU per emulated second while the
 station idles: the golden's 4 s take 3.6 s, 8 s take 7.7 s (both chips, one host thread).
 
 ### The slave
@@ -709,12 +710,12 @@ entries and one address compare after a peripheral write.
 | HINF CFG_DATA1 0x04 | SDIO_ENABLE (the card answers nothing without it), IOREADY1/2 (CCCR I/O Ready), HIGHSPEED_ENABLE (CCCR SHS), SDIO_INT_MASK, SDIO_VER 0x232 at reset; the read-only HIGHSPEED_MODE, IOENABLE1/2 and CD_DISABLE show the host's CCCR |
 | SLC SLCCONF0 0x00 | TX_RST and RX_RST reset a link; RX_AUTO_WRBACK writes a sent descriptor back with the owner cleared |
 | SLC SLC0INT_RAW/ST/ENA/CLR 0x04-0x10 | FRHOST_BIT0-7 from the host, TX_OVF, TX_DONE, TX_SUC_EOF, RX_DONE, RX_EOF; ST is RAW & ENA, the SLC0 line |
-| SLC SLC0RX_LINK, SLC0RX_LINK_ADDR 0x3C, 0x40 | START reads the descriptor at once (the driver polls RX_DONE right after); STOP |
+| SLC SLC0RX_LINK, SLC0RX_LINK_ADDR 0x3C, 0x40 | START reads the descriptor at once and raises RX_DONE when the hardware owns it (the driver polls RX_DONE right after); STOP |
 | SLC SLC0TX_LINK, SLC0TX_LINK_ADDR 0x44, 0x48 | START, STOP; RESTART follows the next pointer of the last buffer closed |
 | SLC SLCINTVEC_TOHOST 0x5C | bits 7:0 raise SLCHOST's TOHOST_BIT0-7 |
 | SLC SLC0TOKEN0/1 0x60, 0x64 | WR, INC, INC_MORE; the count at 27:16 and at SLCHOST TOKEN_RDATA |
-| SLC SLC0_LEN_CONF, SLC0_LENGTH 0xF4, 0xF8 | LEN_WR, LEN_INC, LEN_INC_MORE set the packet length SLCHOST PKT_LEN shows |
-| SLCHOST TOKEN_RDATA 0x44 | TOKEN1 at 27:16, TOKEN0 at 11:0 |
+| SLC SLC0_LEN_CONF, SLC0_LENGTH 0xF4, 0xF8 | LEN_WR, LEN_INC, LEN_INC_MORE set the cumulative length SLCHOST PKT_LEN shows (20 bits, wrapping); the first length write after a START on a packet raises the host's RX_NEW_PACKET |
+| SLCHOST TOKEN_RDATA 0x44 | TOKEN1 at 27:16, TOKEN0 at 11:0 (TOKEN1 can be held for a fault test) |
 | SLCHOST SLC0HOST_INT_RAW/ST 0x50, 0x58 | TOHOST_BIT0-7, RX_UDF, TX_OVF, RX_NEW_PACKET; ST is RAW & FUNC1_INT_ENA |
 | SLCHOST PKT_LEN 0x60 | the length in 19:0; LEN_CHECK (31:20) reads 0 |
 | SLCHOST CONF_W0-W15 0x6C-0xB8 | shared scratch, both sides; CONF_W7's low byte is the host's interrupt to the slave (FRHOST_BIT0-7) and reads 0 |
@@ -751,26 +752,59 @@ transfer to address A carries a packet of 0x1F800 - A bytes:
   descriptors in SRAM, zero-fills past the packet (ESP-Hosted reads whole 512-byte blocks), hands
   each descriptor back with RX_DONE and the last with RX_EOF, which is when the driver returns
   the buffers and starts the next chain. Reading more than the link holds is an underflow
-  (RX_UDF). Starting the link on a descriptor the hardware owns raises the host's
-  RX_NEW_PACKET and the slave's RX_DONE at once: the driver starts a one-byte descriptor, waits for
-  that RX_DONE and clears the host interrupt it raised (`send_isr_invoker_enable`), which is the
-  evidence for both.
+  (RX_UDF, zeros, and the CMD53 succeeds). Starting the link on a descriptor the hardware owns
+  raises the slave's RX_DONE at once: the driver starts a one-byte descriptor and waits for that
+  RX_DONE (`send_isr_invoker_enable`). The host's RX_NEW_PACKET waits for the length the driver
+  writes right after the START (`send_new_packet`): raised at the START, ESP-Hosted's combined
+  register read (INT_RAW to PKT_LEN in one CMD53) could land between the two, see a packet with
+  the old length, clear the interrupt and wait for ever. `SdioStats::stale_new_packets` counts host
+  reads of INT_RAW that show RX_NEW_PACKET with PKT_LEN where the host last read it (an upper
+  bound: a host PKT_LEN poll in between also counts); the report names it when it is not zero.
+  A CMD52 into the FIFO is a one-byte transfer to address A: a read takes the packet's next
+  byte, a write is a byte of a packet of 0x1F800 - A bytes and closes it at the last address.
 - **Host to slave.** The driver loads receive buffers (START for the first, the tail's next pointer
   and RESTART for the rest, TOKEN1 counting them; the host subtracts the buffers it has used). A
   host write fills the current buffer, spills into the next, and closes the last with its length
   and EOF when the packet's 0x1F800 - A bytes are in; the block padding is dropped. A packet may
   span two CMD53s (a block, then the remainder at the incremented address). With no buffer the
   bytes are lost and TX_OVF goes to both sides.
+- **When the C6 sees it.** The bytes cross the bus in the host's register write that runs the
+  transfer, but what the C6 sees of it, each descriptor handed back (owner, length, EOF) and its
+  RX_DONE, RX_EOF, TX_DONE and TX_SUC_EOF, waits for the data phase's end on the bus: with
+  `--sd-timing` its wire time after the command, and when the P4's IDMAC resumes a suspended
+  transfer (a read longer than IDF's four descriptors) the moment of the resume, which the C6,
+  behind the P4 then, has not reached. The slave queues the hand-back and the co-simulation stops
+  the C6 at that cycle to apply it. Until then the buffers are the hardware's, so moving the bytes
+  early is invisible to the driver. Untimed, at a command the C6 already stands at the command's
+  time, so nothing waits.
 - **Interrupts.** The slave raises the host's TOHOST bits through SLCINTVEC_TOHOST; DAT1 goes low
   while SLC0HOST_INT_ST is not zero, IENM and IEN1 are set in the CCCR (§6.3) and HINF does not
   mask it. The host's byte in CONF_W7 raises FRHOST_BIT0-7 on the slave, as ESP-Hosted's "open
   data path" interrupt does.
 
-`--debug sdio` prints the slave's commands, the descriptors handed over and the I/O reset.
-Guesses, each from the sources' silence: the CCCR revision bytes as SDIO_VER's split (0x32,
-0x02), the card capability, two functions in R4, CMD5's C bit set at once, PKT_LEN's LEN_CHECK as
-0, INT_ST under FUNC1_INT_ENA rather than SLC0HOST_INT_ENA, the 0x400 split between the register
-window and the FIFO, and RX_DONE at a link start. Not modelled: the card's busy and read wait, its
+`--debug sdio` prints the slave's commands, the descriptors handed over and the I/O reset. The
+I/O reset (§4.4) leaves SLCHOST's counters (TOKEN1, PKT_LEN) to the C6's driver: Espressif's
+driver resets them itself and says the host has to ask it to (`sdio_slave.c`, header comment),
+which ESP-Hosted's slave does on the host's reset interrupt (`sdio_reset`, `sdio_slave_reset`).
+Guesses, each from the sources' silence:
+
+- the CCCR revision bytes as SDIO_VER's split (0x32, 0x02), the card capability (0x17), two
+  functions in R4, CMD5's C bit set at once, and the FN block sizes at 512 after a reset (the
+  protocol document's default; the specification says 0);
+- PKT_LEN's LEN_CHECK as 0, INT_ST under FUNC1_INT_ENA rather than SLC0HOST_INT_ENA, the 0x400
+  split between the register window and the FIFO;
+- RX_DONE at a link START on an owned descriptor, and the host's RX_NEW_PACKET at the length write
+  that follows it;
+- a read past the send link: zeros, RX_UDF, and a CMD53 that succeeds; silicon may stall the bus
+  and retry instead (SLCHOST's SLC0_HOST_RD_RETRY_INT, SLC's SLC0_RD_RETRY_THRESHOLD);
+- a write with no receive buffer: the bytes dropped, TX_OVF to both sides, and a CMD53 that
+  succeeds (a host is expected to wait for TOKEN1 and never get there);
+- the I/O reset: what it does to SLCHOST's INT_RAW and CONF_W registers is not documented; they are
+  left as they are, like the counters;
+- the card answers from power-up whatever the C6's IO MUX, its PCR clock gate or its ROM is doing:
+  a host that sends CMD5 while the C6's ROM boots is answered here, which silicon may not do.
+
+Not modelled: the card's busy and read wait, its
 CRC (it never answers with a CRC error or a malformed response), suspend and resume, function 2,
 the second SLC (SLC1), the host's token registers (TOKEN_WDATA, TOKEN_CON), the PCR reset of the
 block (`PCR_SDIO_SLAVE_CONF.RST_EN`, which the driver pulses before it configures a block already
@@ -805,24 +839,33 @@ carried out against the slave as it stands, the descriptors read and written in 
 the C6 goes on from there in its next run. The C6 is never ahead of the P4. What the P4 senses
 without a command, the slave's interrupt, is sampled after every command and at every slice end,
 so it reaches the P4 at most one slice late, as a frame reaches csim's medium at the end of the
-slice it started in (`--cooja`). EN is read at slice ends too: driven low, the C6 runs to that
-instant and stops; released, the C6 powers up from its ROM (a chip reset with cause POWERON; its
-LP domain and SRAM are kept, which a real power-up would not keep), and its clock goes on from
-that instant. At power-up EN is the pull-up's: the C6 boots with the P4, as on the board, until
-ESP-Hosted resets it. A chip that resets itself comes back through its ROM. The co-simulation
-reads no host clock and no host randomness and the order of every step is fixed, so a run is the
-same to the instruction every time, and the same however `run_until` is called
+slice it started in (`--cooja`). EN is read at slice ends only, so it takes effect up to a slice
+late: driven low, the C6 runs to that instant and stops; released after at least the C6's t_RST
+(50 µs, ESP32-C6 Series Datasheet, "Chip Power-up and Reset"), the C6 powers up from its ROM (a
+chip reset with cause POWERON; its LP domain and SRAM are kept, which a real power-up would not
+keep), and its clock goes on from that instant. A shorter pulse is ridden out: the C6 runs on
+from where it stopped. The restarted P4 makes GPIO 54 an output a moment before it writes the
+level, and a slice end can catch that as a one-slice pulse; the report counts such pulses. At
+power-up EN is the pull-up's: the C6 boots with the P4, as on the board, until ESP-Hosted resets
+it. A chip that resets itself comes back through its ROM; a P4 reset keeps the SD bus's time
+(the device clock starts again at a chip reset, `Peripherals::cycle_base` carries the cycles
+before it), so the C6 still meets every command at its nanosecond, and the report counts
+commands that ever find the C6 ahead (none should). The co-simulation reads no host clock and no
+host randomness and the order of every step is fixed, so a run is the same to the instruction
+every time, and the same however `run_until` is called
 (`the_pair_runs_the_same_whichever_way_it_is_driven` runs the pair for 2 s whole and in uneven
-pieces). The virtual network's SNTP server is the exception: it answers from the host's clock
+pieces). The virtual network's SNTP server answers its own clock plus emulated time; `--net
+none,epoch=S` fixes that clock, and without it the host's clock at the first answer sets it
 ([networking-howto.md](networking-howto.md)), so a firmware that asks for the time, as oxidrive
-does, can differ from one run to the next; the station example does not ask. Both consoles are
+does, is reproducible only with an epoch. The goldens and tests pass one. Both consoles are
 collected a line at a time and printed in the order the slices produced them. The co-processor
 is native only: the browser build has none.
 
 **Cost.** Without `--coproc` nothing of this runs: the C6's slave is an optional device-table
 entry and one address compare after a peripheral write, the P4's SDIO path one flag tested where
-the SDMMC host runs (`has_sdio`), and the rest is in cold functions. Measured against 59c1d1cd with `cargo
-build --release --bins`, alternating runs, median `user` time, identical instruction counts:
+the SDMMC host runs (`has_sdio`), the fault hooks and the deferred hand-back live in the
+co-simulation, and the rest is in cold functions. Measured against 59c1d1cd with `cargo build
+--release --bins`, alternating runs, median `user` time, identical instruction counts:
 
 | demo | runs | 59c1d1cd | this branch | instructions |
 | --- | --- | --- | --- | --- |
@@ -836,24 +879,32 @@ build --release --bins`, alternating runs, median `user` time, identical instruc
 
 The S3 and C3 run no code this branch changed, so their differences are layout: pocket-tank's
 13 runs are two sets, base first (14.14 s against 14.45 s, 5 runs) and this branch first (14.18
-s against 14.28 s, 8 runs).
+s against 14.28 s, 8 runs). The review changes after it (the SD bus's time base, the deferred
+hand-back, the fault hooks, the WiFi drop counts, the network clock) touch no per-instruction
+path; a spot check on the final tree, five alternating runs each: `c3-hello` 3.85 s against
+3.82 s, `c6-wifi-station` 3.00 s against 3.02 s, `p4-hello` 17.28 s against 17.40 s (+0.7%, the
+runs within 0.2% of each other), `p4-hello-smp` 18.43 s against 18.38 s, instruction counts
+identical.
 
 ### Throughput
 
-ESP-Hosted's own transport test (RawTP: `CONFIG_ESP_HOSTED_RAW_THROUGHPUT_TRANSPORT` with
-`..._RX_FROM_SLAVE` or `..._TX_TO_SLAVE` on the host, `CONFIG_ESP_RAW_THROUGHPUT_TRANSPORT` on the
-slave, reports every second, both added to `examples/esp-hosted-p4`'s defaults and built locally,
-not committed) moves 1460-byte packets as fast as the link takes them. The steady per-second
-reports, 12 s runs:
+ESP-Hosted's own transport test (RawTP) moves 1460-byte packets as fast as the link takes them
+and reports the rate every second on both consoles. Its images are committed beside the pair's
+(`p4-hosted-rawtp-rx.bin`, `p4-hosted-rawtp-tx.bin`, `c6-hosted-rawtp-slave.bin`; the Kconfig
+recipe is in `examples/esp-hosted-p4/README.md`), and the goldens `hosted_rawtp_rx` and
+`hosted_rawtp_tx` pin 10 s of each with the bus timed. Both sides wait 5 s after the data path
+opens, so traffic starts near 7.7 s. The steady per-second reports, 12 s runs:
 
 | direction | SDIO bus | emulator | Espressif, P4 + C6, 4 bits at 40 MHz |
 | --- | --- | --- | --- |
 | C6 to P4 (host receive) | at once | 427-474 Mbit/s | 80 Mbit/s |
-| C6 to P4 | `--sd-timing`, 4 bits at 40 MHz | 139.4 Mbit/s | |
+| C6 to P4 | `--sd-timing`, 4 bits at 40 MHz | 139.5 Mbit/s | |
 | P4 to C6 (host transmit) | at once | 428-430 Mbit/s | 72 Mbit/s |
 | P4 to C6 | `--sd-timing` | 106.3 Mbit/s | |
 
-The board numbers are Espressif's (esp_hosted 2.12.13 `docs/performance_optimization.md`, "ESP32-C6
+The rates did not move when the slave's hand-back began to wait for the end of the data phase on
+the bus ("When the C6 sees it"): the C6 is busy elsewhere for longer than a block's wire time. The
+board numbers are Espressif's (esp_hosted 2.12.13 `docs/performance_optimization.md`, "ESP32-C6
 as Co-Processor", over the air; iperf there gives 30-32 Mbit/s TCP and 49-50 UDP); a P4-WIFI6
 measured about 36 Mbit/s receiving over WiFi (SDIO at 40 MHz, HT20), and oxidrive uploads over
 SMB at about 2 MB/s end to end. Without timing a transfer takes no time on the bus, so the rate
@@ -862,11 +913,42 @@ memcpy, the C6's ISR and the SLC hand-overs. `--sd-timing` gives the link the ca
 model ("The host"): a 512-byte block in 4 bits at 40 MHz is 1044 card clocks, 157 Mbit/s on the
 data lines, and each command adds 106 clocks and each packet its register reads (the interrupt
 status, the length), which leaves the 139 Mbit/s measured; transmit pays the TOKEN1 reads and
-the padding of each packet to whole blocks. What is still missing against the
-board's 72-80: the slave's busy and FIFO latency (it answers at once), the CPUs' caches and PSRAM
-stalls, and the time the data takes through the C6's DMA. The WiFi side is not part of these
-numbers; the virtual access point paces frames about 400 µs apart (`StationLink`), roughly 30
-Mbit/s of 1500-byte frames, so a test through the air would meet that first.
+the padding of each packet to whole blocks. What is still missing against the board's 72-80: the
+slave's busy and FIFO latency (it answers at once), the CPUs' caches and PSRAM stalls, and the
+time the data takes through the C6's DMA.
+
+The WiFi side is not part of these numbers, and through the air it is the first ceiling. The
+virtual access point's receive pacing (`esp-soc/src/wifi.rs`, `StationLink::next_rx`) delivers
+one frame per 400 µs of airtime (`RX_GAP_US`) and none while the last descriptor it filled is
+still unrecycled, for up to 50 ms (`RX_STALL_US`), as an 802.11b/g link without A-MPDU would:
+about 30 Mbit/s of 1500-byte frames at best, below the board's 36. An SMB upload in 4b meets that
+pacing, and the station's transmit side, before it meets the SDIO link.
+
+### Faults
+
+`--coproc c6:...,fault=KIND@WHEN` (repeatable; [cli.md](cli.md)) injects faults at points the run
+itself fixes, the Nth command or transfer of a kind or a shared time, so a faulted run is as
+reproducible as a clean one, and nothing of it runs without `--coproc`. `cli/tests/cosim.rs` runs
+each against the hosted pair and pins ESP-Hosted 2.12.13's reaction:
+
+| fault | what happens on the link | ESP-Hosted's reaction |
+| --- | --- | --- |
+| `read-crc@N[:K]`, `read-timeout@N` | the Nth FIFO read fails (0x109, 0x107) after the slave gave its data, or at the block holding byte K | `Failed to read data`; the packet is lost; the lost one was an RPC response, which times out after 5 s, and the station example aborts and restarts the P4, which resets the C6 and starts again |
+| `reg-read-crc@N` | the Nth register-window read fails | `failed to read registers`, a transport failure and an immediate host restart (`H_TRANSPORT_RESTART_ON_FAILURE`); the pair takes its lease again |
+| `write-crc@N`, `write-nostatus@N` | the Nth FIFO write: the card drops the block (CRC status error) or takes it without a status | `Failed to send data`, retried (`MAX_SDIO_WRITE_RETRY`); the lease on time |
+| `cmd-timeout@N`, `resp-crc@N` | the Nth command never arrives, or is carried out with a bad response CRC | one error; the link goes on |
+| `wedge@T` | the C6's CPU stops, its SDIO hardware answers on, TOKEN and PKT_LEN frozen | silence: no error, no restart, no lease |
+| `dead-bus@T` | nothing answers | silence |
+| `drop-irq@T` | one DAT1 edge goes unlatched (`SdDevice::edge_lost`), D1 stays low | silence: the receive task already waits on the edge, and checks D1's level only when it starts to wait |
+| `spurious-irq@T+D` | D1 low with nothing pending | the host reads the registers, finds nothing; harmless |
+| `token-stall@T+D` | TOKEN1 shows no free receive buffer | the host polls TOKEN1 at growing intervals (`sdio_is_write_buffer_available`) and its traffic waits: the lease 0.5 s late |
+
+A C6 reset in the middle of the traffic (`a_c6_reset_mid_traffic_ends_in_a_host_restart`) loses
+the RPC in flight and ends in a host restart too. The three silent stalls are the finding: in
+this configuration ESP-Hosted's receive task waits for the slave's interrupt with no timeout and
+the station example waits for its connect event the same way, so a wedged co-processor, a dead
+bus or a single lost DAT1 edge stop the WiFi for good without a log line. Nothing here models
+the board's own failure; "Handoff" names the stub that would.
 
 ### oxidrive
 
@@ -875,11 +957,12 @@ USB test does, with ESP-Hosted 2.12.13's slave on the C6 as on its board, and th
 partition made at test time with ESP-IDF's `nvs_partition_gen.py` from `nvs.csv` beside the
 images (`OXIDRIVE_DIR`): the virtual access point's SSID and password, and placeholders that
 reach nothing for the rest (`--net none`: every name resolves to 10.0.2.3 and every connection
-is refused). Neither the CSV nor the image is in this repository. In 20 s of emulated time (26 s
-on the host) the firmware gets past `esp_hosted_reconfigure`, where it stopped before: its WiFi is initialised at 3.25 s and up
-with the lease 10.0.2.15 at 6.81 s, its DNS lookup of the NTP pool is answered, SNTP starts, it
-reports the NAS unreachable, and its MQTT client starts and finds its session refused. That is
-the next point: the services. Against the board's capture, 80 of the board's 105 lines now
+is refused), the network's clock fixed so its SNTP answer is the same every run. Neither the CSV
+nor the image is in this repository. In 20 s of emulated time (17 s on the host) the firmware
+gets past `esp_hosted_reconfigure`, where it stopped before: its WiFi is initialised at 3.25 s and
+up with the lease 10.0.2.15 at 6.81 s, its DNS lookup of the NTP pool is answered, SNTP starts,
+it reports the NAS unreachable, and its MQTT client starts and finds its session refused. That
+is the next point: the services. Against the board's capture, 80 of the board's 105 lines now
 match (76 before), the WiFi initialisation and the SNTP lines among them; the blocks that differ
 are the eight of "Compared with a board" (the core dump, the heap 108 bytes lower, the card's
 geometry, the journal and the configuration, the die temperature), the configuration's effects
@@ -956,6 +1039,17 @@ car meanwhile; with the co-processor it comes up ("The co-processor").
 - **Slices must end on a fixed grid.** Cutting a slice where a caller happened to stop moved where
   EN was seen and where the P4's scheduling rounds fell, and the C6's `Saved PC` after its reset
   differed between two drivings of the same run; the lock-step test caught it.
+- **A P4 reset restarted the SD bus's clock.** The device clock starts again with the new
+  peripheral set, and the SDMMC host took its time from it, so after a P4 software reset every
+  command reached the C6 with a time the C6 had passed and it answered up to a slice stale; a
+  slot-0 card's busy period was measured on the wrong clock too. Found in review; the SD bus now
+  counts from power-on.
+- **The host's packet announcement must wait for the length.** Raising RX_NEW_PACKET at the rx
+  link's START left a few instructions in which ESP-Hosted's combined register read could see a
+  packet with its old length and wait for ever. Found in review, not seen in a run.
+- **A restarted P4 glitches EN.** ESP-Hosted makes GPIO 54 an output (its output latch still 0
+  after the reset) before it writes the level (`transport_gpio_reset`), so EN is low for a few
+  instructions; a slice end can see that, so EN needs the C6's t_RST before it resets the chip.
 
 ## What is modelled
 
@@ -977,7 +1071,8 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 - **AXI-DMA, the LP core**: out of scope. Xesppie's save and restore, which FreeRTOS runs only for
   a task that uses PIE.
 - **The co-processor**: native only; the SDIO link without timing by default and the slave
-  without busy or read wait ("The co-processor"); the services behind the NAT that oxidrive wants
+  without busy or read wait, CRC or suspend ("The co-processor"); faults are injected on the link
+  rather than arising from a model of the bus; the services behind the NAT that oxidrive wants
   (MQTT, SMB) are milestone 4b.
 - **USB**: the full-speed OTG core (0x50040000) and USB_WRAP, host mode, the core's slave mode
   (the data FIFOs), descriptor DMA, isochronous and interrupt endpoints, LPM, the
@@ -1013,7 +1108,9 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 **Status.** Milestone 4a is done: the C6's SDIO slave (HINF, SLC, SLCHOST) and the I/O card a host
 sees, SDIO functions on the P4's SDMMC host with their interrupt on DAT1, the two machines in
 lock-step with the C6's EN on GPIO 54, `--coproc`, and IDF's station example reaching `got ip`
-through unmodified ESP-Hosted 2.12.13 on both chips (golden `hosted-p4`). oxidrive now brings its
+through unmodified ESP-Hosted 2.12.13 on both chips (golden `hosted-p4`), ESP-Hosted's raw
+throughput test both ways (goldens `hosted_rawtp_rx`, `hosted_rawtp_tx`), and deterministic fault
+hooks on the link with ESP-Hosted's reaction to each pinned ("Faults"). oxidrive now brings its
 WiFi up through the C6, takes a lease, resolves the NTP pool and starts SNTP, then finds its
 services missing: the MQTT session is refused and the NAS is unreachable ("The co-processor",
 "oxidrive"). Milestones 1-3 are as described above.
@@ -1037,9 +1134,17 @@ services missing: the MQTT session is refused and the NAS is unreachable ("The c
    oxidrive takes the card from the car (TEST UNIT READY: MEDIUM NOT PRESENT), uploads a clip to
    the SMB server, gives the card back, and the car's next writes land intact; afterwards fsck the
    image and compare every clip, and check the upload on the server byte for byte.
-4. **Throughput honesty.** An SMB upload through the C6 meets the virtual access point's frame
-   pacing (about 400 µs a frame) before it meets the SDIO link ("Throughput"); compare with the
-   board's 2 MB/s only once both are understood, as for the USB rate.
+4. **Throughput honesty.** An SMB upload through the C6 meets the virtual access point's receive
+   pacing first, not the SDIO link ("Throughput"): one frame per 400 µs of airtime, none while the
+   last descriptor filled is unrecycled for up to 50 ms, 802.11b/g with no A-MPDU, about
+   30 Mbit/s at best. The upload's TCP ACKs come back that way. Compare with the board's 2 MB/s
+   only once both are understood, as for the USB rate; pass `--net ...,epoch=` so the runs are
+   reproducible (NTLMv2 timestamps, TLS validity and MQTT keepalives read the clock).
+5. **The owner's radio wedge.** A one-shot stub that makes the P4's `hosted_malloc_align`
+   (esp_hosted's `port_esp_hosted_host_os.c`) return NULL at its Nth call would reproduce the
+   board's wedge chain end to end; today's stubs return a value on every call, so it needs a
+   counted, one-shot stub in the machine (medium effort). The fault hooks show where such a chain
+   ends: a wedged slave or a lost DAT1 edge stalls ESP-Hosted silently ("Faults").
 
 **Timed SD transfers** are there (`--sd-timing`). oxidrive's 11.0 MB/s with them against its
 board's 10.9 MB/s is a coincidence, not a calibration ("USB", "Throughput"): the card's
