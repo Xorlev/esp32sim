@@ -10,6 +10,7 @@ use emu_core::{ClockDomain, ClockTree};
 use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Misc, RegRam, WriteEffect};
 use esp_periph::{Efuse, Gpio, Rng, Sha, SpiMem, Systimer, TimerGroup, Uart, UartLayout, UsbSerialJtag};
 use esp_periph::sdmmc::{Sdmmc, SdmmcLayout, SLOTS};
+use esp_periph::usb_otg::{Dwc2, Dwc2Config};
 use esp_periph::{RST_POWERON, RST_SW_CPU, RST_SW_SYS};
 
 /// The emulator's time base: the rev < 3 application clock, CPLL 360 MHz
@@ -30,6 +31,8 @@ pub mod src {
     pub const GPIO_INTR0: usize = 74;
     /// HP_SYSTEM_CPU_INT_FROM_CPU_0..3: the FreeRTOS yield and the IPC interrupts
     pub const FROM_CPU0: usize = 79;
+    /// ETS_USB_OTG_INTR_SOURCE: the high-speed USB-OTG core
+    pub const USB_OTG: usize = 93;
     pub const COUNT: usize = 128;
     /// The name IDF gives a source, for diagnostics.
     pub fn name(s: usize) -> &'static str {
@@ -37,10 +40,14 @@ pub mod src {
             USB_SERIAL_JTAG => "USB_SERIAL_JTAG", SDIO_HOST => "SDIO_HOST", UART0 => "UART0", UART1 => "UART1", TG0_T0 => "TG0_T0", TG0_T1 => "TG0_T1",
             TG1_T0 => "TG1_T0", TG1_T1 => "TG1_T1", 53 => "SYSTIMER_TARGET0", 54 => "SYSTIMER_TARGET1", 55 => "SYSTIMER_TARGET2",
             GPIO_INTR0 => "GPIO_INTR0", 79 => "FROM_CPU_INTR0", 80 => "FROM_CPU_INTR1", 81 => "FROM_CPU_INTR2", 82 => "FROM_CPU_INTR3",
-            _ => "?",
+            USB_OTG => "USB_OTG", _ => "?",
         }
     }
 }
+
+/// The USB-OTG HS core's register block, DR_REG_USB2_BASE (register/hw_ver1/soc/reg_base.h); its
+/// data FIFOs from 0x50001000 are not modelled (buffer DMA does not use them).
+pub const USB_OTG_BLOCK: u32 = 0x50000;
 
 /// CLIC interrupt IDs: 0-15 are the core's own, IDF's CPU interrupt lines 0-31 are IDs 16-47
 /// (IDF v5.5.3 include/soc/clic_reg.h CLIC_EXT_INTR_NUM_OFFSET, hal/include/hal/interrupt_clic_ll.h).
@@ -326,6 +333,9 @@ impl Device for LpAon {
             // HP_SDMMC_EMAC_RST_CTRL.RST_EN_SDMMC (bit 28) resets the SDMMC host
             // (lp_clkrst_reg.h:989-1005; sdmmc_ll_reset_register pulses it)
             (1, 0x4c) => { self.ram[1].write(o, v); if v & (1 << 28) != 0 { return WriteEffect::PERIPH_RESET; } }
+            // HP_USB_CLKRST_CTRL1.RST_EN_USB_OTG20 (bit 2) holds the USB-OTG HS core in reset
+            // (lp_clkrst_reg.h:928-952; _usb_utmi_ll_reset_register pulses it)
+            (1, 0x48) => { let old = self.ram[1].read(o); self.ram[1].write(o, v); if (old ^ v) & (1 << 2) != 0 { return WriteEffect::PERIPH_RESET; } }
             (2, 0x10) => { if v & (1 << 28) != 0 { self.time_latch = self.slow_ticks; } self.ram[2].write(o, v); }
             (b, o) if b < 3 => self.ram[b].write(o, v),
             _ => {}
@@ -497,6 +507,8 @@ pub struct Peripherals {
     pub io_mux: RegRam,
     /// the SD/MMC host (0x50083000) and the pins of each device on its bus
     pub sdmmc: Sdmmc,
+    /// the high-speed USB-OTG core (0x50000000) and the cable to a host, if one is attached
+    pub usb_otg: Dwc2,
     pub sd_pins: Vec<SdPins>,
     pub efuse: Efuse,
     /// SPI_MEM_C: the flash controller's cache side (the MMU registers are the bus's)
@@ -533,6 +545,7 @@ pub struct Peripherals {
 // include/soc/clk_tree_defs.h), RC_SLOW 136 kHz (SOC_CLK_RC_SLOW_FREQ_APPROX) for the LP timer.
 device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Xtal, 9), (ClockDomain::Apb, 9), (ClockDomain::RtcSlow, 2647), (ClockDomain::Cpu, 1)];
     0x20800 "CLIC" (clic) => [];
+    0x50000 "USB_OTG" optional (usb_otg) => [src::USB_OTG];
     0x20801 "CLIC_CTRL" alias (clic) delta 0x1000 => [];
     0x20810 "CLIC_OTHER" alias (clic) delta 0x10000 => [];
     0x20811 "CLIC_OTHER_CTRL" alias (clic) delta 0x11000 => [];
@@ -590,7 +603,7 @@ impl Peripherals {
         Peripherals {
             uart: [Uart::new(UartLayout::C6), Uart::new(UartLayout::C6)], usb: UsbSerialJtag::new(CPU_HZ), systimer: SystimerP4::default(),
             timg: [TimerGroup::new(), TimerGroup::new()], gpio: GpioP4::new(), io_mux: RegRam::new(),
-            sdmmc: Sdmmc::new(SdmmcLayout::Esp32p4), sd_pins: Vec::new(),
+            sdmmc: Sdmmc::new(SdmmcLayout::Esp32p4), sd_pins: Vec::new(), usb_otg: Dwc2::new(Dwc2Config::esp32p4_hs(CPU_HZ)),
             efuse: efuse_p4(mac, wafer, (0, 3)),
             spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true), psram1: psram_controller(),
             sha: Sha::new(), intmtx: IntMatrix::new(), clic: Clic::default(), cache: Cache::new(), hp_sys: HpSys::default(), hp_clkrst: HpClkRst::new(),
@@ -632,7 +645,13 @@ impl Peripherals {
     pub fn write32(&mut self, addr: u32, v: u32) {
         let fx = mmio::write32(self, addr, v);
         if fx.contains(WriteEffect::SPI_EXEC | WriteEffect::PERIPH_RESET) {
-            if fx.contains(WriteEffect::PERIPH_RESET) { self.sdmmc.reset_registers(); }
+            if fx.contains(WriteEffect::PERIPH_RESET) {
+                match addr {
+                    0x5011_1048 => { self.usb_otg.set_reset(v & (1 << 2) != 0); Dispatch::refresh_optional(self, USB_OTG_BLOCK); }
+                    0x5011_104c => self.sdmmc.reset_registers(),
+                    _ => {}
+                }
+            }
             if fx.contains(WriteEffect::SPI_EXEC) { if addr >> 12 == 0x5008f { self.psram_exec = true; } else { self.spi_exec = true; } }
         }
     }
@@ -867,6 +886,23 @@ mod tests {
         assert_eq!(p.read32(0x5008_3024), 0, "INTMASK back to its reset value");
         assert_eq!(p.sdmmc.devices.len(), 1, "the card stays in its socket");
         assert_eq!(p.read32(0x5011_104c), 0);
+    }
+
+    /// HP_USB_CLKRST_CTRL1.RST_EN_USB_OTG20 holds the USB-OTG core in reset while set; other bits
+    /// of the register leave it alone.
+    #[test]
+    fn lp_clkrst_holds_the_usb_otg_core_in_reset() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        p.write32(0x5000_0008, 1);
+        assert_eq!(p.read32(0x5000_0008), 1);
+        p.write32(0x5011_1048, 1 << 2);
+        assert_eq!(p.read32(0x5000_0008), 0, "GAHBCFG back to its reset value");
+        p.write32(0x5000_0008, 1);
+        assert_eq!(p.read32(0x5000_0008), 0, "writes are ignored while the reset is held");
+        p.write32(0x5011_1048, 0);
+        p.write32(0x5000_0008, 1);
+        p.write32(0x5011_1048, 1 << 30);
+        assert_eq!(p.read32(0x5000_0008), 1, "the PHY clock bit is not a reset");
     }
 
     #[test]

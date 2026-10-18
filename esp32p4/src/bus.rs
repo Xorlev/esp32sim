@@ -47,11 +47,13 @@ pub const CLIC_HIGH: u32 = 0x2082_0000;
 #[derive(Clone, Copy)]
 enum Mmu { Flash, Psram }
 
-/// What the SDMMC host's IDMAC reaches: L2MEM and PSRAM (SOC_SDMMC_PSRAM_DMA_CAPABLE, IDF
-/// v5.5.3 include/soc/soc_caps.h), at their cached or uncached addresses. Caches are not
-/// modelled, so a DMA access sees what the cores wrote.
-struct SdmmcDma<'a> { l2mem: &'a mut [u8], psram: &'a mut [u8], mmu: &'a [u32; MMU_ENTRIES] }
-impl SdmmcDma<'_> {
+/// What the SDMMC host's IDMAC and the USB-OTG core's DMA reach: L2MEM and PSRAM
+/// (SOC_SDMMC_PSRAM_DMA_CAPABLE, SOC_PSRAM_DMA_CAPABLE, IDF v5.5.3 include/soc/soc_caps.h;
+/// components/usb/hcd_dwc.c:50, the USB-DWC's DMA reaching external RAM on the P4), at
+/// their cached or uncached addresses. Caches are not modelled, so a DMA access sees what the
+/// cores wrote.
+struct DmaView<'a> { l2mem: &'a mut [u8], psram: &'a mut [u8], mmu: &'a [u32; MMU_ENTRIES] }
+impl DmaView<'_> {
     /// The memory at `addr` and how many bytes of it are contiguous there.
     fn span(&mut self, addr: u32) -> Result<&mut [u8], Fault> {
         let a = if (0x8000_0000..0x9000_0000).contains(&addr) { addr - UNCACHED_OFFSET } else { addr };
@@ -68,7 +70,7 @@ impl SdmmcDma<'_> {
         }
     }
 }
-impl esp_periph::sdmmc::SdmmcMemory for SdmmcDma<'_> {
+impl esp_periph::sdmmc::SdmmcMemory for DmaView<'_> {
     fn read(&mut self, mut addr: u32, mut buf: &mut [u8]) -> Result<(), Fault> {
         while !buf.is_empty() {
             let s = self.span(addr)?;
@@ -232,8 +234,17 @@ impl SocBus {
     /// current pin routing.
     fn run_sdmmc(&mut self) {
         self.periph.sdmmc.route = self.periph.sd_routes();
-        let mut dma = SdmmcDma { l2mem: &mut self.l2mem, psram: &mut self.psram, mmu: &self.mmu_psram };
+        let mut dma = DmaView { l2mem: &mut self.l2mem, psram: &mut self.psram, mmu: &self.mmu_psram };
         self.periph.sdmmc.run(&mut dma);
+    }
+
+    /// Let the USB host on the cable carry out what is due, its transactions moving data through
+    /// the core's DMA.
+    fn run_usb(&mut self) {
+        let mut dma = DmaView { l2mem: &mut self.l2mem, psram: &mut self.psram, mmu: &self.mmu_psram };
+        self.periph.usb_otg.run(&mut dma);
+        esp_periph::Dispatch::refresh_optional(&mut self.periph, crate::periph::USB_OTG_BLOCK);
+        self.irq_dirty = true;
     }
 
     /// Execute a pending SPI1 command against the flash image.
@@ -274,6 +285,7 @@ impl SocBus {
     fn devices(&mut self, cycles: u32) {
         if self.periph.spi_exec { self.run_spi(); }
         self.periph.tick(cycles as u64);
+        if self.periph.usb_otg.pending() { self.run_usb(); }
     }
 }
 
@@ -482,14 +494,14 @@ mod tests {
         b.psram = vec![0; 0x20000];
         b.mmu_psram[0] = MMU_PSRAM_VALID | 1 << 10 | 1;
         b.mmu_psram[1] = MMU_PSRAM_VALID | 1 << 10;
-        let mut d = SdmmcDma { l2mem: &mut b.l2mem, psram: &mut b.psram, mmu: &b.mmu_psram };
+        let mut d = DmaView { l2mem: &mut b.l2mem, psram: &mut b.psram, mmu: &b.mmu_psram };
         d.write(0x8FF4_0000, &[1, 2, 3, 4]).unwrap();
         let mut r = [0u8; 4];
         d.read(0x4FF4_0000, &mut r).unwrap();
         assert_eq!(r, [1, 2, 3, 4]);
         d.write(0x4800_fffe, &[5, 6, 7, 8]).unwrap();
         assert_eq!((&b.psram[0x1_fffe..], &b.psram[..2]), (&[5u8, 6][..], &[7u8, 8][..]), "split across the page boundary as mapped");
-        let mut d = SdmmcDma { l2mem: &mut b.l2mem, psram: &mut b.psram, mmu: &b.mmu_psram };
+        let mut d = DmaView { l2mem: &mut b.l2mem, psram: &mut b.psram, mmu: &b.mmu_psram };
         assert!(d.read(0x4802_0000, &mut r).is_err(), "an unmapped PSRAM page");
         assert!(d.read(0x4FFB_FFFE, &mut r).is_err(), "past the end of L2MEM");
         assert!(d.write(0x3010_0000, &r).is_err(), "TCM is out of its reach");
@@ -508,6 +520,26 @@ mod tests {
         b.write32(0x5008_3000, 1 << 4).unwrap();
         b.periph.refresh_lines();
         assert_eq!(b.periph.source_status()[0] >> crate::periph::src::SDIO_HOST & 1, 1, "source 23 asserted");
+    }
+
+    /// A chip reset keeps the USB cable and its VBUS; the host sees the reset core's pull-up go.
+    #[test]
+    fn a_chip_reset_keeps_the_usb_cable() {
+        use esp_periph::usb_otg::Request;
+        let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
+        esp_soc::SocBus::attach_usb_host(&mut b, Default::default()).unwrap();
+        esp_soc::SocBus::usb_link(&mut b).unwrap().submit(Request::Attach).unwrap();
+        b.tick(64);
+        assert!(esp_soc::SocBus::usb_link(&mut b).unwrap().take_completion().is_some(), "VBUS on at the next device tick");
+        assert_eq!(b.read32(0x5000_0000).unwrap() >> 19 & 1, 1, "GOTGCTL.BSESVLD");
+        b.write32(0x5000_0804, 0).unwrap();
+        assert!(esp_soc::SocBus::usb_link(&mut b).unwrap().port().connected, "DCTL.SDIS cleared: D+ pulled up");
+        esp_soc::SocBus::reboot(&mut b, [0; 6]);
+        let p = esp_soc::SocBus::usb_link(&mut b).unwrap().port();
+        assert!(p.power && !p.connected, "VBUS stays, the reset core is soft-disconnected");
+        assert_eq!(b.read32(0x5000_0000).unwrap() >> 19 & 1, 1, "and sees the session");
+        b.write32(0x5000_0804, 0).unwrap();
+        assert!(esp_soc::SocBus::usb_link(&mut b).unwrap().port().connected);
     }
 
     /// Core 1 sees its own CLIC block at 0x20800000 and core 0's at 0x20810000.

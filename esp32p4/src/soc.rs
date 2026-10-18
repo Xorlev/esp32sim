@@ -145,6 +145,9 @@ impl esp_soc::SocBus for SocBus {
         p.sdmmc.devices = old.sdmmc.devices;
         p.sdmmc.stats = old.sdmmc.stats;
         p.sd_pins = old.sd_pins;
+        // The USB cable stays plugged in; the host sees the reset core's pull-up go.
+        if let Some(link) = old.usb_otg.link { p.usb_otg.stats = old.usb_otg.stats; p.usb_otg.reattach(old.usb_otg.now, link); }
+        esp_periph::Dispatch::refresh_optional(p, periph::USB_OTG_BLOCK);
         *self.mmu_flash = [0; MMU_ENTRIES];
         *self.mmu_psram = [0; MMU_ENTRIES];
         self.mmu_flash_index = 0;
@@ -205,7 +208,26 @@ impl esp_soc::SocBus for SocBus {
     }
     fn report(&self) -> String {
         let s = &self.periph.sdmmc.stats;
-        if self.periph.sdmmc.devices.is_empty() && s.commands == 0 { return String::new(); }
-        format!("[sdmmc] {} commands ({} unanswered), {} bytes read, {} written", s.commands, s.timeouts, s.bytes_read, s.bytes_written)
+        let mut out = Vec::new();
+        if !self.periph.sdmmc.devices.is_empty() || s.commands > 0 {
+            out.push(format!("[sdmmc] {} commands ({} unanswered), {} bytes read, {} written", s.commands, s.timeouts, s.bytes_read, s.bytes_written));
+        }
+        if let Some(l) = &self.periph.usb_otg.link {
+            let (d, k) = (&self.periph.usb_otg.stats, &l.stats);
+            out.push(format!("[usb] {} SETUPs, {} IN packets ({} bytes), {} OUT packets ({} bytes), {} NAKs, {} STALLs; host: {} transfers, {} bus resets, {} data PID errors; core: {} DMA faults, {} FIFO size errors",
+                             d.setups, d.packets_in, d.bytes_in, d.packets_out, d.bytes_out, d.naks, d.stalls, k.transfers, k.resets, k.toggle_errors, d.dma_faults, d.fifo_errors));
+        }
+        out.join("\n")
     }
+    /// The host on the other end of the high-speed USB-OTG port (rhport 1, `DR_REG_USB2_BASE`).
+    fn attach_usb_host(&mut self, timing: esp_periph::usb_otg::UsbTiming) -> Result<(), String> {
+        let now = self.cycles;
+        let mut link = esp_periph::usb_otg::UsbLink::new(timing, periph::CPU_HZ, now);
+        link.log = self.periph.usb_otg.logging();
+        self.periph.usb_otg.attach(now, link);
+        esp_periph::Dispatch::refresh_optional(&mut self.periph, periph::USB_OTG_BLOCK);
+        self.irq_dirty = true;
+        Ok(())
+    }
+    fn usb_link(&mut self) -> Option<&mut esp_periph::usb_otg::UsbLink> { self.periph.usb_otg.link.as_deref_mut() }
 }
