@@ -305,3 +305,131 @@ fn p4_user_counters_shadow_the_machine_counters() {
     c6.write_csr(csr::CYCLE, 5);
     assert_eq!(c6.read_csr(csr::CYCLE), 5, "an unmodelled CSR reads back what was written");
 }
+
+/// CLIC mode on the P4 core (CLIC specification, "CLIC Interrupt Operation"; ESP-IDF v5.5.3
+/// riscv/vectors_clic.S): a hardware-vectored interrupt jumps through `mtvt + 4*id`, mcause
+/// carries the ID and the previous level, mintstatus (0x346) the new one; a candidate at or
+/// below the current level waits, a higher one nests, and `mret` restores the level from MPIL.
+#[test]
+fn clic_vectors_nests_by_level_and_mret_restores_it() {
+    use riscv_rv32::exec::{CLIC_IRQ_LEVEL_SHIFT, CLIC_IRQ_SHV};
+    let nops = asm("0001 0001 0001 0001 0001 0001 0001 0001");   // c.nop
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &nops, "nop");
+    let (table, handler, base) = (BASE + 0x400, BASE + 0x800, BASE + 0x200);
+    for id in 16..48u32 { ram.mem[(table - BASE + 4 * id) as usize..][..4].copy_from_slice(&(handler + 4 * id).to_le_bytes()); }
+    for w in (0x800..0x900).step_by(2) { ram.mem[w..w + 2].copy_from_slice(&0x0001u16.to_le_bytes()); }
+    ram.mem[0x900..0x904].copy_from_slice(&0x3020_0073u32.to_le_bytes());   // mret
+    cpu.write_csr(csr::MTVEC, base | 3);
+    cpu.write_csr(csr::MTVT, table | 0x3f);
+    assert_eq!(cpu.read_csr(csr::MTVT), table, "mtvt is 64-byte aligned");
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+    let irq = |line: u32, level: u32, shv: bool| Some(line | level << CLIC_IRQ_LEVEL_SHIFT | if shv { CLIC_IRQ_SHV } else { 0 });
+    cpu.set_irq(irq(2, 0x3f, true));                                  // CLIC ID 18, level 1
+    let at = cpu.pc;
+    assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Interrupt(2)));
+    assert_eq!((cpu.pc, cpu.mepc), (handler + 4 * 18, at));
+    assert_eq!(cpu.read_csr(csr::MCAUSE), 0x8000_0000 | 3 << 28 | 1 << 27 | 18, "MPP = M, MPIE = 1, MPIL = 0, ID 18");
+    assert_eq!(cpu.read_csr(csr::MINTSTATUS_P4), 0x3f << 24);
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);          // the handler enables nesting
+    cpu.set_irq(irq(1, 0x3f, true));                                  // the same level waits
+    assert_eq!(step(&mut cpu, &mut ram), Ok(()));
+    cpu.set_irq(irq(12, 0x7f, false));                                // level 3, not vectored: the base
+    let inner = cpu.pc;
+    assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Interrupt(12)));
+    assert_eq!((cpu.pc, cpu.mepc, cpu.read_csr(csr::MINTSTATUS_P4) >> 24), (base, inner, 0x7f));
+    assert_eq!(cpu.read_csr(csr::MCAUSE) & 0x80ff_0fff, 0x8000_0000 | 0x3f << 16 | 28, "MPIL is the interrupted level");
+    cpu.set_irq(None);
+    cpu.pc = BASE + 0x900;                                            // mret from the nested one
+    step(&mut cpu, &mut ram).unwrap();
+    assert_eq!((cpu.pc, cpu.mil), (inner, 0x3f));
+    assert!(cpu.mie_enabled());
+    // an exception keeps the level, enters at the base and records the level in MPIL
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus & !mstatus::MIE);
+    ram.mem[(cpu.pc - BASE) as usize..][..4].copy_from_slice(&0x0000_0073u32.to_le_bytes());   // ecall
+    assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Exception(11)));
+    assert_eq!((cpu.pc, cpu.mil, cpu.read_csr(csr::MCAUSE) & 0x80ff_0fff), (base, 0x3f, 0x3f << 16 | 11));
+    // writing mcause sets MPIL and, through the alias, mstatus.MPIE
+    cpu.write_csr(csr::MCAUSE, 0x8000_0012);
+    assert_eq!(cpu.mstatus & mstatus::MPIE, 0);
+    cpu.pc = BASE + 0x900;
+    step(&mut cpu, &mut ram).unwrap();
+    assert_eq!((cpu.mil, cpu.mie_enabled()), (0, false));
+}
+
+/// The ROM's `mtvec` mode 1 keeps taking exceptions at its base on the P4 core, and the C6 core
+/// has no CLIC: 0x307 and 0x346 are plain CSRs there and a presented line is taken as before.
+#[test]
+fn clic_mode_is_the_p4_cores_alone() {
+    let (mut p4, mut ram) = machine_on(Cpu::new_esp32p4(), &asm("00000073"), "ecall");
+    p4.write_csr(csr::MTVEC, BASE + 0x101);
+    assert_eq!(step(&mut p4, &mut ram), Err(Trap::Exception(11)));
+    assert_eq!((p4.pc, p4.mcause, p4.read_csr(csr::MCAUSE)), (BASE + 0x100, 11, 0xb), "mcause reads the bare cause outside CLIC mode");
+    let mut c6 = Cpu::new_rv32imac();
+    c6.write_csr(csr::MTVT, 0x1234);
+    c6.write_csr(csr::MINTSTATUS_P4, 0x55);
+    assert_eq!((c6.read_csr(csr::MTVT), c6.read_csr(csr::MINTSTATUS_P4)), (0x1234, 0x55));
+    assert!(!c6.clic);
+}
+
+fn clic_irq(line: u32, level: u32, shv: bool) -> Option<u32> {
+    use riscv_rv32::exec::{CLIC_IRQ_LEVEL_SHIFT, CLIC_IRQ_SHV};
+    Some(line | level << CLIC_IRQ_LEVEL_SHIFT | if shv { CLIC_IRQ_SHV } else { 0 })
+}
+
+/// In mtvec modes 0 and 1 the P4 core takes no CLIC candidate, even with MIE set, does not wake
+/// from WFI for it and does not count it as pending; mcause reads as written there.
+#[test]
+fn clint_mode_takes_no_clic_candidate() {
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &asm("0001 0001 10500073 0001"), "nop");
+    cpu.write_csr(csr::MTVEC, BASE + 0x101);
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+    cpu.set_irq(clic_irq(2, 0x3f, false));
+    assert!(!cpu.irq_pending());
+    for _ in 0..3 { assert_eq!(step(&mut cpu, &mut ram), Ok(())); }   // nop, nop, wfi
+    assert!(cpu.waiting);
+    assert_eq!(Core::step(&mut cpu, &mut ram).kind, emu_core::StepKind::Idle, "the WFI goes on");
+    cpu.write_csr(csr::MCAUSE, 0x8000_0000 | 3 << 28 | 0x12);
+    assert_eq!(cpu.read_csr(csr::MCAUSE), 0x8000_0000 | 3 << 28 | 0x12, "no MPP/MPIE alias outside CLIC mode");
+    cpu.write_csr(csr::MTVEC, BASE + 0x103);
+    assert!(cpu.irq_pending());
+}
+
+/// MIE alone blocks a take; a WFI ends for any presented candidate, takeable or not.
+#[test]
+fn clic_mie_blocks_and_wfi_wakes() {
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &asm("10500073 0001 0001 0001"), "wfi");
+    cpu.write_csr(csr::MTVEC, BASE + 0x203);
+    cpu.set_irq(clic_irq(1, 0x3f, false));
+    let mut core = |cpu: &mut Cpu| Core::step(cpu, &mut ram);
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::Retired);       // wfi
+    assert!(cpu.waiting);
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::Retired, "MIE = 0: woken, nothing taken, the nop runs");
+    assert!(!cpu.waiting);
+    cpu.mil = 0x3f;
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+    cpu.pc = BASE;
+    cpu.set_irq(None);
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::Retired);
+    assert!(cpu.waiting);
+    cpu.set_irq(clic_irq(1, 0x3f, false));                            // at the current level
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::Retired, "woken, not taken: it resumes after the wfi");
+    assert_eq!(cpu.pc, BASE + 6);
+    cpu.mil = 0;
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::TrapBefore(Trap::Interrupt(1)));
+    assert_eq!(cpu.pc, BASE + 0x200);
+}
+
+/// A fault on the hardware-vectoring table read is an instruction access fault at the table
+/// entry with MINHV set; `mret`'s resumption of the fetch is not modelled.
+#[test]
+fn clic_vector_table_fault_is_an_access_fault() {
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &asm("0001 0001"), "nop");
+    cpu.write_csr(csr::MTVEC, BASE + 0x203);
+    cpu.write_csr(csr::MTVT, 0x2000_0000);                            // outside the RAM
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+    cpu.set_irq(clic_irq(5, 0x3f, true));
+    assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Exception(1)));
+    let entry = 0x2000_0000 + 4 * 21;
+    assert_eq!((cpu.pc, cpu.mepc, cpu.mtval), (BASE + 0x200, entry, entry));
+    assert_eq!(cpu.read_csr(csr::MCAUSE) & (1 << 30 | 0xfff), 1 << 30 | 1, "MINHV and the access-fault code");
+}

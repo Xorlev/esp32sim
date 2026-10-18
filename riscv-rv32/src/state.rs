@@ -21,6 +21,10 @@ pub mod csr {
     /// uses; the user-mode alias at 0x802 is what the ROM's `ets_delay_us` busy-waits on.
     pub const MPCER: u32 = 0x7E0; pub const MPCMR: u32 = 0x7E1; pub const MPCCR: u32 = 0x7E2;
     pub const PCER_U: u32 = 0x800; pub const PCMR_U: u32 = 0x801; pub const PCCR_U: u32 = 0x802;
+    /// CLIC (RISC-V "Core-Local Interrupt Controller" specification): the hardware-vectoring table
+    /// base, and the ESP32-P4 rev < 3's `mintstatus`, which sits at 0x346 instead of 0xFB1
+    /// (ESP-IDF v5.5.3 riscv/include/esp_private/interrupt_clic.h:46-58).
+    pub const MTVT: u32 = 0x307; pub const MINTSTATUS_P4: u32 = 0x346;
     /// ESP32-P4 EXT_ILL: why the last illegal-instruction trap was taken
     /// (ESP-IDF v5.5.3 `components/riscv/vectors.S`, `EXT_ILL_CSR`).
     pub const EXT_ILL: u32 = 0x7F0;
@@ -37,6 +41,16 @@ pub mod exc {
     pub const LOAD_MISALIGNED: u32 = 4; pub const LOAD_ACCESS_FAULT: u32 = 5;
     pub const STORE_MISALIGNED: u32 = 6; pub const STORE_ACCESS_FAULT: u32 = 7;
     pub const ECALL_M: u32 = 11;
+}
+
+/// `mcause` in CLIC mode: the interrupt bit, MINHV (a vector-table fetch is in progress), MPP and
+/// MPIE (aliases of mstatus's), MPIL (the interrupt level before the trap), a 12-bit cause
+/// (ESP-IDF v5.5.3 riscv/include/esp_private/vectors_const.h; CLIC specification, "mcause").
+pub mod mcause {
+    pub const INTERRUPT: u32 = 1 << 31; pub const MINHV: u32 = 1 << 30;
+    pub const MPP: u32 = 3 << 28; pub const MPIE: u32 = 1 << 27;
+    pub const MPIL_SHIFT: u32 = 16; pub const MPIL: u32 = 0xff << 16;
+    pub const CODE: u32 = 0xfff;
 }
 
 pub mod mstatus {
@@ -103,6 +117,14 @@ pub struct Cpu {
     /// `cycle`/`instret` (Zicntr) read the machine counters; without it they are unmodelled CSRs,
     /// as they always were on the C3 and C6, which read the cycle count from MPCCR
     pub user_counters: bool,
+    /// CLIC mode exists (`mtvec` mode 3, `mtvt`, `mintstatus`, levels): the SoC presents the
+    /// candidate as `line | level << 8 | SHV << 16` (`exec::CLIC_IRQ_*`). Without it the presented
+    /// value is a line the SoC has already arbitrated, as on the C3 and C6.
+    pub clic: bool,
+    /// the hardware-vectoring table base (CSR 0x307), 64-byte aligned
+    pub mtvt: u32,
+    /// mintstatus.mil: the level of the interrupt being handled, 0 outside any handler
+    pub mil: u32,
     /// the address an `lr.w` reserved, until the next `sc.w`
     pub reservation: Option<u32>,
     /// pcs the machine intercepts (stubs, probes), as a bloom over `emu_core::pc_bit`: `run` stops there
@@ -122,7 +144,7 @@ impl Cpu {
             mstatus: 0x1800,          // MPP = machine
             mtvec: 0, mepc: 0, mcause: 0, mtval: 0, mie: 0, mscratch: 0,
             insn_count: 0, retired_count: 0, cycle_count: 0, cycle_base: 0, instret_base: 0, waiting: false, irq: None, misa: MISA_RV32IMC,
-            has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, user_counters: false, reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
+            has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, user_counters: false, clic: false, mtvt: 0, mil: 0, reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
         }
     }
     pub fn new_rv32imac() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAC; c }
@@ -130,18 +152,18 @@ impl Cpu {
     /// cycle count from (`rdcycle`, ESP-IDF v5.5.3 riscv/include/riscv/rv_utils.h:106-108). Its
     /// custom extensions (Xesppie, hardware loops) are not modelled and decode as illegal. FS is
     /// Off at reset, as on any core with F.
-    pub fn new_esp32p4() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAFC; c.has_ext_ill = true; c.user_counters = true; c }
+    pub fn new_esp32p4() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAFC; c.has_ext_ill = true; c.user_counters = true; c.clic = true; c }
 
     pub fn reset(&mut self) {
         // `insn_count` is the emulator's own monotonic counter — it drives the run statistics and
         // the trace, so a chip reset must not rewind it (a reset that did made the browser UI
         // report a negative instruction rate). The architectural cycle counter is separately
         // monotonic and firmware reads its reset-relative value.
-        let (insns, retired, cycles, misa, ext_ill, counters, bloom) = (self.insn_count, self.retired_count, self.cycle_count, self.misa, self.has_ext_ill, self.user_counters, self.boundary_bloom);
+        let (insns, retired, cycles, misa, ext_ill, counters, clic, bloom) = (self.insn_count, self.retired_count, self.cycle_count, self.misa, self.has_ext_ill, self.user_counters, self.clic, self.boundary_bloom);
         *self = Cpu::new();
         self.insn_count = insns; self.retired_count = retired; self.cycle_count = cycles;
         self.cycle_base = cycles; self.instret_base = retired;
-        self.misa = misa; self.has_ext_ill = ext_ill; self.user_counters = counters; self.boundary_bloom = bloom;
+        self.misa = misa; self.has_ext_ill = ext_ill; self.user_counters = counters; self.clic = clic; self.boundary_bloom = bloom;
     }
 
     #[inline(always)]
@@ -174,8 +196,11 @@ impl Cpu {
             MTVEC => self.mtvec,
             MSCRATCH => self.mscratch,
             MEPC => self.mepc,
+            MCAUSE if self.clic_mode() => self.clic_mcause(),
             MCAUSE => self.mcause,
             MTVAL => self.mtval,
+            MTVT if self.clic => self.mtvt,
+            MINTSTATUS_P4 if self.clic => self.mil << 24,
             MIP => 0,                               // the SoC's INTC holds pending state, not `mip`
             MCYCLE | MPCCR | PCCR_U => self.cycle_count.wrapping_sub(self.cycle_base) as u32,
             MCYCLEH => (self.cycle_count.wrapping_sub(self.cycle_base) >> 32) as u32,
@@ -212,8 +237,15 @@ impl Cpu {
             MTVEC => self.mtvec = v,
             MSCRATCH => self.mscratch = v,
             MEPC => self.mepc = v & !1,
+            // MPP and MPIE are mstatus's own bits seen through mcause (CLIC specification, "mcause")
+            MCAUSE if self.clic_mode() => {
+                self.mcause = v & (mcause::INTERRUPT | mcause::MINHV | mcause::MPIL | mcause::CODE);
+                self.mstatus = (self.mstatus & !(mstatus::MPP | mstatus::MPIE)) | ((v & mcause::MPP) >> 17) | ((v & mcause::MPIE) >> 20);
+            }
             MCAUSE => self.mcause = v,
             MTVAL => self.mtval = v,
+            MTVT if self.clic => self.mtvt = v & !0x3f,
+            MINTSTATUS_P4 if self.clic => {}
             // a write moves the guest-visible counter; the emulator's own count stays monotonic
             MCYCLE | MPCCR | PCCR_U => { let c = self.cycle_count.wrapping_sub(self.cycle_base) & !0xffff_ffff | v as u64; self.cycle_base = self.cycle_count.wrapping_sub(c); }
             MCYCLEH => { let c = self.cycle_count.wrapping_sub(self.cycle_base) & 0xffff_ffff | ((v as u64) << 32); self.cycle_base = self.cycle_count.wrapping_sub(c); }
@@ -225,16 +257,24 @@ impl Cpu {
         }
     }
 
+    /// mcause as CLIC mode shows it: MPP and MPIE read through from mstatus.
+    fn clic_mcause(&self) -> u32 { self.mcause | ((self.mstatus & mstatus::MPP) << 17) | ((self.mstatus & mstatus::MPIE) << 20) }
+
+    /// `mtvec` mode 3: CLIC mode.
+    #[inline(always)]
+    pub fn clic_mode(&self) -> bool { self.clic && self.mtvec & 3 == 3 }
+
     /// Enter the trap handler. `cause` has bit 31 set for interrupts; `tval` goes to `mtval`.
     /// `mtvec` mode 1 vectors interrupts to `base + 4*line` — how the C3 dispatches its 31 lines —
-    /// while exceptions always enter at the base.
+    /// while exceptions always enter at the base. In CLIC mode an exception enters at the
+    /// 64-byte-aligned base and records the current level in MPIL; the level does not change.
     pub fn trap(&mut self, cause: u32, tval: u32, epc: u32) {
         self.mepc = epc;
-        self.mcause = cause;
+        self.mcause = if self.clic_mode() { (cause & (mcause::INTERRUPT | mcause::CODE)) | self.mil << mcause::MPIL_SHIFT } else { cause };
         self.mtval = tval;
         let mpie = if self.mstatus & mstatus::MIE != 0 { mstatus::MPIE } else { 0 };
         self.mstatus = (self.mstatus & !(mstatus::MIE | mstatus::MPIE)) | mpie | mstatus::MPP;
-        let base = self.mtvec & !3;
+        let base = if self.clic_mode() { self.mtvec & !0x3f } else { self.mtvec & !3 };
         self.pc = if self.mtvec & 3 == 1 && cause & 0x8000_0000 != 0 {
             base.wrapping_add(4 * (cause & 0x1f))
         } else {
@@ -243,8 +283,10 @@ impl Cpu {
         self.waiting = false;
     }
 
-    /// `mret`: restore the interrupt-enable bit and jump back.
+    /// `mret`: restore the interrupt-enable bit and jump back; with a CLIC the level comes back
+    /// from mcause.MPIL.
     pub fn mret(&mut self) {
+        if self.clic_mode() { self.mil = (self.mcause & mcause::MPIL) >> mcause::MPIL_SHIFT; }
         let mpie = self.mstatus & mstatus::MPIE != 0;
         self.mstatus = (self.mstatus & !mstatus::MIE) | if mpie { mstatus::MIE } else { 0 } | mstatus::MPIE;
         self.pc = self.mepc;
