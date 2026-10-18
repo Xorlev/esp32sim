@@ -130,6 +130,29 @@ impl Bench {
         self.arm_setup();
         setup
     }
+    /// A control write as dcd_dwc2 serves one: control OUT 0 armed a packet at a time for the
+    /// data stage, then a zero-length IN for the status stage.
+    fn serve_control_out(&mut self, len: usize) -> Vec<u8> {
+        assert!(self.until(2_000, |b| b.rd(out_reg(0, reg::EPINT)) & epint::SETUP != 0), "SETUP phase done");
+        let int = self.rd(out_reg(0, reg::EPINT));
+        self.wr(out_reg(0, reg::EPINT), int);
+        for chunk in 0..len.div_ceil(64) {
+            let n = (len - chunk * 64).min(64) as u32;
+            self.wr(out_reg(0, reg::EPTSIZ), n | 1 << PKTCNT_SHIFT);
+            self.wr(out_reg(0, reg::EPDMA), BUF + chunk as u32 * 64);
+            let c = self.rd(out_reg(0, reg::EPCTL));
+            self.wr(out_reg(0, reg::EPCTL), c | epctl::EPENA | epctl::CNAK);
+            assert!(self.until(2_000, |b| b.rd(out_reg(0, reg::EPINT)) & epint::XFRC != 0), "data packet {chunk} taken");
+            self.wr(out_reg(0, reg::EPINT), epint::XFRC);
+        }
+        self.wr(in_reg(0, reg::EPTSIZ), 1 << PKTCNT_SHIFT);
+        let c = self.rd(in_reg(0, reg::EPCTL));
+        self.wr(in_reg(0, reg::EPCTL), c | epctl::EPENA | epctl::CNAK);
+        assert!(self.until(2_000, |b| b.rd(in_reg(0, reg::EPINT)) & epint::XFRC != 0), "status IN sent");
+        self.wr(in_reg(0, reg::EPINT), epint::XFRC);
+        self.arm_setup();
+        self.mem.0[0x1000..0x1000 + len].to_vec()
+    }
     /// edpt_activate for bulk endpoint 1 both ways, 512-byte packets, and its TX FIFO.
     fn open_bulk1(&mut self) {
         self.wr(reg::DIEPTXF1, 128 << 16 | 848);
@@ -508,4 +531,22 @@ fn a_rate_capped_host_spreads_packets_over_microframes() {
     fast.complete(10_000);
     let took = fast.us() - t0;
     assert!((140..=260).contains(&took), "line rate: 13 packets in the first microframe, 3 in the next, took {took} us");
+}
+
+/// A control write's status stage is a DATA1 zero-length IN whatever the data stage's packets
+/// left the toggle at (USB 2.0 §8.5.3): one packet and two.
+#[test]
+fn control_writes_of_one_and_two_packets_end_in_a_data1_status() {
+    let mut b = Bench::new();
+    b.enumerate();
+    for len in [7usize, 70] {
+        let data: Vec<u8> = (0..len as u8).map(|i| i ^ 0x5a).collect();
+        let l = (len as u16).to_le_bytes();
+        b.submit(Request::Control { setup: [0x21, 0x09, 0, 2, 0, 0, l[0], l[1]], data: data.clone(), mps: 64 });
+        assert_eq!(b.serve_control_out(len), data, "the data stage landed by DMA");
+        let c = b.complete(2_000);
+        assert_eq!(c.outcome, Outcome::Done(vec![]), "{len} bytes");
+        assert!(c.naks < 8, "{len} bytes: {} NAKs", c.naks);
+    }
+    assert_eq!(b.link().stats.toggle_errors, 0);
 }

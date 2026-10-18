@@ -127,6 +127,7 @@ impl FakeMsc {
             (0x00, req::SET_CONFIGURATION) => { self.configured = value == 1; self.pid = [false; 2]; }
             (0x02, req::CLEAR_FEATURE) => { let i = (index >> 7) as usize & 1; self.halt[i] = false; self.pid[i] = false; self.clear_halts += 1; }
             (0xa1, msc::GET_MAX_LUN) => self.ctrl_in = vec![0],
+            (0x40, 0x01) => {}
             (0x21, msc::BULK_ONLY_RESET) => { self.bot = Bot::Idle; self.bot_resets += 1; }
             _ => self.ctrl_stall = true,
         }
@@ -361,4 +362,15 @@ fn a_script_parses_and_runs_on_the_fake() {
     r.run(&cmds).unwrap();
     let mut r = script::Runner::new(&mut port);
     assert_eq!(r.run(&script::parse("capacity").unwrap()), Err((1, "no mass-storage interface open (msc)".into())));
+}
+
+#[test]
+fn control_writes_end_in_a_data1_status() {
+    let mut port = FakePort::new(FakeMsc::new(2048));
+    let mut h = UsbHost::new(&mut port);
+    h.enumerate(1_000_000_000).unwrap();
+    for len in [7u16, 70, 128] {
+        h.control(setup_packet(0x40, 0x01, 0, 0, len), vec![0xa5; len as usize]).unwrap();
+    }
+    assert_eq!(h.port().link().unwrap().stats.toggle_errors, 0);
 }

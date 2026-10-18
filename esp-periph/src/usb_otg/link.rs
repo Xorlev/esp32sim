@@ -397,7 +397,8 @@ impl UsbLink {
             }
             Stage::In | Stage::StatusIn => {
                 let control = matches!(x.req, Request::Control { .. });
-                let expect = if control { x.toggle } else { self.toggles[1][x.ep as usize & 15] };
+                // a status stage is DATA1 whatever the data stage left (USB 2.0 §8.5.3)
+                let expect = if x.stage == Stage::StatusIn { true } else if control { x.toggle } else { self.toggles[1][x.ep as usize & 15] };
                 match dev.token_in(mem, x.ep, x.mps) {
                     InReply::Nak => { x.naks += 1; self.stats.naks += 1; self.next_xact = Some(next_frame); self.xfer = Some(x); return; }
                     InReply::Stall => { self.stats.stalls += 1; Some(Outcome::Stall(std::mem::take(&mut x.data))) }
@@ -411,7 +412,8 @@ impl UsbLink {
                             if self.log { eprintln!("[usb-link] IN{} DATA{} dropped, expected DATA{}", x.ep, pid as u8, expect as u8); }
                             None
                         } else if x.stage == Stage::StatusIn {
-                            if d.is_empty() { Some(Outcome::Done(std::mem::take(&mut x.data))) } else { Some(Outcome::Babble(std::mem::take(&mut x.data))) }
+                            // the status of a control write or a no-data request: nothing came in
+                            if d.is_empty() { Some(Outcome::Done(Vec::new())) } else { Some(Outcome::Babble(Vec::new())) }
                         } else {
                             if control { x.toggle = !x.toggle } else { self.toggles[1][x.ep as usize & 15] ^= true; }
                             self.stats.bytes_in += d.len() as u64;
