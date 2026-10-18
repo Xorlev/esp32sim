@@ -274,3 +274,101 @@ fn udp_ignores_other_senders_and_preserves_dns_reply_address() {
     assert_eq!(&frames[0][26..30], &[10, 0, 2, 3]);
     assert_eq!(&frames[0][42..], b"answer");
 }
+
+#[test]
+fn forwards_parse_an_ipv4_guest_and_host_address_each() {
+    let f = Forward::parse("10.0.2.100:445=127.0.0.1:4445").unwrap();
+    assert_eq!((f.guest.to_string(), f.host.to_string()), ("10.0.2.100:445".into(), "127.0.0.1:4445".into()));
+    for bad in ["10.0.2.100:445", "10.0.2.100=127.0.0.1:1", "10.0.2.100:445=127.0.0.1", "nas:445=127.0.0.1:1", "10.0.2.100:0=127.0.0.1:1",
+                "10.0.2.100:445=127.0.0.1:0", "[::1]:445=127.0.0.1:1", "10.0.2.100:445=127.0.0.1:1=x"] {
+        assert!(Forward::parse(bad).is_err(), "{bad}");
+    }
+    let nat = Nat { forwards: vec![f], ..Nat::new(false) };
+    assert_eq!(nat.tcp_target(&[10, 0, 2, 100], 445), Some(f.host), "a forward wins over the guest's own destination");
+    assert_eq!(nat.tcp_target(&[10, 0, 2, 100], 80), Some(address(&[10, 0, 2, 100], 80)));
+    let only = Nat::forward_only(false, vec![f]);
+    assert_eq!((only.tcp_target(&[10, 0, 2, 100], 445), only.tcp_target(&[10, 0, 2, 100], 80)), (Some(f.host), None));
+}
+
+const STA_MAC: [u8; 6] = [2, 0, 0, 0, 0, 0x15];
+const SERVICE: [u8; 4] = [10, 0, 2, 100];
+
+/// A frame from the station to `dst:dport` from port 40000.
+fn guest_tcp(dst: [u8; 4], dport: u16, seq: u32, ack: u32, flags: u8, data: &[u8]) -> Vec<u8> {
+    let mut seg = segment(seq, ack, flags, data);
+    seg[..2].copy_from_slice(&40000u16.to_be_bytes());
+    seg[2..4].copy_from_slice(&dport.to_be_bytes());
+    ethernet(&GATEWAY_MAC, &STA_MAC, 0x0800, &ip_packet(6, &[10, 0, 2, 15], &dst, &seg))
+}
+
+fn guest_udp(dst: [u8; 4], dport: u16, payload: &[u8]) -> Vec<u8> {
+    ethernet(&GATEWAY_MAC, &STA_MAC, 0x0800, &ip_packet(17, &[10, 0, 2, 15], &dst, &udp_packet(&[10, 0, 2, 15], &dst, 40001, dport, payload)))
+}
+
+/// The network's frames for the station, waiting on loopback without advancing emulated time.
+fn net_ready(net: &mut crate::net::VirtualNet, now_us: u64) -> Vec<Vec<u8>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let frames = net.poll(now_us);
+        if !frames.is_empty() { return frames; }
+        assert!(std::time::Instant::now() < deadline, "loopback delivery timed out");
+        std::thread::yield_now();
+    }
+}
+
+/// Source address and port, flags and payload of a TCP frame for the station.
+fn tcp_of(frame: &[u8]) -> ([u8; 4], u16, u32, u8, &[u8]) {
+    (frame[26..30].try_into().unwrap(), u16::from_be_bytes([frame[34], frame[35]]), u32::from_be_bytes(frame[38..42].try_into().unwrap()), frame[47], &frame[54..])
+}
+
+/// `--net none,fwd=10.0.2.100:445=<listener>`: the guest's connection to the forwarded address
+/// reaches a listener on the host's loopback and carries bytes both ways, and the guest sees the
+/// address it connected to.
+#[test]
+fn a_forward_carries_a_guest_connection_to_a_host_listener() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let fwd = Forward { guest: SocketAddrV4::new(ip(&SERVICE), 445), host: listener.local_addr().unwrap() };
+    let mut net = crate::net::VirtualNet::new(false);
+    net.nat = Some(Nat::forward_only(false, vec![fwd]));
+    assert!(net.handle(&guest_tcp(SERVICE, 445, 999, 0, SYN, &[]), 0).is_empty(), "the SYN waits for the host's connect");
+    let (mut host, _) = listener.accept().unwrap();
+    host.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    let syn_ack = net_ready(&mut net, 10);
+    let (from, port, isn, flags, _) = tcp_of(&syn_ack[0]);
+    assert_eq!((from, port, flags), (SERVICE, 445, SYN | ACK));
+    net.handle(&guest_tcp(SERVICE, 445, 1000, isn.wrapping_add(1), ACK, &[]), 20);
+    let acked = net.handle(&guest_tcp(SERVICE, 445, 1000, isn.wrapping_add(1), PSH | ACK, b"ping"), 30);
+    assert_eq!(tcp_of(&acked[0]).3, ACK);
+    net.poll(40);
+    let mut got = [0; 4];
+    host.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"ping");
+    host.write_all(b"pong").unwrap();
+    let frames = net_ready(&mut net, 50);
+    let reply = frames.iter().map(|f| tcp_of(f)).find(|t| !t.4.is_empty()).expect("the host's bytes");
+    assert_eq!((reply.0, reply.1, reply.4), (SERVICE, 445, &b"pong"[..]));
+    let nat = net.nat.as_ref().unwrap();
+    assert_eq!((nat.tcp_opened, nat.bytes_to_host, nat.bytes_to_guest), (1, 4, 4));
+}
+
+/// The rest of `--net none` stays as it was: other connections are refused at once, and DNS and
+/// SNTP are answered inside the network, from its own clock.
+#[test]
+fn a_forward_only_network_refuses_the_rest_and_answers_dns_and_ntp_itself() {
+    let fwd = Forward::parse("10.0.2.100:445=127.0.0.1:9").unwrap();
+    let mut net = crate::net::VirtualNet::new(false);
+    net.nat = Some(Nat::forward_only(false, vec![fwd]));
+    net.epoch_us = Some(1_767_225_600_000_000);
+    let rst = net.handle(&guest_tcp(SERVICE, 80, 999, 0, SYN, &[]), 0);
+    assert_eq!(tcp_of(&rst[0]).3, RST | ACK);
+    let query = [0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, b'n', b'a', b's', 0, 0, 1, 0, 1];
+    let answer = net.handle(&guest_udp([10, 0, 2, 3], 53, &query), 0);
+    assert_eq!(&answer[0][answer[0].len() - 4..], &[10, 0, 2, 3]);
+    let mut ntp = [0; 48]; ntp[0] = 0x23;
+    let time = net.handle(&guest_udp([10, 0, 2, 3], 123, &ntp), 2_000_000);
+    let secs = u32::from_be_bytes(time[0][14 + 20 + 8 + 40..][..4].try_into().unwrap());
+    assert_eq!(secs as u64, 1_767_225_602 + 2_208_988_800);
+    assert_eq!((net.tcp_rejects, net.dns_answers, net.ntp_answers), (1, 1, 1));
+    let nat = net.nat.as_ref().unwrap();
+    assert_eq!((nat.tcp_opened, nat.udp_flows), (0, 0), "nothing went to the host");
+}
