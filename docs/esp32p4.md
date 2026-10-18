@@ -8,7 +8,9 @@ through the SDMMC host ("SD card" below), presents it as a USB mass-storage devi
 a host written in Rust on the high-speed USB-OTG port ("USB" below), and
 reaches WiFi through an emulated ESP32-C6 on SDIO running unmodified ESP-Hosted slave firmware,
 the two chips in lock-step in one process ("The co-processor" below). An image built
-for rev ≥ 3 is refused ("Revisions" below). This page describes the chip and its peripherals.
+for rev ≥ 3 is refused ("Revisions" below). Through the C6 and the virtual network's guest-to-host
+forwards an application can reach real servers on the host
+([networking-howto.md](networking-howto.md)). This page describes the chip and its peripherals.
 
 ```sh
 cargo build --release
@@ -507,16 +509,20 @@ there, so the firmware runs between the transfers of a command:
   SD_MAX_RETRIES 5) and the error handler's escalation past the abort. The review that asked for
   this described Linux's timeout handling as the class reset first, then a port reset; the
   v6.12 source does the port reset first, and the class reset only when the port reset fails.
-- `fat32::Fat32` mounts a volume (an MBR's FAT32 partition, or from LBA 0), lists, reads and
-  writes 8.3 files in the root directory in a vfat-like order: the directory entry at once, the
-  data a chunk at a time as it comes (one WRITE(10) per contiguous run of clusters), the FAT
-  sectors of each chunk's clusters in both FATs, then the entry's size and first cluster and
-  FSInfo. It is not Linux's writeback order, in which the page cache batches the data, the buffer
-  cache holds the FAT and directory sectors, inode writeback updates the entry periodically and
-  FSInfo is written at sync or unmount: a file cut off mid-write here keeps size 0 and no cluster
-  with its clusters orphaned in the FAT, where Linux would usually have left a shorter file.
-  Allocation starts at FSInfo's hint and writes the last cluster allocated back as the hint; the
-  free count written is FSInfo's as it stands on the volume less what this host allocated since.
+- `fat32::Fat32` mounts a volume (an MBR's FAT32 partition, or from LBA 0), lists, reads and writes
+  files in the root directory and below it (`list`, `stat`, `read_path`, `mkdir_all`,
+  `create_path`), with long-name entries before the short one for any name that is not an upper-case
+  8.3 name (fatgen103's basis names with ~N tails, and their checksum), so a host can write a
+  directory tree (`HostData/FirstGroup/<stamp>/entry.bin`; `bmff_bytes` makes a file whose top-level
+  boxes are `ftyp`, `mdat` and `moov`). It writes in a vfat-like order: the directory entry at once,
+  the data a chunk at a time as it comes (one WRITE(10) per contiguous run of clusters), the FAT
+  sectors of each chunk's clusters in both FATs, then the entry's size and first cluster and FSInfo.
+  It is not Linux's writeback order, in which the page cache batches the data, the buffer cache
+  holds the FAT and directory sectors, inode writeback updates the entry periodically and FSInfo is
+  written at sync or unmount: a file cut off mid-write here keeps size 0 and no cluster with its
+  clusters orphaned in the FAT, where Linux would usually have left a shorter file. Allocation
+  starts at FSInfo's hint and writes the last cluster allocated back as the hint; the free count
+  written is FSInfo's as it stands on the volume less what this host allocated since.
   `FileWriter::fat_every` writes the FAT less often.
 - `fat32::write_paced` writes a file at a fixed rate: chunk i is due at t0 + i x gap (t0
   taken before the file is created), the host waits only for a chunk that is not due yet, and the
@@ -550,6 +556,9 @@ endpoint that stops answering) under both recovery policies, and for a paced wri
 `esp-periph/src/usb_otg/tests.rs` drives the core with TinyUSB's register sequences against the
 link, including control writes of one and two packets (the status stage is DATA1, §8.5.3), an
 endpoint disable waiting for its NAK, the reset line held, and an injected VBUS loss.
+`fat32_directories_and_long_names_round_trip` writes a tree of long names on an image and reads
+it back; `external_fat32_tree_passes_fsck` runs the system's FAT checker on the same tree
+(`sd_image::fsck`: `fsck_msdos -n`, `fsck.fat -n` or `FSCK_FAT`).
 
 **Throughput.** A host writing in 64 KiB chunks as fast as the drive takes them, then reading the
 file back (FAT32, the card's programming time 0). The second half is the rate from the middle
@@ -885,7 +894,8 @@ The WiFi side is not part of these numbers, and through the air it is the first 
 virtual access point's receive pacing (`esp-soc/src/wifi.rs`, `StationLink::next_rx`) delivers
 one frame per 400 µs of airtime (`RX_GAP_US`) and none while the last descriptor it filled is
 still unrecycled, for up to 50 ms (`RX_STALL_US`), as an 802.11b/g link without A-MPDU would:
-about 30 Mbit/s of 1500-byte frames at best.
+about 30 Mbit/s of 1500-byte frames at best. TCP through the NAT meets a lower ceiling: at most
+5840 bytes in flight each way ([networking-howto.md](networking-howto.md), "Known limits").
 
 ### Faults
 
