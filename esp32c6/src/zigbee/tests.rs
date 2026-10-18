@@ -148,10 +148,63 @@ fn an_unacknowledged_frame_is_held_for_the_next_poll() {
     let due = air(&mut c, u64::MAX);
     assert_eq!(due.len(), 2);
     assert!(c.queue.is_empty());
-    // no acknowledgement arrives: after the deadline the frame is queued again
+    // no acknowledgement arrives: after the deadline the frame is queued again, counting the miss
     assert!(c.take_due(t + 100 * MS).is_empty());
     assert_eq!(c.queue.len(), 1);
-    assert_eq!(c.stats.acks_missed, 1);
+    assert_eq!((c.stats.acks_missed, c.queue[0].misses), (1, 1));
+    // an acknowledgement with another sequence number does not count, and does not lose the frame
+    let t = t + 200 * MS;
+    c.on_tx(t, 11, &data_request(21, Addr::Short(0x1234)));
+    let due = air(&mut c, u64::MAX);
+    let seq = due[1].frame[2];
+    c.on_tx(t + 3 * MS, 11, &ack(seq.wrapping_add(7)));
+    assert!(c.queue.is_empty());
+    assert!(c.take_due(t + 100 * MS).is_empty());
+    assert_eq!((c.stats.acks_missed, c.queue.len(), c.queue[0].misses), (2, 1, 2));
+    // the third miss drops it, and nothing behind it is held up
+    c.command(0, "zb identify 10 2").unwrap();
+    let t = t + 400 * MS;
+    c.on_tx(t, 11, &data_request(22, Addr::Short(0x1234)));
+    air(&mut c, u64::MAX);
+    assert!(c.take_due(t + 100 * MS).is_empty());
+    assert_eq!(c.queue.len(), 1, "only the second identify remains");
+    assert_eq!(c.queue[0].misses, 0);
+    assert_eq!(c.stats.acks_missed, 3);
+}
+
+/// Every prefix of every frame the device can send, and a bit flipped in each: nothing panics.
+#[test]
+fn hostile_frames_do_not_panic() {
+    let mut c = coordinator();
+    join(&mut c);
+    let mut zdo = vec![0x08, 0x00, 0x13, 0x00, 0x00, 0x00, 0x00, 0x11, 0x34, 0x12];
+    zdo.extend_from_slice(&DEV); zdo.push(0x80);
+    // APS data with the extended-header and security bits, a short write response, a short
+    // configure-reporting response, a report cut mid-value, an APS command with no payload
+    let frames: Vec<Vec<u8>> = vec![
+        device_frame(1, 0xfffd, &zdo),
+        device_frame(2, 0x0000, &[0xa0, 1, 0x10, 0x00, 0x04, 0x01, 11, 0x33]),
+        device_frame(3, 0x0000, &[0x40, 1, 0x10, 0x00, 0x04, 0x01, 11, 0x34, 0x08, 0x05, 0x04, 0x86, 0x55]),
+        device_frame(4, 0x0000, &[0x40, 1, 0x01, 0x00, 0x04, 0x01, 10, 0x35, 0x08, 0x06, 0x07, 0x8c, 0x00]),
+        device_frame(5, 0x0000, &[0x40, 1, 0x01, 0x00, 0x04, 0x01, 10, 0x36, 0x08, 0x07, 0x0a, 0x21, 0x00, 0x21, 0x34]),
+        device_frame(6, 0x0000, &[0x21, 0x40]),
+        device_frame(7, 0x0000, &[0x01, 0x41]),
+        association_request(3), data_request(4, Addr::Short(0x1234)), beacon_request(), ack(1),
+    ];
+    let mut t = 4000 * MS;
+    for f in &frames {
+        for n in 0..=f.len() {
+            c.on_tx(t, 11, &f[..n]);
+            t += MS;
+            air(&mut c, u64::MAX);
+        }
+        for i in 0..f.len() {
+            let mut g = f.clone(); g[i] ^= 0x10;
+            c.on_tx(t, 11, &g);
+            t += MS;
+            air(&mut c, u64::MAX);
+        }
+    }
 }
 
 #[test]
@@ -165,7 +218,7 @@ fn script_commands_wait_for_a_device() {
     zdo.extend_from_slice(&DEV); zdo.push(0x80);
     c.on_tx(3000 * MS, 11, &device_frame(1, 0xfffd, &zdo));
     assert_eq!(c.queue.len(), 1);
-    assert!(c.queue[0].1.starts_with("read ep 10"));
+    assert!(c.queue[0].what.starts_with("read ep 10"));
     assert!(Coordinator::check("zb frobnicate").is_err());
     assert!(c.command(0, "zb write 10 0x0500 0x0010 bogus 1").is_err());
 }

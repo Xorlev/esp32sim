@@ -95,11 +95,14 @@ impl Gpio {
         if pin as usize >= self.pin.len() { return false; }
         self.input & (1u64 << pin) != 0
     }
-    /// The pins whose level-type interrupt condition holds right now (type 4: low, 5: high). The
-    /// status register shows them for as long as the level lasts, as the latched edge bits are
-    /// shown until cleared, so an ISR reading `PCPU_INT` finds the pin that woke it.
-    fn level_status(&self) -> u64 {
-        (0..49u8).filter(|&p| { let typ = (self.pin[p as usize] >> 7) & 7; (typ == 4 && !self.level(p)) || (typ == 5 && self.level(p)) }).fold(0, |m, p| m | (1u64 << p))
+    /// `GPIO_STATUS_REG` (0x44) / `GPIO_PCPU_INT_REG` (0x5c, `soc/gpio_reg.h`, IDF v5.5.3): the
+    /// latched edge bits, plus every level-type pin (`INT_TYPE` 4: low, 5: high) whose condition
+    /// holds right now. A level interrupt's status stays set for as long as the level does, and
+    /// `gpio_intr_service` (`esp_driver_gpio/src/gpio.c`) reads `PCPU_INT` through
+    /// `gpio_ll_get_intr_status` to find the pins whose handlers to call: without them here it
+    /// found none. Masking of `PCPU_INT` by `INT_ENA` is not modelled, as before.
+    fn status_now(&self) -> u64 {
+        (0..49u8).filter(|&p| { let typ = (self.pin[p as usize] >> 7) & 7; (typ == 4 && !self.level(p)) || (typ == 5 && self.level(p)) }).fold(self.status, |m, p| m | (1u64 << p))
     }
     pub fn irq(&self) -> bool {
         // level-type interrupts on current input, plus latched edge status, gated by INT_ENA (bits 13..17, bit 13 = core0)
@@ -112,8 +115,7 @@ impl Gpio {
             0x20 => self.enable as u32, 0x2c => (self.enable >> 32) as u32,
             0x38 => self.strap,
             0x3c => self.input as u32, 0x40 => (self.input >> 32) as u32,
-            0x44 => (self.status | self.level_status()) as u32, 0x50 => ((self.status | self.level_status()) >> 32) as u32,
-            0x5c => (self.status | self.level_status()) as u32, 0x68 => ((self.status | self.level_status()) >> 32) as u32,     // PCPU_INT: interrupt status seen by core 0
+            0x44 | 0x5c => self.status_now() as u32, 0x50 | 0x68 => (self.status_now() >> 32) as u32,   // STATUS, and PCPU_INT: the status seen by core 0
             0x74..=0x134 => self.pin[((off - 0x74) / 4) as usize],
             0x154..=0x550 => self.func_in_sel[((off - 0x154) / 4) as usize],
             0x554..=0x614 => self.func_out_sel[((off - 0x554) / 4) as usize],

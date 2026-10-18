@@ -6,7 +6,7 @@
 //! Frame layouts are the Zigbee specification's (document 05-3474-22) and the ZCL's (07-5123-08);
 //! byte order on the air is least significant first throughout.
 
-use super::crypto::{ccm_decrypt, ccm_encrypt, hmac_mmo, MIC_LEN};
+use super::crypto::{ccm_decrypt, ccm_encrypt, hmac_mmo};
 use super::{hex, ieee_str, Coordinator, COORD_ENDPOINT, HA_PROFILE};
 
 const NWK_RADIUS: u8 = 30;
@@ -100,6 +100,16 @@ pub(super) fn zcl_value(t: u8, data: &[u8]) -> Option<(String, usize)> {
 
 fn zcl_type_name(t: u8) -> &'static str {
     match t { 0x10 => "bool", 0x20 => "u8", 0x21 => "u16", 0x22 => "u24", 0x23 => "u32", 0x28 => "i8", 0x29 => "i16", 0x2b => "i32", 0x30 => "enum8", 0x31 => "enum16", 0x18 => "bitmap8", 0x19 => "bitmap16", 0x39 => "float", 0x41 => "octstr", 0x42 => "string", 0xe2 => "utc", 0xf0 => "ieee", 0xf1 => "key", _ => "" }
+}
+
+/// `[status]` alone means success for all, else `[status .. attribute]` records of `n` bytes with
+/// the attribute id at `attr_at`; whatever does not fit a record is shown as hex.
+fn status_records(b: &[u8], n: usize, attr_at: usize) -> String {
+    if b.len() == 1 { return zcl_status(b[0]); }
+    let mut items: Vec<String> = b.chunks_exact(n).map(|c| format!("{:#06x}: {}", le16(&c[attr_at..]), zcl_status(c[0]))).collect();
+    let rest = b.chunks_exact(n).remainder();
+    if !rest.is_empty() { items.push(format!("trailing {}", hex(rest))); }
+    items.join(", ")
 }
 
 fn zcl_status(s: u8) -> String {
@@ -278,7 +288,7 @@ impl Coordinator {
     /// device's trust-centre link key, inside an unsecured NWK frame — what a joining device can
     /// decrypt before it has anything else.
     pub(super) fn send_network_key(&mut self, now: u64, idx: usize) {
-        let d = self.devices[idx].clone();
+        let d = self.devices[idx].addressing();
         let ktk = hmac_mmo(&d.link_key, &[0x00]);
         let mut cmd = vec![APS_CMD_TRANSPORT_KEY, KEY_TYPE_STANDARD_NWK];
         cmd.extend_from_slice(&self.cfg.nwk_key);
@@ -371,10 +381,11 @@ impl Coordinator {
                 let src_ep = *aps.get(i)?; i += 1;
                 let counter = *aps.get(i)?; i += 1;
                 if fc & 0x80 != 0 { i += 1; }           // extended header (fragmentation): not supported
+                let (header, rest) = (aps.get(..i)?, aps.get(i..)?);
                 let payload = if security {
                     let key = self.devices[idx].link_key;
-                    match unsecure(&key, &aps[..i], &aps[i..], Some(self.devices[idx].ieee)) { Some((_, p)) => p, None => { self.log(now, "APS data frame failed to decrypt"); return Some(()); } }
-                } else { aps.get(i..)?.to_vec() };
+                    match unsecure(&key, header, rest, Some(self.devices[idx].ieee)) { Some((_, p)) => p, None => { self.log(now, "APS data frame failed to decrypt"); return Some(()); } }
+                } else { rest.to_vec() };
                 if ack_request && n.dst != 0xffff && n.dst < 0xfff8 {
                     // APS acknowledgement: the addressing reflected, the same counter
                     let mut ack = vec![0x02, src_ep];
@@ -388,7 +399,7 @@ impl Coordinator {
                     self.enqueue(mac, format!("aps ack {counter}"));
                 }
                 if profile == 0 { self.on_zdo(now, idx, cluster, &payload); }
-                else { self.on_zcl(now, idx, src_ep, dst_ep, cluster, profile, &payload); }
+                else { self.on_zcl(now, idx, src_ep, cluster, profile, &payload); }
             }
             1 => {
                 let counter = *aps.get(1)?;
@@ -419,7 +430,7 @@ impl Coordinator {
                 if kt != KEY_TYPE_TC_LINK { self.log(now, format!("request key of type {kt:#04x}: only the trust-centre link key is handed out")); return; }
                 if key_id != Some(KEY_ID_LINK) { self.log(now, format!("request key not secured with the link key (key id {key_id:?})")); }
                 // a fresh link key for this device, derived so a run is reproducible
-                let d = self.devices[idx].clone();
+                let d = self.devices[idx].addressing();
                 let new_key = hmac_mmo(&self.cfg.tc_link_key, &d.ieee);
                 let load_key = hmac_mmo(&d.link_key, &[0x02]);
                 let mut cmd = vec![APS_CMD_TRANSPORT_KEY, KEY_TYPE_TC_LINK];
@@ -435,7 +446,7 @@ impl Coordinator {
             }
             Some(&APS_CMD_VERIFY_KEY) => {
                 let kt = p.get(1).copied().unwrap_or(0);
-                let d = self.devices[idx].clone();
+                let d = self.devices[idx].addressing();
                 let hash = p.get(10..26);
                 let expect = hmac_mmo(&d.link_key, &[0x03]);
                 let ok = kt == KEY_TYPE_TC_LINK && hash == Some(&expect[..]);
@@ -531,7 +542,6 @@ impl Coordinator {
                 let n = b[3] as usize;
                 let eps: Vec<u8> = b.get(4..4 + n).map(|s| s.to_vec()).unwrap_or_default();
                 self.log(now, format!("active endpoints: {:?}", eps));
-                self.devices[idx].endpoints = eps.clone();
                 for ep in &eps {
                     let short = self.devices[idx].short;
                     let mut p = short.to_le_bytes().to_vec(); p.push(*ep);
@@ -542,6 +552,7 @@ impl Coordinator {
                     let mut p = Vec::new(); for a in attrs { p.extend_from_slice(&a.to_le_bytes()); }
                     self.send_zcl(idx, ep, CLUSTER_BASIC, false, ZCL_READ, &p, format!("read basic attributes ep {ep}"));
                 }
+                self.devices[idx].endpoints = eps;
             }
             ZDO_SIMPLE_DESC_REQ if status == 0 && b.len() >= 12 => {
                 let d = &b[4..];
@@ -561,7 +572,7 @@ impl Coordinator {
     // ------------------------------------------------------------------ ZCL
 
     #[allow(clippy::too_many_arguments)]
-    fn on_zcl(&mut self, now: u64, idx: usize, src_ep: u8, dst_ep: u8, cluster: u16, profile: u16, p: &[u8]) {
+    fn on_zcl(&mut self, now: u64, idx: usize, src_ep: u8, cluster: u16, profile: u16, p: &[u8]) {
         let Some(&fc) = p.first() else { return };
         let specific = fc & 3 == 1;
         let manuf = fc & 4 != 0;
@@ -587,12 +598,12 @@ impl Coordinator {
                     default_status = None;
                 }
                 ZCL_WRITE_RSP => {
-                    let txt = if b.len() == 1 { zcl_status(b[0]) } else { b.chunks(3).map(|c| format!("{:#06x}: {}", le16(&c[1..]), zcl_status(c[0]))).collect::<Vec<_>>().join(", ") };
+                    let txt = status_records(b, 3, 1);
                     self.log(now, format!("write response {where_}: {txt}"));
                     default_status = None;
                 }
                 ZCL_CONFIGURE_REPORTING_RSP => {
-                    let txt = if b.len() == 1 { zcl_status(b[0]) } else { b.chunks(4).map(|c| format!("{:#06x}: {}", le16(&c[2..]), zcl_status(c[0]))).collect::<Vec<_>>().join(", ") };
+                    let txt = status_records(b, 4, 2);
                     self.log(now, format!("configure reporting response {where_}: {txt}"));
                     default_status = None;
                 }
@@ -640,7 +651,6 @@ impl Coordinator {
             if let Some(m) = manuf_code { f[0] |= 0x04; f.extend_from_slice(&m.to_le_bytes()); }
             f.extend_from_slice(&[tsn, ZCL_DEFAULT_RSP, cmd, status]);
             self.send_aps(idx, src_ep, cluster, profile, &f, format!("default response ep {src_ep} tsn {tsn}"));
-            let _ = dst_ep;
         }
     }
 
@@ -672,9 +682,15 @@ impl Coordinator {
                 let val = arg(5)?;
                 match t {
                     TYPE_IEEE => { if val == "me" || val == "coordinator" { p.extend_from_slice(&self.cfg.ieee); } else { let mut b: [u8; 8] = super::parse_hex_bytes(val, "ieee")?; b.reverse(); p.extend_from_slice(&b); } }
-                    0x42 => { p.push(val.len() as u8); p.extend_from_slice(val.as_bytes()); }
+                    0x42 => { if val.len() > 254 { return Err("string: at most 254 bytes".into()); } p.push(val.len() as u8); p.extend_from_slice(val.as_bytes()); }
                     0x10 => p.push(match val { "1" | "true" | "on" => 1, "0" | "false" | "off" => 0, v => return Err(format!("bool: {v:?}")) }),
-                    _ => { let n = zcl_type_len(t, &[0; 8]).ok_or_else(|| format!("type {t:#04x}: unknown size"))?; let v = parse_num(val)?; p.extend_from_slice(&v.to_le_bytes()[..n]); }
+                    _ => {
+                        let n = zcl_type_len(t, &[0; 8]).ok_or_else(|| format!("type {t:#04x}: unknown size"))?;
+                        if n > 8 { return Err(format!("type {t:#04x} is {n} bytes: give it as hex with `zb cmd`, or use `ieee`")); }
+                        let v = parse_num(val)?;
+                        if n < 8 && v >> (8 * n) != 0 { return Err(format!("{val} does not fit in {n} byte{}", if n == 1 { "" } else { "s" })); }
+                        p.extend_from_slice(&v.to_le_bytes()[..n]);
+                    }
                 }
                 self.send_zcl(idx, ep, cluster, false, ZCL_WRITE, &p, format!("write ep {ep} cluster {cluster:#06x} attr {attr:#06x} = {val}"));
             }
@@ -727,7 +743,6 @@ impl Coordinator {
             }
             c => return Err(format!("zb: unknown command {c:?}")),
         }
-        let _ = MIC_LEN;
         Ok(())
     }
 }

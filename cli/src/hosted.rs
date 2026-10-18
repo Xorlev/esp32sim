@@ -60,7 +60,8 @@ impl Hosted {
             if let Some(c) = &mut self.coordinator {
                 for p in c.take_due(now) {
                     let on_channel = m.bus.periph.radio.channel() == c.cfg.channel;
-                    let taken = on_channel && m.bus.radio_receive(&p.frame, RSSI_DBM, LQI, Some(0));
+                    // the frame started at `p.at`; the loop may have overshot it by a block
+                    let taken = on_channel && m.bus.radio_receive(&p.frame, RSSI_DBM, LQI, Some(now.saturating_sub(p.at)));
                     m.sync_irq();
                     c.outcome(now, p, taken);
                 }

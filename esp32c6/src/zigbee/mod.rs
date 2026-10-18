@@ -182,9 +182,29 @@ fn mac_frame(frame_type: u8, ack_request: bool, pending: bool, seq: u8, dst_pan:
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind { Ack, Beacon, Data }
 
-/// A frame the coordinator will put on the air at `at` (a cycle of the device's clock).
+/// What a queued frame is, where that decides anything: the association response is replaced
+/// by a repeated request and must be delivered before the network key follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tag { AssociationResponse, Other }
+
+/// A frame waiting for the device to poll. `misses` counts the times it was on the air and
+/// never acknowledged (or refused by the radio until given up on): three and it is dropped.
 #[derive(Clone, Debug)]
-pub struct Pending { pub at: u64, pub frame: Vec<u8>, pub kind: Kind, pub tries: u8, pub what: String }
+pub struct Queued { pub frame: Vec<u8>, pub what: String, pub tag: Tag, pub misses: u8 }
+
+/// A frame the coordinator will put on the air at `at` (a cycle of the device's clock).
+/// `refusals` is how often the radio has refused it this time round; `misses` as in `Queued`.
+#[derive(Clone, Debug)]
+pub struct Pending { pub at: u64, pub frame: Vec<u8>, pub kind: Kind, pub refusals: u8, pub misses: u8, pub tag: Tag, pub what: String }
+
+/// Our acknowledged frame on the air, until its acknowledgement or its deadline.
+#[derive(Clone, Debug)]
+struct InFlight { seq: u8, deadline: u64, frame: Vec<u8>, what: String, tag: Tag, misses: u8 }
+
+/// A frame is dropped after this many unacknowledged deliveries.
+const MAX_MISSES: u8 = 3;
+/// A frame the radio refuses this often in one delivery goes back to the queue (one miss).
+const MAX_REFUSALS: u8 = 6;
 
 /// One device the coordinator knows: the only child a single-device network has, but a table
 /// so a second one is a loop, not a rewrite.
@@ -208,6 +228,11 @@ pub struct Device {
     pub last_poll: u64,
 }
 
+/// The `Copy` part of a `Device` that frame builders need, so they do not clone its vectors.
+#[derive(Clone, Copy)]
+pub(crate) struct Addressing { pub ieee: [u8; 8], pub short: u16, pub link_key: [u8; 16] }
+impl Device { pub(crate) fn addressing(&self) -> Addressing { Addressing { ieee: self.ieee, short: self.short, link_key: self.link_key } } }
+
 pub struct Coordinator {
     pub cfg: Config,
     pub devices: Vec<Device>,
@@ -216,11 +241,11 @@ pub struct Coordinator {
     dsn: u8, bsn: u8,
     nwk_seq: u8, nwk_fc: u32, aps_counter: u8, aps_fc: u32, zcl_tsn: u8, zdo_tsn: u8,
     /// frames waiting for the device to poll, oldest first
-    pub queue: VecDeque<(Vec<u8>, String)>,
+    pub queue: VecDeque<Queued>,
     /// frames due on the air, by time
     inject: Vec<Pending>,
-    /// our frame on the air that asked for an acknowledgement: (seq, deadline, frame, what)
-    awaiting_ack: Option<(u8, u64, Vec<u8>, String, u8)>,
+    /// our frame on the air that asked for an acknowledgement
+    awaiting_ack: Option<InFlight>,
     /// the IAS zone id to hand out next
     next_zone: u8,
     pub stats: Stats,
@@ -255,33 +280,34 @@ impl Coordinator {
     /// acknowledgement it is waiting for timing out.
     pub fn next_deadline(&self) -> Option<u64> {
         let inj = self.inject.iter().map(|p| p.at).min();
-        let ack = self.awaiting_ack.as_ref().map(|a| a.1);
+        let ack = self.awaiting_ack.as_ref().map(|a| a.deadline);
         match (inj, ack) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) }
     }
 
     /// Frames due at or before `now`, in time order. The caller puts each on the air and reports
     /// back with `outcome`.
     pub fn take_due(&mut self, now: u64) -> Vec<Pending> {
-        if let Some((seq, deadline, frame, what, tries)) = self.awaiting_ack.take() {
-            if now >= deadline {
-                self.stats.acks_missed += 1;
-                if tries < 3 {
-                    self.log(now, format!("no ack for {what} (seq {seq}); holding it for the next poll"));
-                    self.queue.push_front((frame, what));
-                } else {
-                    self.log(now, format!("no ack for {what} after {tries} tries; dropped"));
-                }
-            } else {
-                self.awaiting_ack = Some((seq, deadline, frame, what, tries));
-            }
+        if self.awaiting_ack.as_ref().is_some_and(|a| now >= a.deadline) {
+            let a = self.awaiting_ack.take().unwrap();
+            self.stats.acks_missed += 1;
+            self.requeue(now, a.frame, a.what, a.tag, a.misses + 1, format!("no ack for seq {}", a.seq));
         }
-        let mut due: Vec<Pending> = Vec::new();
-        let mut i = 0;
-        while i < self.inject.len() {
-            if self.inject[i].at <= now { due.push(self.inject.remove(i)); } else { i += 1; }
-        }
+        let (due, later): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.inject).into_iter().partition(|p| p.at <= now);
+        self.inject = later;
+        let mut due = due;
         due.sort_by_key(|p| p.at);
         due
+    }
+
+    /// A delivery failed: back to the head of the queue for the next poll, or dropped once it
+    /// has failed `MAX_MISSES` times.
+    fn requeue(&mut self, now: u64, frame: Vec<u8>, what: String, tag: Tag, misses: u8, why: String) {
+        if misses < MAX_MISSES {
+            self.log(now, format!("{why}: {what} held for the next poll (attempt {misses} of {MAX_MISSES})"));
+            self.queue.push_front(Queued { frame, what, tag, misses });
+        } else {
+            self.log(now, format!("{why}: {what} dropped after {misses} attempts"));
+        }
     }
 
     /// What became of a frame handed to the radio: taken (on the air from `now`) or refused (the
@@ -295,9 +321,10 @@ impl Coordinator {
                 Kind::Data => {
                     let ar = p.frame.first().is_some_and(|b| b & 0x20 != 0);
                     if ar {
-                        // the acknowledgement follows the frame's end; allow it the turnaround and some slack
+                        // the acknowledgement follows the frame's end; allow it the turnaround and some slack.
+                        // `frame[2]` is the sequence number: every frame built here has a header.
                         let deadline = now + ppdu_cycles(p.frame.len()) + us(ACK_TURNAROUND_NS / 1000) + ack_cycles() + ms(2);
-                        self.awaiting_ack = Some((p.frame[2], deadline, p.frame.clone(), p.what.clone(), p.tries));
+                        self.awaiting_ack = Some(InFlight { seq: p.frame[2], deadline, frame: p.frame.clone(), what: p.what.clone(), tag: p.tag, misses: p.misses });
                     }
                 }
             }
@@ -305,21 +332,21 @@ impl Coordinator {
             return;
         }
         self.stats.not_taken += 1;
-        p.tries += 1;
+        p.refusals += 1;
         match p.kind {
             Kind::Ack => self.trace(now, "ack not taken: the device was not waiting for it"),
-            Kind::Beacon => { if p.tries < 3 { p.at = now + us(500); self.inject.push(p); } else { self.trace(now, "beacon not taken; the scan moved on"); } }
+            Kind::Beacon => { if p.refusals < 3 { p.at = now + us(500); self.inject.push(p); } else { self.trace(now, "beacon not taken; the scan moved on"); } }
             Kind::Data => {
-                if p.tries < 6 { p.at = now + us(500); self.inject.push(p); }
-                else { self.log(now, format!("{} not taken by the radio; holding it for the next poll", p.what)); self.queue.push_front((p.frame, p.what)); }
+                if p.refusals < MAX_REFUSALS { p.at = now + us(500); self.inject.push(p); }
+                else { self.requeue(now, p.frame, p.what, p.tag, p.misses + 1, "refused by the radio".into()); }
             }
         }
     }
 
-    fn schedule(&mut self, at: u64, frame: Vec<u8>, kind: Kind, what: String) { self.inject.push(Pending { at, frame, kind, tries: 0, what }); }
+    fn schedule(&mut self, at: u64, frame: Vec<u8>, kind: Kind, what: String) { self.inject.push(Pending { at, frame, kind, refusals: 0, misses: 0, tag: Tag::Other, what }); }
 
     /// Queue a frame for the device: it leaves when the device next polls.
-    pub(crate) fn enqueue(&mut self, frame: Vec<u8>, what: String) { self.queue.push_back((frame, what)); }
+    pub(crate) fn enqueue(&mut self, frame: Vec<u8>, what: String) { self.queue.push_back(Queued { frame, what, tag: Tag::Other, misses: 0 }); }
 
     /// A MAC data frame to the device's short address, acknowledged, carrying `payload`.
     pub(crate) fn data_frame(&mut self, dst: u16, payload: &[u8]) -> Vec<u8> {
@@ -363,10 +390,14 @@ impl Coordinator {
         self.stats.frames_in += 1;
         let end = now + ppdu_cycles(frame.len());
         if m.frame_type == 2 {
-            self.stats.acks_received += 1;
-            if let Some((seq, _, _, what, _)) = self.awaiting_ack.take() {
-                if seq == m.seq { self.trace(now, format!("ack for {what}")); }
-                else { self.log(now, format!("ack with seq {} while waiting for seq {seq} ({what})", m.seq)); }
+            match &self.awaiting_ack {
+                Some(a) if a.seq == m.seq => {
+                    self.stats.acks_received += 1;
+                    let what = self.awaiting_ack.take().unwrap().what;
+                    self.trace(now, format!("ack for {what}"));
+                }
+                Some(a) => { let (seq, what) = (a.seq, a.what.clone()); self.log(now, format!("ack with seq {} while waiting for seq {seq} ({what}); ignored", m.seq)); }
+                None => self.trace(now, format!("ack with seq {} for nothing of ours", m.seq)),
             }
             return;
         }
@@ -408,7 +439,7 @@ impl Coordinator {
                 if !self.cfg.permit_join {
                     self.log(now, format!("association request from {} refused: joining not permitted", ieee_str(&ieee)));
                     let seq = self.next_dsn();
-                    let rsp = mac_frame(3, true, false, seq, Some(self.cfg.pan), Addr::Ext(ieee), Some(self.cfg.pan), Addr::Ext(self.cfg.ieee), &[0x02, 0xff, 0xff, 0x01]);
+                    let rsp = mac_frame(3, true, false, seq, Some(self.cfg.pan), Addr::Ext(ieee), Some(self.cfg.pan), Addr::Ext(self.cfg.ieee), &[0x02, 0xff, 0xff, 0x02]);   // status 2: PAN access denied
                     self.enqueue(rsp, "association response (denied)".into());
                     return;
                 }
@@ -431,24 +462,25 @@ impl Coordinator {
                 p.extend_from_slice(&short.to_le_bytes());
                 p.push(0x00);
                 let rsp = mac_frame(3, true, false, seq, Some(self.cfg.pan), Addr::Ext(ieee), Some(self.cfg.pan), Addr::Ext(self.cfg.ieee), &p);
-                self.queue.retain(|(_, w)| !w.starts_with("association response"));
-                self.enqueue(rsp, "association response".into());
+                self.queue.retain(|q| q.tag != Tag::AssociationResponse);
+                self.queue.push_back(Queued { frame: rsp, what: "association response".into(), tag: Tag::AssociationResponse, misses: 0 });
             }
             Some(0x04) => {
                 self.stats.polls += 1;
                 if let Some(i) = self.device_of(&m.src) { self.devices[i].polls += 1; self.devices[i].last_poll = now; }
                 if pending {
-                    if let Some((frame, what)) = self.queue.pop_front() {
+                    if let Some(q) = self.queue.pop_front() {
                         let at = ack_at + ack_cycles() + LIFS;
-                        self.trace(now, format!("poll from {}: {what} follows", m.src));
-                        self.schedule(at, frame, Kind::Data, what);
+                        self.trace(now, format!("poll from {}: {} follows", m.src, q.what));
+                        self.inject.push(Pending { at, frame: q.frame, kind: Kind::Data, refusals: 0, misses: q.misses, tag: q.tag, what: q.what });
                     }
                 } else {
                     self.trace(now, format!("poll from {}: nothing pending", m.src));
                 }
-                // the association response is ACKed and the device joined: the network key follows
+                // the association response has left the queue (this poll took it, or an earlier one did
+                // and the device, now polling, has it): the network key follows
                 if let Some(i) = self.device_of(&m.src) {
-                    if self.devices[i].associated && !self.devices[i].keyed && !self.queue.iter().any(|(_, w)| w.starts_with("association response")) {
+                    if self.devices[i].associated && !self.devices[i].keyed && !self.queue.iter().any(|q| q.tag == Tag::AssociationResponse) {
                         self.devices[i].keyed = true;
                         self.send_network_key(now, i);
                     }
@@ -469,12 +501,12 @@ impl Coordinator {
             "permit" => { let on = it.next().map(|v| v != "0" && v != "off").unwrap_or(true); self.cfg.permit_join = on; self.log(now, format!("permit join: {on}")); Ok(()) }
             "" => Err("zb: empty command".into()),
             _ => {
-                if self.target.is_none() || !self.devices[self.target.unwrap()].keyed {
+                let Some(t) = self.target.filter(|&t| self.devices[t].keyed) else {
                     self.log(now, format!("`zb {rest}` waits for a device to join"));
                     self.deferred.push(rest.to_string());
                     return Ok(());
-                }
-                self.device_command(now, self.target.unwrap(), rest)
+                };
+                self.device_command(now, t, rest)
             }
         }
     }

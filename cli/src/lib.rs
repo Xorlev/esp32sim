@@ -230,9 +230,6 @@ fn run_hosted(mut m: esp32c6::Machine, o: &Opts) {
     if o.approximate_timing { usage_error("--zigbee / --pwm-log: no approximate timing"); }
     let cfg = o.zigbee.as_deref().map(|s| esp32c6::zigbee::Config::parse(s).unwrap_or_else(|e| usage_error(&e)));
     let boot = prepare(&mut m, o);
-    if o.zigbee.is_none() {
-        if let Some((_, esp_soc::ScriptAction::Host(c))) = m.script.events.iter().find(|(_, a)| matches!(a, esp_soc::ScriptAction::Host(_))) { usage_error(&format!("script: `{c}` needs --zigbee")); }
-    }
     for (_, a) in &m.script.events { if let esp_soc::ScriptAction::Host(c) = a { esp32c6::zigbee::Coordinator::check(c).unwrap_or_else(|e| usage_error(&format!("script: {e}"))); } }
     if let Some(c) = &cfg { eprintln!("[zb] coordinator: PAN {:#06x}, extended PAN {}, channel {}, permit join {}", c.pan, esp32c6::zigbee::ieee_str(&c.ext_pan), c.channel, c.permit_join); }
     let mut h = hosted::Hosted::new(cfg, o.pwm_log.clone());
@@ -487,6 +484,9 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
     }
     if o.ble { m.bus.enable_ble(&ble_elf).unwrap_or_else(|e| usage_error(&format!("--ble: {e}"))); }
     if let Some(p) = &o.script { m.load_script(&std::fs::read_to_string(p).unwrap_or_else(|e| usage_error(&format!("script: {e}")))).unwrap_or_else(|e| usage_error(&format!("script: {e}"))); }
+    if o.zigbee.is_none() {
+        if let Some((_, esp_soc::ScriptAction::Host(c))) = m.script.events.iter().find(|(_, a)| matches!(a, esp_soc::ScriptAction::Host(_))) { usage_error(&format!("script: `{c}` needs --zigbee (ESP32-C6)")); }
+    }
     if let Some(s) = &o.serial { m.bus.serial_input(s.as_bytes()); }
     for pre in &o.trace_fns {
         let n = m.trace_fns(pre);
