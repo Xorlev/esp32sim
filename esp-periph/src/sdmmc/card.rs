@@ -463,7 +463,7 @@ impl SdDevice for SdCard {
         r
     }
 
-    fn read_data(&mut self, out: &mut [u8]) -> Result<(), SdDataError> {
+    fn read_data(&mut self, _now: u64, out: &mut [u8]) -> Result<(), SdDataError> {
         let mut done = 0;
         while done < out.len() {
             let Phase::Read { buf, pos, next, left } = &mut self.data else { return Err(SdDataError::Timeout) };
