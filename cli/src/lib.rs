@@ -73,6 +73,8 @@ pub struct Opts {
     /// `--sd IMAGE` (copy-on-write) or `--sd-rw IMAGE` (write-through): a card in the SD socket,
     /// with `--sd-prg-us` and `--sd-serial`
     pub sd: Option<(String, bool)>, pub sd_prg_us: Option<u64>, pub sd_serial: Option<u32>,
+    /// `--usb-host FILE`: a USB host on the chip's USB-OTG port, running the commands in FILE
+    pub usb_host: Option<String>,
     pub board: String, pub wifi: Option<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
@@ -113,6 +115,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--sd-rw" => o.sd = Some((next(), true)),
             "--sd-prg-us" => o.sd_prg_us = Some(next().parse().unwrap_or_else(|_| usage_error("--sd-prg-us: expected microseconds"))),
             "--sd-serial" => o.sd_serial = Some(hex(&next(), "sd-serial")),
+            "--usb-host" => o.usb_host = Some(next()),
             "--mac" => { let v = next(); let b: Vec<u8> = v.split(':').filter_map(|x| u8::from_str_radix(x, 16).ok()).collect(); if b.len() != 6 { eprintln!("--mac wants xx:xx:xx:xx:xx:xx"); std::process::exit(2); } let mut m = [0u8; 6]; m.copy_from_slice(&b); o.mac = Some(m); }
             "--strap" => o.strap = Some(hex(&next(), "strap")),
             "--reset-cause" => o.reset_cause = Some(hex(&next(), "reset-cause")),
@@ -406,9 +409,17 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
         eprintln!("[emu] APPROXIMATE timing: {:?}; use --boot rom; accuracy unvalidated", model.config);
     }
     let boot = prepare(&mut m, o);
+    let cmds = o.usb_host.as_ref().map(|path| {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| usage_error(&format!("--usb-host {path}: {e}")));
+        let cmds = esp_soc::usb_host::script::parse(&text).unwrap_or_else(|e| usage_error(&format!("--usb-host {path}: {e}")));
+        m.bus.attach_usb_host(Default::default()).unwrap_or_else(|e| usage_error(&format!("--usb-host: {e}")));
+        eprintln!("[emu] USB host on the device port: {} commands from {}", cmds.len(), path);
+        cmds
+    });
     let t0 = std::time::Instant::now();
     m.web_restart = !o.no_reboot;
-    let stop = run_with_reboots(&mut m, o.max_insns, !o.no_reboot && boot == "rom", boot == "app");
+    if let Some(cmds) = cmds { run_usb_host(&mut m, &cmds); }
+    let stop = if m.max_cycles == 0 { Stop::Halted } else { run_with_reboots(&mut m, o.max_insns, !o.no_reboot && boot == "rom", boot == "app") };
     let dt = t0.elapsed().as_secs_f64();
     report(&mut m, o, stop, dt);
     let pending = m.bus.ble_pending_commands();
@@ -417,6 +428,16 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
     if let Some(model) = memory_model {
         eprintln!("[emu] approximate memory totals [internal, ROM, flash, PSRAM, MMIO]: {:?}", model.memory.borrow().stats);
         if let Some(cache) = &model.cache { eprintln!("[emu] approximate physical data cache: {:?}", cache.borrow().stats()); }
+    }
+}
+
+/// `--usb-host`: the host's commands, each running the machine for as long as it takes; the run
+/// then goes on to its time limit.
+fn run_usb_host<S: Soc>(m: &mut Machine<S>, cmds: &[(usize, esp_soc::usb_host::script::Cmd)]) {
+    let mut r = esp_soc::usb_host::script::Runner::new(m);
+    match r.run(cmds) {
+        Ok(()) => r.host().say(format_args!("script done")),
+        Err((ln, e)) => r.host().say(format_args!("line {ln} failed: {e}")),
     }
 }
 

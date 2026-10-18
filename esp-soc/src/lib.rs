@@ -24,6 +24,7 @@ pub mod pins;
 pub mod png;
 pub mod soc;
 pub mod uart;
+pub mod usb_host;
 pub mod web;
 pub mod wifi;
 
