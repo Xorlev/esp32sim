@@ -427,9 +427,9 @@ fn run_with_reboots<S: Soc>(m: &mut Machine<S>, mut remaining: u64, reboot: bool
 
 /// Images, boot, observers, scripts: everything before the first instruction. Returns the boot mode.
 fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
-    let c3 = S::CORES == 1;
-    let boot = o.boot.clone().unwrap_or_else(|| if c3 { "rom".into() } else { "app".into() });
-    let console = o.console.clone().unwrap_or_else(|| if c3 { "uart0".into() } else { "both".into() });
+    let rom_boot = S::ROM_BOOT_DEFAULT;
+    let boot = o.boot.clone().unwrap_or_else(|| if rom_boot { "rom".into() } else { "app".into() });
+    let console = o.console.clone().unwrap_or_else(|| if rom_boot { "uart0".into() } else { "both".into() });
     m.bus.misc().log_unknown = o.log_periph;
     if !o.breaks.is_empty() { m.add_observer(Box::new(Breakpoints { pcs: o.breaks.clone() })); }
     if o.trace { m.add_observer(Box::new(Trace { from: o.trace_from })); }
