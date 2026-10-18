@@ -398,6 +398,19 @@ fn flash_controller(spi1: bool) -> SpiMem {
     s
 }
 
+/// The PSRAM controller's command side with an AP Memory hex (x16) PSRAM on CS1, which the
+/// shared controller model already speaks: register read 0x4040 and write 0xC0C0, sync read
+/// 0x0000 and write 0x8080 (IDF v5.5.3 components/esp_psram/device/esp_psram_impl_ap_hex.c:20-30).
+/// The mode registers read what the reference board's 32 MB part reports after IDF has set it
+/// up: MR0 0x30 (fixed latency, read latency 4, drive 0), MR1 vendor 0x0D, MR2 0xDF (256 Mbit,
+/// generation 4, good die), MR3 0x20 (slow refresh), MR8 0x4B (2048-byte wrapped bursts, x16);
+/// the bits the board's console does not show are zero.
+fn psram_controller() -> SpiMem {
+    let mut s = SpiMem::new(true);
+    s.psram_mr = [0x30, 0x0d, 0xdf, 0x20, 0, 0, 0, 0, 0x4b];
+    s
+}
+
 pub struct Peripherals {
     pub uart: [Uart; 2],
     pub usb: UsbSerialJtag,
@@ -410,6 +423,8 @@ pub struct Peripherals {
     pub spi0: MspiCache<SpiMem>,
     /// SPI_MEM_S: the PSRAM controller's cache side (its MMU registers are the bus's)
     pub psram0: MspiCache<RegRam>,
+    /// SPI1_MEM_S: the PSRAM controller's command side, the hex PSRAM on its CS1
+    pub psram1: SpiMem,
     /// SPI1_MEM_C: the flash controller's command side
     pub spi1: SpiMem,
     /// SHA accelerator: the ROM checks the bootloader's appended SHA-256 with it
@@ -430,6 +445,7 @@ pub struct Peripherals {
     /// register RAM behind unmodelled blocks, first-touch logging, pc attribution
     pub misc: Misc,
     pub spi_exec: bool,
+    pub psram_exec: bool,
     clock: ClockTree<4>,
     last_status: [u32; 4],
 }
@@ -447,6 +463,7 @@ device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Xtal, 9), (Cloc
     0x5008c "FLASH_SPI0" (spi0) => [];
     0x5008d "FLASH_SPI1" (spi1) => [];
     0x5008e "PSRAM_MSPI0" (psram0) => [];
+    0x5008f "PSRAM_MSPI1" (psram1) => [];
     0x50091 "SHA" (sha) => [];
     0x500c2 "TIMG0" (timg[0]) => [src::TG0_T0, src::TG0_T1];
     0x500c3 "TIMG1" (timg[1]) => [src::TG1_T0, src::TG1_T1];
@@ -493,10 +510,10 @@ impl Peripherals {
             uart: [Uart::new(UartLayout::C6), Uart::new(UartLayout::C6)], usb: UsbSerialJtag::new(CPU_HZ), systimer: SystimerP4::default(),
             timg: [TimerGroup::new(), TimerGroup::new()], gpio: { let mut g = Gpio::new(); g.strap = 0x30f; g }, io_mux: RegRam::new(),
             efuse: efuse_p4(mac, wafer, (0, 3)),
-            spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true),
+            spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true), psram1: psram_controller(),
             sha: Sha::new(), intmtx: IntMatrix::new(), clic: Clic::default(), cache: Cache::new(), hp_sys: HpSys::default(), hp_clkrst: HpClkRst::new(),
             lp: LpAon::new(), ana_mst: AnaMst::default(), assist_debug: AssistDebug::default(), rng: Rng::new(), rng_spin: 0,
-            misc: Misc::new(), spi_exec: false, clock: Self::new_clock(), last_status: [0; 4],
+            misc: Misc::new(), spi_exec: false, psram_exec: false, clock: Self::new_clock(), last_status: [0; 4],
         }
     }
 
@@ -532,7 +549,7 @@ impl Peripherals {
 
     pub fn write32(&mut self, addr: u32, v: u32) {
         let fx = mmio::write32(self, addr, v);
-        if fx.contains(WriteEffect::SPI_EXEC) { self.spi_exec = true; }
+        if fx.contains(WriteEffect::SPI_EXEC) { if addr >> 12 == 0x5008f { self.psram_exec = true; } else { self.spi_exec = true; } }
     }
 
     /// Advance every clocked device by `cycles` CPU cycles.

@@ -155,6 +155,7 @@ impl SocBus {
         let v = if size == 4 { v } else { merge(self.periph.read32(a)) };
         self.periph.write32(a, v);
         if self.periph.spi_exec { self.run_spi(); }
+        if self.periph.psram_exec { self.run_psram(); }
         self.irq_dirty = true;
     }
 
@@ -163,6 +164,13 @@ impl SocBus {
         self.periph.spi_exec = false;
         self.periph.spi1.execute(&mut self.flash, &mut []);
         self.periph.spi1.dirty.clear();
+    }
+
+    /// Execute a pending PSRAM controller command against the PSRAM array.
+    fn run_psram(&mut self) {
+        self.periph.psram_exec = false;
+        self.periph.psram1.execute(&mut [], &mut self.psram);
+        self.periph.psram1.dirty.clear();
     }
 
     /// Write straight into flash (image loaders, not the guest).
@@ -313,6 +321,31 @@ mod tests {
         assert_eq!(b.read16(0x5010_FFFE).unwrap(), 0xcdef);
         assert!(b.write32(ROM_LOW, 0).is_err());
         assert!(b.read32(0x4FFC_0000).is_err());
+    }
+
+    /// A user command on the PSRAM controller's command side, as psram_ctrlr_ll_common_transaction
+    /// issues it: 16-bit command, 32-bit address, CS1 (IDF v5.5.3 hal/esp32p4/include/hal/psram_ctrlr_ll.h:754-798).
+    fn psram_cmd(b: &mut SocBus, cmd: u32, addr: u32, mosi: Option<u32>, miso_bits: u32) -> u32 {
+        const BASE: u32 = 0x5008_F000;
+        let user = 1 << 31 | 1 << 30 | if mosi.is_some() { 1 << 27 } else { 0 } | if miso_bits > 0 { 1 << 28 } else { 0 };
+        for (o, v) in [(0x34, 1), (0x18, user), (0x1c, 31 << 26), (0x20, 15 << 28 | cmd), (0x04, addr), (0x24, 31), (0x28, miso_bits.saturating_sub(1))] { b.write32(BASE + o, v).unwrap(); }
+        if let Some(v) = mosi { b.write32(BASE + 0x58, v).unwrap(); }
+        b.write32(BASE, 1 << 18).unwrap();
+        assert_eq!(b.read32(BASE).unwrap(), 0, "USR clears when the command is done");
+        b.read32(BASE + 0x58).unwrap()
+    }
+
+    #[test]
+    fn hex_psram_answers_its_mode_registers_and_shares_the_window() {
+        let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
+        b.psram = vec![0; 0x20000];
+        assert_eq!(psram_cmd(&mut b, 0x4040, 0, None, 16) & 0xffff, 0x0d30);   // MR0, MR1 vendor AP
+        assert_eq!(psram_cmd(&mut b, 0x4040, 2, None, 16) & 0xffff, 0x20df);   // MR2 256 Mbit, MR3 slow refresh
+        psram_cmd(&mut b, 0x8080, 0x1_0004, Some(0x5a6b_7c8d), 0);
+        assert_eq!(psram_cmd(&mut b, 0x0000, 0x1_0004, None, 32), 0x5a6b_7c8d);
+        b.write32(PSRAM_MSPI0 + SPI_MMU_ITEM_INDEX, 0).unwrap();
+        b.write32(PSRAM_MSPI0 + SPI_MMU_ITEM_CONTENT, MMU_PSRAM_VALID | 1 << 10 | 1).unwrap();
+        assert_eq!(b.read32(PSRAM_LOW + 4).unwrap(), 0x5a6b_7c8d);
     }
 
     #[test]

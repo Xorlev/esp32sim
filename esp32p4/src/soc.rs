@@ -127,6 +127,7 @@ impl esp_soc::SocBus for SocBus {
         p.assist_debug.saved_pc = old.misc.cur_pc;
         p.spi0.0.jedec = old.spi0.0.jedec;
         p.spi1.jedec = old.spi1.jedec;
+        p.psram1.psram_mr = old.psram1.psram_mr;      // the PSRAM keeps its mode registers
         p.gpio.strap = old.gpio.strap;
         *self.mmu_flash = [0; MMU_ENTRIES];
         *self.mmu_psram = [0; MMU_ENTRIES];
