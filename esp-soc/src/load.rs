@@ -28,6 +28,8 @@ pub enum LoadKind {
     Flash = 5,
     Script = 6,
     CameraPicture = 7,
+    /// a card image for the SD socket, held in memory
+    SdCard = 8,
 }
 
 impl TryFrom<u32> for LoadKind {
@@ -42,6 +44,7 @@ impl TryFrom<u32> for LoadKind {
             5 => Ok(Self::Flash),
             6 => Ok(Self::Script),
             7 => Ok(Self::CameraPicture),
+            8 => Ok(Self::SdCard),
             _ => Err(format!("unknown load kind {kind}")),
         }
     }
@@ -74,6 +77,7 @@ impl<S: Soc> Machine<S> {
                 self.bus.board().set_camera_picture(picture).map_err(str::to_owned)?;
                 Ok(())
             }
+            LoadKind::SdCard => self.bus.attach_sd_card(Box::new(esp_periph::sdmmc::MemStore(data.to_vec())), Default::default()).map(|_| ()),
         }
     }
 
