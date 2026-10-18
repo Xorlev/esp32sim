@@ -1,0 +1,294 @@
+//! Real network services for `external_` tests: mosquitto and samba's smbd, unprivileged, each
+//! listening on 127.0.0.1 from a directory of its own, stopped when dropped. Included with
+//! `#[path]` like `common`. The binaries come from the environment (`MOSQUITTO`, `SMBD`, ...) or
+//! the usual install paths; [esp32p4.md](../docs/esp32p4.md), "Services", has the setup.
+#![allow(dead_code)]
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// A port on 127.0.0.1 that nothing listened on a moment ago. Another process can take it before
+/// the service binds it; the service then fails to start and its log says so.
+pub fn free_port() -> u16 { TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port() }
+
+/// A new empty directory under the system temp directory, unique to this process and call.
+pub fn temp_dir(name: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("esp32sim-svc-{}-{id}-{name}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// `var` if set, else the first of `paths` that exists, else the first of `names` found on PATH.
+pub fn find_tool(var: &str, paths: &[&str], names: &[&str]) -> Result<PathBuf, String> {
+    if let Some(v) = std::env::var_os(var) { return Ok(PathBuf::from(v)); }
+    if let Some(p) = paths.iter().map(PathBuf::from).find(|p| p.is_file()) { return Ok(p); }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    names.iter().flat_map(|n| std::env::split_paths(&path).map(move |d| d.join(n))).find(|p| p.is_file())
+        .ok_or_else(|| format!("{} not found: set {var} or install it (tried {})", names.first().unwrap_or(&var), paths.iter().chain(names).copied().collect::<Vec<_>>().join(", ")))
+}
+
+fn tail(text: &str) -> String { let n = text.len(); text[n.saturating_sub(2000)..].to_string() }
+
+/// Run a tool to completion; its output, or why it failed.
+pub fn run_tool(cmd: &mut Command, stdin: &str) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("{cmd:?}: {e}"))?;
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).map_err(|e| format!("{cmd:?}: {e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("{cmd:?}: {e}"))?;
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.success() { Ok(text) } else { Err(format!("{cmd:?}: {}\n{}", out.status, tail(&text))) }
+}
+
+/// A server process and its children in a process group of their own, listening on
+/// 127.0.0.1:`port`. Dropping it sends the group SIGTERM, then SIGKILL after 5 s: smbd's
+/// parent stops its children on SIGTERM, and a SIGKILL to the parent alone would leave them.
+pub struct Service { pub name: String, pub port: u16, pub dir: PathBuf, log: PathBuf, child: Child }
+
+impl Service {
+    /// Start `cmd`, its output in `dir/NAME.log`, and wait until 127.0.0.1:`port` accepts a
+    /// connection. A process that exits first, or does not listen within `timeout`, is an error
+    /// with the end of its log.
+    pub fn start(name: &str, mut cmd: Command, port: u16, dir: &Path, timeout: Duration) -> Result<Service, String> {
+        use std::os::unix::process::CommandExt;
+        let log = dir.join(format!("{name}.log"));
+        let out = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+        cmd.stdin(Stdio::null()).stdout(out.try_clone().unwrap()).stderr(out).process_group(0);
+        let child = cmd.spawn().map_err(|e| format!("{name}: {cmd:?}: {e}"))?;
+        let mut s = Service { name: name.into(), port, dir: dir.into(), log, child };
+        s.wait_listening(timeout)?;
+        Ok(s)
+    }
+
+    pub fn pid(&self) -> u32 { self.child.id() }
+    pub fn addr(&self) -> SocketAddr { SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)) }
+    pub fn log_text(&self) -> String { std::fs::read_to_string(&self.log).unwrap_or_default() }
+
+    fn wait_listening(&mut self, timeout: Duration) -> Result<(), String> {
+        let t0 = Instant::now();
+        loop {
+            if TcpStream::connect_timeout(&self.addr(), Duration::from_millis(200)).is_ok() { return Ok(()); }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(format!("{} exited ({status}) before listening on {}:\n{}", self.name, self.addr(), tail(&self.log_text())));
+            }
+            if t0.elapsed() > timeout {
+                return Err(format!("{} not listening on {} after {:?}:\n{}", self.name, self.addr(), timeout, tail(&self.log_text())));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Stop the group and reap the process.
+    pub fn stop(&mut self) {
+        let group = format!("-{}", self.child.id());
+        let signal = |sig: &str| { let _ = Command::new("kill").args([sig, "--", &group]).stderr(Stdio::null()).status(); };
+        signal("-TERM");
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(5) {
+            if let Ok(Some(_)) = self.child.try_wait() { break; }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        signal("-KILL");
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Service { fn drop(&mut self) { self.stop(); } }
+
+/// Whether any process of the process group `pgid` is still there (`kill -0`).
+pub fn group_alive(pgid: u32) -> bool {
+    Command::new("kill").args(["-0", "--", &format!("-{pgid}")]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
+fn mosquitto_tool(name: &str) -> Result<PathBuf, String> {
+    let var = name.to_uppercase();
+    let paths: Vec<String> = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].iter().map(|d| format!("{d}/{name}")).collect();
+    find_tool(&var, &paths.iter().map(String::as_str).collect::<Vec<_>>(), &[name])
+}
+
+/// The broker's configuration: one listener on 127.0.0.1, no anonymous clients, the users in
+/// `passwd`, nothing kept on disk.
+pub fn mosquitto_conf(port: u16, passwd: &Path) -> String {
+    format!("listener {port} 127.0.0.1\nallow_anonymous false\npassword_file {}\npersistence false\nlog_dest stderr\nlog_type error\nlog_type warning\nlog_type notice\nlog_type information\n", passwd.display())
+}
+
+/// mosquitto with one user. `MOSQUITTO` names the broker, `MOSQUITTO_PASSWD`, `MOSQUITTO_SUB`
+/// and `MOSQUITTO_PUB` the clients.
+pub struct Mosquitto { pub svc: Service, pub user: String, pub pass: String }
+
+impl Mosquitto {
+    pub fn start(user: &str, pass: &str) -> Result<Mosquitto, String> {
+        let broker = find_tool("MOSQUITTO", &["/opt/homebrew/sbin/mosquitto", "/usr/local/sbin/mosquitto", "/usr/sbin/mosquitto"], &["mosquitto"])?;
+        let dir = temp_dir("mosquitto");
+        let passwd = dir.join("passwd");
+        run_tool(Command::new(mosquitto_tool("mosquitto_passwd")?).arg("-c").arg("-b").arg(&passwd).args([user, pass]), "")?;
+        let port = free_port();
+        let conf = dir.join("mosquitto.conf");
+        std::fs::write(&conf, mosquitto_conf(port, &passwd)).unwrap();
+        let mut cmd = Command::new(broker);
+        cmd.arg("-c").arg(&conf);
+        let svc = Service::start("mosquitto", cmd, port, &dir, Duration::from_secs(10))?;
+        Ok(Mosquitto { svc, user: user.into(), pass: pass.into() })
+    }
+
+    fn client(&self, tool: &str) -> Result<Command, String> {
+        let mut c = Command::new(mosquitto_tool(tool)?);
+        c.args(["-h", "127.0.0.1", "-p", &self.svc.port.to_string(), "-u", &self.user, "-P", &self.pass]);
+        Ok(c)
+    }
+
+    /// The retained messages on `topics` (filters allowed), as (topic, payload): what a client
+    /// subscribing now is sent first. Waits up to `wait` for them.
+    pub fn retained(&self, topics: &[&str], wait: Duration) -> Result<Vec<(String, String)>, String> {
+        let mut c = self.client("mosquitto_sub")?;
+        c.args(["-v", "--retained-only", "-W", &wait.as_secs().max(1).to_string()]);
+        for t in topics { c.args(["-t", t]); }
+        let out = c.stdin(Stdio::null()).output().map_err(|e| format!("mosquitto_sub: {e}"))?;
+        // 27 is mosquitto_sub's exit status when -W runs out
+        if !out.status.success() && out.status.code() != Some(27) {
+            return Err(format!("mosquitto_sub: {}: {}", out.status, String::from_utf8_lossy(&out.stderr)));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.split_once(' ').map(|(t, p)| (t.to_string(), p.to_string()))).collect())
+    }
+
+    pub fn publish(&self, topic: &str, payload: &str) -> Result<(), String> {
+        run_tool(self.client("mosquitto_pub")?.args(["-t", topic, "-m", payload]), "").map(|_| ())
+    }
+}
+
+fn samba_tool(var: &str, name: &str) -> Result<PathBuf, String> {
+    let paths: Vec<String> = ["/opt/homebrew/opt/samba/bin", "/usr/local/opt/samba/bin", "/usr/bin"].iter().map(|d| format!("{d}/{name}")).collect();
+    find_tool(var, &paths.iter().map(String::as_str).collect::<Vec<_>>(), &[name])
+}
+
+/// smbd's configuration: a standalone server on 127.0.0.1:`port`, every directory it keeps state
+/// in under `dir`, SMB 2.1 to 3.1.1 with signing required, and one share writable by the user
+/// that `users.map` maps to `unix_user`.
+pub fn samba_conf(dir: &Path, port: u16, share: &str, unix_user: &str) -> String {
+    let d = dir.display();
+    format!("[global]
+  smb ports = {port}
+  bind interfaces only = yes
+  interfaces = 127.0.0.1
+  server role = standalone server
+  server min protocol = SMB2_10
+  server max protocol = SMB3_11
+  server signing = mandatory
+  map to guest = never
+  passdb backend = tdbsam:{d}/private/passdb.tdb
+  username map = {d}/users.map
+  private dir = {d}/private
+  lock directory = {d}/lock
+  state directory = {d}/state
+  cache directory = {d}/cache
+  pid directory = {d}/pid
+  ncalrpc dir = {d}/ncalrpc
+  log file = {d}/log/smbd.log
+  disable spoolss = yes
+  load printers = no
+[{share}]
+  path = {d}/share
+  read only = no
+  valid users = {unix_user}
+")
+}
+
+/// smbd serving one share to one user. samba keeps a password only for an account of the host,
+/// so the user is mapped (`username map`) to the account running the test. `SMBD`, `PDBEDIT` and
+/// `SMBCLIENT` name the tools; on macOS Homebrew installs smbd as `samba-dot-org-smbd`, and
+/// /usr/sbin/smbd is the system's own server, never this one.
+pub struct Samba { pub svc: Service, pub share: String, pub user: String, pub pass: String, pub conf: PathBuf }
+
+impl Samba {
+    pub fn start(share: &str, user: &str, pass: &str) -> Result<Samba, String> {
+        let mut paths = vec!["/opt/homebrew/opt/samba/sbin/samba-dot-org-smbd", "/usr/local/opt/samba/sbin/samba-dot-org-smbd"];
+        if !cfg!(target_os = "macos") { paths.push("/usr/sbin/smbd"); }
+        let smbd = find_tool("SMBD", &paths, &[if cfg!(target_os = "macos") { "samba-dot-org-smbd" } else { "smbd" }])?;
+        let unix_user = run_tool(Command::new("id").arg("-un"), "")?.trim().to_string();
+        let dir = temp_dir("samba");
+        for d in ["private", "lock", "state", "cache", "pid", "ncalrpc", "log", "share"] { std::fs::create_dir_all(dir.join(d)).unwrap(); }
+        std::fs::write(dir.join("users.map"), format!("{unix_user} = {user}\n")).unwrap();
+        let port = free_port();
+        let conf = dir.join("smb.conf");
+        std::fs::write(&conf, samba_conf(&dir, port, share, &unix_user)).unwrap();
+        run_tool(Command::new(samba_tool("PDBEDIT", "pdbedit")?).arg("-s").arg(&conf).args(["-a", "-u", &unix_user, "-t"]), &format!("{pass}\n{pass}\n"))?;
+        let mut cmd = Command::new(smbd);
+        cmd.arg("-s").arg(&conf).args(["--foreground", "--no-process-group"]);
+        let svc = Service::start("smbd", cmd, port, &dir, Duration::from_secs(20))?;
+        Ok(Samba { svc, share: share.into(), user: user.into(), pass: pass.into(), conf })
+    }
+
+    /// The share's directory on the host.
+    pub fn path(&self) -> PathBuf { self.svc.dir.join("share") }
+
+    /// smbclient's `-c` commands against the share, as the user, over SMB3.
+    pub fn smbclient(&self, commands: &str) -> Result<String, String> {
+        run_tool(Command::new(samba_tool("SMBCLIENT", "smbclient")?).arg("-s").arg(&self.conf)
+            .args(["-p", &self.svc.port.to_string(), "-m", "SMB3", &format!("//127.0.0.1/{}", self.share), "-U", &format!("{}%{}", self.user, self.pass), "-c", commands]), "")
+    }
+}
+
+/// The fixture's own lifecycle with a listener the test holds: ready as soon as the port
+/// accepts, and the whole process group gone after the drop.
+#[test]
+fn a_service_is_ready_when_its_port_accepts_and_stops_with_its_group() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "sleep 60 & sleep 60"]);
+    let svc = Service::start("sleepers", cmd, port, &temp_dir("sleepers"), Duration::from_secs(5)).unwrap();
+    let pgid = svc.pid();
+    assert!(group_alive(pgid));
+    drop(svc);
+    assert!(!group_alive(pgid), "a process of group {pgid} outlived the drop");
+}
+
+#[test]
+fn a_service_that_exits_or_never_listens_is_an_error_with_its_log() {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "echo cannot bind >&2; exit 3"]);
+    let e = Service::start("quitter", cmd, free_port(), &temp_dir("quitter"), Duration::from_secs(5)).err().unwrap();
+    assert!(e.contains("exited") && e.contains("cannot bind"), "{e}");
+    let mut cmd = Command::new("sleep");
+    cmd.arg("60");
+    let t0 = Instant::now();
+    let e = Service::start("sleeper", cmd, free_port(), &temp_dir("sleeper"), Duration::from_millis(300)).err().unwrap();
+    assert!(e.contains("not listening"), "{e}");
+    assert!(t0.elapsed() < Duration::from_secs(10), "the timeout held");
+}
+
+#[test]
+fn the_service_configurations_keep_to_loopback_and_their_directory() {
+    let dir = Path::new("/tmp/svc");
+    let smb = samba_conf(dir, 4445, "archive", "someone");
+    for l in smb.lines().filter(|l| l.contains(" dir") || l.contains("directory") || l.contains("file =") || l.contains("path =")) {
+        assert!(l.split_once(" = ").is_some_and(|(_, v)| v.starts_with("/tmp/svc/") || v.starts_with("tdbsam:/tmp/svc/")), "{l}");
+    }
+    for want in ["smb ports = 4445", "interfaces = 127.0.0.1", "bind interfaces only = yes", "server signing = mandatory", "server max protocol = SMB3_11", "[archive]", "valid users = someone"] {
+        assert!(smb.contains(want), "{want}");
+    }
+    let mq = mosquitto_conf(1884, Path::new("/tmp/svc/passwd"));
+    assert!(mq.starts_with("listener 1884 127.0.0.1\n") && mq.contains("allow_anonymous false\n") && mq.contains("password_file /tmp/svc/passwd\n"));
+}
+
+/// Both servers from this machine's install: a file through the share and back, a retained
+/// message through the broker.
+#[test]
+#[ignore = "needs samba (smbd, pdbedit, smbclient) and mosquitto with its clients installed"]
+fn external_samba_and_mosquitto_serve_a_test_client() {
+    let smb = Samba::start("archive", "esp32sim", "esp32sim-smb").unwrap_or_else(|e| panic!("{e}"));
+    let src = smb.svc.dir.join("hello.txt");
+    std::fs::write(&src, b"hello over SMB3").unwrap();
+    smb.smbclient(&format!("put {} hello.txt", src.display())).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(std::fs::read(smb.path().join("hello.txt")).unwrap(), b"hello over SMB3");
+    assert!(smb.smbclient("ls").unwrap().contains("hello.txt"));
+    let mq = Mosquitto::start("esp32sim", "esp32sim-mqtt").unwrap_or_else(|e| panic!("{e}"));
+    mq.publish("esp32sim/test", "retained?").unwrap_or_else(|e| panic!("{e}"));
+    let none = mq.retained(&["esp32sim/#"], Duration::from_secs(1)).unwrap();
+    assert!(none.is_empty(), "a message published without -r is not retained: {none:?}");
+    run_tool(mq.client("mosquitto_pub").unwrap().args(["-r", "-t", "esp32sim/test", "-m", "kept"]), "").unwrap();
+    let kept = mq.retained(&["esp32sim/#"], Duration::from_secs(1)).unwrap();
+    assert_eq!(kept, [("esp32sim/test".to_string(), "kept".to_string())]);
+}

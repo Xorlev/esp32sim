@@ -54,7 +54,10 @@ pub fn known_rom_difference(line: usize, emu: &str, board: &str) -> bool {
 /// board's, laid out as a card formatter lays one out (MBR, FAT32 from LBA 2048, 32 KiB
 /// clusters); its FAT geometry and contents are the image's, not the board card's.
 /// `write_through` writes what the firmware writes to the image file.
-pub fn boot(card_name: &str, write_through: bool) -> (esp32p4::Machine, String, std::path::PathBuf) {
+pub fn boot(card_name: &str, write_through: bool) -> (esp32p4::Machine, String, std::path::PathBuf) { boot_card(card_name, write_through, None) }
+
+/// `boot` with a card of `size` bytes instead of the board card's size.
+pub fn boot_card(card_name: &str, write_through: bool, size: Option<u64>) -> (esp32p4::Machine, String, std::path::PathBuf) {
     let dir = dir();
     let file = |name: &str| std::fs::read(format!("{dir}/{name}")).unwrap_or_else(|e| panic!("{dir}/{name}: {e} (set OXIDRIVE_DIR to the directory holding bootloader.bin, partition-table.bin, app.bin and board-boot.log)"));
     // espflash wrote the flash mode it was given (QIO, as the board's `SPI mode:QIO` line shows)
@@ -69,8 +72,8 @@ pub fn boot(card_name: &str, write_through: bool) -> (esp32p4::Machine, String, 
     m.load_rom(&std::fs::read(rom("esp32p4_rev0")).unwrap()).unwrap();
     for (off, data) in [(0x2000, bootloader), (0x8000, file("partition-table.bin")), (0x30000, file("app.bin"))] { m.write_flash(off, &data).unwrap(); }
     let card = tmp(card_name);
-    let (size, serial) = board_card(&board_log);
-    sd_image::fat32(&card, size, 32 << 10, "ESP32SIM").unwrap();
+    let (board_size, serial) = board_card(&board_log);
+    sd_image::fat32(&card, size.unwrap_or(board_size), 32 << 10, "ESP32SIM").unwrap();
     let timed_bus = std::env::var("OXIDRIVE_SD_TIMING").is_ok_and(|v| v == "1");
     let config = esp_periph::sdmmc::SdCardConfig { serial, timed_bus, ..Default::default() };
     let path = card.to_str().unwrap();
