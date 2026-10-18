@@ -326,19 +326,22 @@ application owns the card:
 [usb-host] t=0.203250 device 303a:4002, USB 2.00, class ef/02/01, EP0 64 bytes, 1 configuration(s)
 [usb-host] t=0.203750 interface 0: class 08/06/50, endpoints 01 (512 bytes) 81 (512 bytes)
 [usb-host] t=0.206375 READ CAPACITY: 131072 blocks of 512 bytes (64 MiB)
-[usb-host] t=0.566250 fat-write CLIP0001.MP4: 1048576 bytes in 16 chunks of 64 KiB, 0.355 s, 2.95 MB/s
-[usb-host] t=0.609500 fat-read CLIP0001.MP4: 1048576 bytes, hash 208645dd266d37e6, 24.24 MB/s, matches what was written
-[usb-host] t=0.611125 ejected
-[usb-host] t=0.611750 TEST UNIT READY: sense 2/3a/00 (MEDIUM NOT PRESENT)
-[usb-host] t=1.517000 TEST UNIT READY passed after 4 failed polls
-[usb-host] t=1.518875 root: CLIP0001.MP4 (1048576), README.MD (379)
+[usb-host] t=0.459375 fat-write CLIP0001.MP4: 1048576 bytes in 16 chunks, 0.248 s, 4.22 MB/s, second half 4.35 MB/s; camera 4.10 MB/s, worst 1.9 ms late (chunk 0), kept up
+[usb-host] t=0.502625 fat-read CLIP0001.MP4: 1048576 bytes, hash 208645dd266d37e6, 24.24 MB/s, matches what was written
+[usb-host] t=0.504250 ejected
+[usb-host] t=0.504875 TEST UNIT READY: sense 2/3a/00 (MEDIUM NOT PRESENT)
+[usb-host] t=1.510750 TEST UNIT READY passed after 5 failed polls
+[usb-host] t=1.511125 READ CAPACITY: 131072 blocks of 512 bytes (64 MiB)
+[usb-host] t=1.513625 root: CLIP0001.MP4 (1048576), README.MD (379)
 ```
 
 When the host configures the device, esp_tinyusb takes the card from the application and
 exposes it; the eject (START STOP UNIT with LoEj) gives it back, the example's console writes
 README.MD on it and `expose` hands it to USB again. The golden pins the console, the host's log
 with its emulated times and the instruction count, then reads the clip, README.MD and the raw
-blocks the car wrote back from the image.
+blocks the car wrote back from the image. A second golden, `usbmsc-p4-faults`
+(`examples/usb_msc-p4/faults.txt`), has the same example meet the faults a car meets
+("Faults").
 
 ### The core
 
@@ -352,9 +355,11 @@ names and what the driver expects of them: TinyUSB 0.21.0~2 `src/portable/synops
 device-table entry, so it is ticked and asked for deadlines only while a host is plugged in. The
 interrupt is source 93 (`ETS_USB_OTG_INTR_SOURCE`, include/soc/interrupts.h): GAHBCFG.GINT and
 an unmasked GINTSTS bit. LP_CLKRST HP_USB_CLKRST_CTRL1.RST_EN_USB_OTG20 (0x50111048 bit 2,
-lp_clkrst_reg.h) resets its registers, which `usb_new_phy` does through
+lp_clkrst_reg.h) holds the core in reset while it is set: the registers go to their reset values
+when it is asserted and ignore writes until it is released. `usb_new_phy` pulses it through
 `_usb_utmi_ll_reset_register`; a chip reset keeps the cable. Its DMA reaches L2MEM and PSRAM like
-the SDMMC IDMAC (`SOC_PSRAM_DMA_CAPABLE`).
+the SDMMC IDMAC (`SOC_PSRAM_DMA_CAPABLE`; IDF's own host driver puts DWC DMA memory in PSRAM on
+the P4, components/usb/hcd_dwc.c:50).
 
 | register | modelled |
 | --- | --- |
@@ -371,7 +376,7 @@ the SDMMC IDMAC (`SOC_PSRAM_DMA_CAPABLE`).
 | DCTL 0x804 | SDIS releases D+ (the host sees a disconnect); SGINAK/CGINAK and SGONAK/CGONAK set and clear GINSTS/GONSTS at once; RWUSIG signals remote wakeup |
 | DSTS 0x808 | SUSPSTS, ENUMSPD (0 high, 1 full speed), SOFFN counting microframes at high speed |
 | DIEPMSK, DOEPMSK, DAINT, DAINTMSK, DIEPEMPMSK | a DAINT bit is set while the endpoint's interrupt register has a bit its mask lets through; DAINTMSK does not gate it |
-| DIEPCTLn, DOEPCTLn | MPS, USBAEP, DPID, NAKSTS, EPTYP, STALL, TXFNUM; EPENA is set by software and cleared by the core at the end of a transfer and at SETUP done; EPDIS disables an enabled endpoint (EPDISD); SNAK (and INEPNE), CNAK, SD0PID, SD1PID; control endpoint 0 takes DIEPCTL0's packet size both ways, a SETUP clears its STALL and sets NAK on both, control OUT 0 cannot be disabled |
+| DIEPCTLn, DOEPCTLn | MPS, USBAEP, DPID, NAKSTS, EPTYP, STALL, TXFNUM; EPENA is set by software and cleared by the core at the end of a transfer and at SETUP done; EPDIS disables an enabled endpoint once it NAKs, an IN endpoint with NAK set (SNAK, INEPNE), an OUT endpoint under the global OUT NAK (SGONAK, BOUTNAKEFF), the order dcd_dwc2's `edpt_disable` follows: until then EPDIS reads 1 and the endpoint stays enabled, then EPENA and EPDIS clear with EPDISD; SNAK (and INEPNE), CNAK, SD0PID, SD1PID; control endpoint 0 takes DIEPCTL0's packet size both ways, a SETUP clears its STALL and sets NAK on both, control OUT 0 cannot be disabled |
 | DIEPINTn, DOEPINTn | write 1 to clear; TXFE reads 1 |
 | DIEPTSIZn, DOEPTSIZn | XferSize and PktCnt count down by packet (17 and 8 bits, OTG20_TRANS_COUNT_WIDTH and OTG20_PACKET_COUNT_WIDTH; 7 and 2 or 1 on endpoint 0), STUPCNT on control OUT 0 |
 | DIEPDMAn, DOEPDMAn | the DMA address, advancing with the data |
@@ -438,6 +443,9 @@ states a controller puts on the wire, each at its own time, against the device s
   §7.1.7.7). With SOFs stopped the core sees early suspend after 3 ms and suspend 125 µs later
   (§7.1.7.6).
 - One device hangs on the cable: tokens reach it whatever its address.
+- `UsbLink::inject(at_ns, LinkFault::VbusOff)` drops VBUS at a set time whatever the host is
+  doing then: a transfer in flight ends `Disconnected` and the core sees a session end (SEDET),
+  which TinyUSB reports as an unplug.
 
 Its next event is the core's device deadline, so idle cores sleep through a transfer to the
 packet that wakes them, and the bus runs what is due after the device ticks of a round.
@@ -452,21 +460,58 @@ there, so the firmware runs between the transfers of a command:
   port reset, 10 ms of reset recovery (§9.2.6.2), the device descriptor's first 64 bytes at address
   0, SET_ADDRESS and its 2 ms recovery (§9.2.6.3), the device and configuration descriptors, the
   strings, SET_CONFIGURATION (§9.1.2, §9.4); control transfers time out after 5 s.
+- `reset_device`: Linux's `usb_reset_device` (v6.12 drivers/usb/core/hub.c,
+  `usb_reset_and_verify_device` at 6090 and `hub_port_init`'s new scheme at 4985-5034): reset,
+  GET_DESCRIPTOR(64) at address 0, reset again, SET_ADDRESS to the old address, the device and
+  configuration descriptors read and compared with the old ones, SET_CONFIGURATION with the old
+  configuration; 50 ms after each reset (TRSTRCY "plus some extra", hub.c:3112-3113), 10 ms
+  after SET_ADDRESS.
 - `msc::Msc`: SCSI over bulk-only transport (BOT 1.0): CBW and CSW with tags, the CSW checked
   for validity and meaning (§6.3), a STALLed data stage cleared and the CSW read, a STALLed CSW
-  cleared and read once more, phase errors and untrustworthy CSWs ending in reset recovery
-  (Bulk-Only Mass Storage Reset and CLEAR_FEATURE(ENDPOINT_HALT) on both endpoints, §5.3.4), REQUEST
-  SENSE after CHECK CONDITION; INQUIRY, TEST UNIT READY, READ CAPACITY(10), MODE SENSE(6), PREVENT
-  ALLOW MEDIUM REMOVAL, START STOP UNIT, READ(10) and WRITE(10) of any length in commands of 240
-  blocks at most (Linux usb-storage's default), SYNCHRONIZE CACHE(10); `wait_ready` polls TEST UNIT
-  READY as a car polls its drive. The LUN is a `fat32::BlockDevice`.
+  cleared and read once more, REQUEST SENSE after CHECK CONDITION; INQUIRY, TEST UNIT READY, READ
+  CAPACITY(10), MODE SENSE(6), PREVENT ALLOW MEDIUM REMOVAL, START STOP UNIT, READ(10) and
+  WRITE(10) of any length in commands of 240 blocks at most (usb-storage's `max_sectors`,
+  scsiglue.c:670), SYNCHRONIZE CACHE(10); `wait_ready` polls TEST UNIT READY as a car polls its drive.
+  A command may take 30 s (sd's SD_TIMEOUT, drivers/scsi/sd.h:15, set at sd.c:3970-3972) before it
+  is aborted. The LUN is a `fat32::BlockDevice`. Recovery (`Msc::recovery`) is Linux's by default,
+  from v6.12 drivers/usb/storage/transport.c:
+  - a transport error (a CBW that fails, a phase error, a CSW with the wrong tag or a status past
+    2, a CSW still bad after the second read) or a command aborted at its timeout goes to
+    `Handle_Errors` (transport.c:903-926): a port reset first (`usb_stor_port_reset`,
+    `reset_device` above), the class reset only if that fails (`usb_stor_Bulk_reset`,
+    `usb_stor_reset_common` at 1347: the request with a 5 s timeout, 6 s for the device to
+    recover, then the halt cleared on bulk IN and bulk OUT);
+  - a data stage that runs long (babble) with a good status gives a faked INVALID FIELD IN CDB
+    (`fake_sense`, 1186 and 1305-1310), and the CSW is still read;
+  - a zero-length packet where the CSW should be is read past once (1229-1233);
+  - a residue past the transfer length is clamped to it (1298).
+
+  `Recovery::Bot` (`recovery bot`) is BOT 1.0's reset recovery for all of these (Bulk-Only Mass
+  Storage Reset and CLEAR_FEATURE(ENDPOINT_HALT) on both endpoints, §5.3.4). What Linux's SCSI
+  layer adds on top is not modelled: the retries of a failed command (sd's `max_retries`,
+  SD_MAX_RETRIES 5) and the error handler's escalation past the abort. The review that asked for
+  this described Linux's timeout handling as the class reset first, then a port reset; the
+  v6.12 source does the port reset first, and the class reset only when the port reset fails.
 - `fat32::Fat32` mounts a volume (an MBR's FAT32 partition, or from LBA 0), lists, reads and
-  writes 8.3 files in the root directory as Linux's vfat writes them: the directory entry at once,
-  the data a chunk at a time as it comes (one WRITE(10) per contiguous run of clusters), the FAT
+  writes 8.3 files in the root directory in a vfat-like order: the directory entry at once, the
+  data a chunk at a time as it comes (one WRITE(10) per contiguous run of clusters), the FAT
   sectors of each chunk's clusters in both FATs, then the entry's size and first cluster and
-  FSInfo. `FileWriter::fat_every` writes the FAT less often; `BlockDevice::pause_ns` is the idle
-  gap between chunks.
-- `script::Runner` runs a command file (`--usb-host`), each command logging what it did.
+  FSInfo. It is not Linux's writeback order, in which the page cache batches the data, the buffer
+  cache holds the FAT and directory sectors, inode writeback updates the entry periodically and
+  FSInfo is written at sync or unmount: a clip cut off mid-write here keeps size 0 and no cluster
+  with its clusters orphaned in the FAT, where Linux would usually have left a shorter clip.
+  Allocation starts at FSInfo's hint and writes the last cluster allocated back as the hint; the
+  free count written is FSInfo's as it stands on the volume less what this host allocated since.
+  `FileWriter::fat_every` writes the FAT less often.
+- `fat32::write_clip` records a clip as a camera feeds it: chunk i is due at t0 + i x gap (t0
+  taken before the file is created), the car waits only for a chunk that is not due yet, and the
+  result (`ClipStats`) has the rate overall and over the second half, the worst lateness against
+  the schedule and whether the car kept up (never a whole chunk behind).
+- `script::Runner` runs a command file (`--usb-host`), each command logging what it did. A
+  NOT READY seen by `ready` or `poll` drops the mounted volume, and a failure that leaves no
+  device on the port drops the interface and the volume, so the next `mount` reads the volume
+  again. The CLI runs it under the run's `--max-insns` and reboot policy
+  (`usb_host::run_machine_until`).
 
 A test drives the same API between runs of the machine:
 
@@ -485,21 +530,48 @@ f.close(&mut fs, &mut msc)?;
 
 `esp-soc/src/usb_host/tests.rs` runs the host against a mass-storage device written in Rust at
 the transaction level, with knobs for what BOT's host side must survive (MEDIUM NOT PRESENT, short
-data stages, STALLs, phase errors, wrong tags, NAKs); `esp-periph/src/usb_otg/tests.rs` drives
-the core with TinyUSB's register sequences against the link.
+data stages, STALLs, phase errors, wrong tags, NAKs, a zero-length packet before the CSW, an
+endpoint that stops answering) under both recovery policies, and for the camera's pacing;
+`esp-periph/src/usb_otg/tests.rs` drives the core with TinyUSB's register sequences against the
+link, including control writes of one and two packets (the status stage is DATA1, §8.5.3), an
+endpoint disable waiting for its NAK, the reset line held, and an injected VBUS loss.
 
-**Throughput.** A car writing 4 MiB in 64 KiB chunks without gaps, then reading it back (FAT32,
-the card instant, programming time 0):
+**Throughput.** A car writing in 64 KiB chunks as fast as the drive takes them, then reading the
+clip back (FAT32, the card's programming time 0). The second half is the rate from the middle
+chunk to the close. The large clips are thousands of times either firmware's buffer, and their
+second half runs at the rate of the whole and of the 4 MiB clip, so these are steady-state rates:
 
-| firmware | SD bus | write | read |
-| --- | --- | --- | --- |
-| tusb_msc example (8 KiB MSC buffer) | at once | 9.1 MB/s | 24.8 MB/s |
-| tusb_msc example | `--sd-timing`, 4 bits at 20 MHz | 4.4 MB/s | 6.8 MB/s |
-| oxidrive (32 KiB buffer) | at once | 19.7 MB/s | |
-| oxidrive | `--sd-timing`, 4 bits at 40 MHz | 11.0 MB/s | |
+| firmware | SD bus | clip | write | second half | read |
+| --- | --- | --- | --- | --- | --- |
+| tusb_msc example (8 KiB MSC buffer) | at once | 4 MiB | 9.1 MB/s | | 24.8 MB/s |
+| tusb_msc example | at once | 32 MiB | 9.2 MB/s | 9.2 MB/s | |
+| tusb_msc example | `--sd-timing`, 4 bits at 20 MHz | 4 MiB | 4.4 MB/s | | 6.8 MB/s |
+| tusb_msc example | `--sd-timing` | 32 MiB | 4.4 MB/s | 4.4 MB/s | |
+| oxidrive (32 KiB buffer) | at once | 4 MiB | 19.7 MB/s | 19.6 MB/s | |
+| oxidrive | at once | 64 MiB | 20.0 MB/s | 20.0 MB/s | |
+| oxidrive | `--sd-timing`, 4 bits at 40 MHz | 4 MiB | 11.0 MB/s | 11.0 MB/s | |
+| oxidrive | `--sd-timing` | 64 MiB | 11.1 MB/s | 11.1 MB/s | |
 
-oxidrive's board measured about 10.9 MB/s writing over USB. With 16 ms between chunks (a camera
-at 4 MB/s) oxidrive takes the clip at 3.5 MB/s, 3.0 MB/s with the bus timed.
+Against a camera, 64 KiB due every 16 ms (4.1 MB/s, `fat32::write_clip`), both keep up with the
+SD bus timed or not: oxidrive over 4 MiB and 64 MiB clips (the 64 MiB one takes 16.37 s, the
+camera's schedule plus the last chunk), the tusb_msc example over 1 MiB (the golden) and 16 MiB.
+The latest chunk starts 1.9 ms after its due time, and it is the first, behind the directory
+entry. With the bus timed the example keeps up with a 7% margin (4.4 against 4.1 MB/s), oxidrive
+with 2.7 times. Earlier versions of this page gave 3.5 MB/s for oxidrive against "a camera at
+4 MB/s": the car then slept a whole gap after each chunk instead of waiting for the next chunk's
+due time, so that figure measured the pacing, not the drive.
+
+oxidrive's board measured about 10.9 MB/s writing over USB. That the timed bus gives 11.0 MB/s is
+a coincidence, not a calibration. The 4 MiB clip takes 0.213 s with the card instant: USB and the
+CPU, at one instruction a cycle. Its SD wire time alone is about 0.216 s (8192 blocks at 4 bits
+and 40 MHz, 1051 clocks a block: start bit, 1024 data clocks, CRC16, end bit, the CRC status
+token, two clocks between blocks; plus the commands). Timed, the clip takes 0.381 s, so the two overlap by only about 0.048 s: the
+card write runs after each buffer arrives, in the TinyUSB task (esp_tinyusb defers it there,
+tinyusb_msc.c:351-388), and only the next buffer's DMA proceeds alongside it. Two things the
+model leaves out would each slow it: the card's programming time is 0 (`--sd-prg-us`,
+`SdCardConfig::prg_ns`), and cache misses and PSRAM stalls are not modelled. Before the rate is
+compared with a board again, `--sd-prg-us` wants a value measured on a card: the busy time after
+a multi-block write.
 
 The USB port and the timed SD bus cost the other chips nothing and the P4 nothing while unused:
 the core is an optional device-table entry, the bus tests one flag per round for the link and
@@ -517,7 +589,44 @@ tree, the others on the tree before the timed SD bus, which only the P4 runs:
 | `p4-hello-smp` (27 s) | 7 | 19.18 s | 19.18 s | 9,720,000,000 + 9,713,148,105 |
 | pocket-tank (8 s) | 5 | 14.47 s | 14.42 s | 1,113,634,993 + 1,490,529,616 |
 
-The C3 and C6 run no code this branch changed; their ±1% is layout.
+The C3 and C6 run no code this branch changed; their ±1% is layout. The review fixes after it
+(the endpoint disable, the reset line, recovery, pacing, faults) change no per-round work: the
+core's paths run only with a host attached, which no demo has, and the reset line is a write to
+one LP_CLKRST register. A spot check on the final tree, five alternating runs each: `p4-hello`
+18.16 s against 18.04 s, `p4-hello-smp` 19.18 s against 19.23 s, instruction counts identical.
+
+**Faults.** `examples/usb_msc-p4/faults.txt` (golden `usbmsc-p4-faults`) has the tusb_msc
+example meet three faults; the example logs each hand-over of the card ("Storage mounted to
+application: No" when the car has it, "Yes" when the application has it), and the golden pins the
+sequence:
+
+| fault | what the car does | what the example does |
+| --- | --- | --- |
+| a WRITE(10) of 240 blocks with a 5 ms command timeout | aborts it mid data stage, resets the port (Linux's recovery), writes the blocks again and verifies them | nothing visible but one line: `proc_write10_cmd 910: ASSERT FAILED` (below); the next commands work |
+| a port reset after an eject | `port-reset`: two resets, the descriptors compared, SET_CONFIGURATION | takes the card back from the application: "No" |
+| VBUS lost 100 ms into a 1 MiB clip | the write fails `Disconnected`; the interface and the volume are dropped; `attach` again | gives the card to the application on the unplug ("Yes"), takes it again on the new SET_CONFIGURATION ("No") |
+
+The clip cut by the VBUS loss is on the card as an entry of size 0 and no cluster, its clusters
+allocated in the FAT (the golden checks both): the vfat-like writer's failure mode, not Linux's.
+
+What the sources say about the hand-overs (TinyUSB 0.21.0~2, esp_tinyusb 2.4.0):
+
+- SET_CONFIGURATION with a non-zero value calls `tud_mount_cb` (usbd.c:1006-1012). A bus reset
+  alone does not unmount (usbd.c:717-721); an unplug calls `tud_umount_cb` (723-727).
+- esp_tinyusb's `tud_mount_cb` runs `msc_storage_mount_to_usb` (tinyusb.c:62-65), which unmounts
+  the card from the application unless `auto_mount_off` is set (tinyusb_msc.c:776-790);
+  `tud_umount_cb` runs `msc_storage_mount_to_app` (tinyusb.c:86-89, tinyusb_msc.c:760-774).
+
+So a port reset, which Linux's usb-storage does to recover from any transport error or timeout,
+takes the card from an application that is using it, unless the firmware sets `auto_mount_off`.
+
+The assertion after the aborted write is a race in the stack, not in the model as far as the
+sources show: dcd_dwc2's bus reset handler closes the endpoints in the interrupt (it clears
+`xfer_status`, dcd_dwc2.c:775) while the TinyUSB task still holds the write's last transfer
+completion; asking for the next chunk then finds bulk OUT closed (`dcd_edpt_xfer`,
+dcd_dwc2.c:687-688) and msc_device.c:910 asserts. The bus reset event that follows resets the
+class (`mscd_reset`). A 5 ms timeout cuts a live transfer, which is what opens the window; Linux's
+30 s timeout aborts a device that has stopped. Not seen on silicon.
 
 **Open points**, each a guess where the sources disagree or say nothing:
 
@@ -572,8 +681,11 @@ The board's lines from 93 on come through the C6 (WiFi, the clock, MQTT): milest
 `external_oxidrive_presents_the_card_to_a_car` boots the same images with VBUS from power-up and
 the card image written through. The car enumerates oxidrive at 0.27 s at high speed, the drive is
 ready at the first TEST UNIT READY, its FAT32 volume (32 KiB clusters) mounts, and a 4 MiB clip
-written in 64 KiB chunks 16 ms apart takes 1.2 s (3.5 MB/s; 19.7 MB/s without the gaps), reads
-back over USB unchanged and is on the image byte for byte afterwards. The firmware logs its USB
+written in 64 KiB chunks, one due every 16 ms (a 4.1 MB/s camera), keeps up with the camera: it
+takes 1.01 s, no chunk starts more than 1.9 ms late (the first, behind the directory entry), and
+the clip reads back over USB unchanged and is on the image byte for byte afterwards. A 64 MiB
+clip (`OXIDRIVE_CLIP_MIB=64`) keeps up the same way, with the SD bus timed or not ("USB",
+"Throughput"). The firmware logs its USB
 link connected and mounted. It prints nothing about the car's writes in the 14 s of emulated time
 looked at: what it counts feeds the archive windows, which need WiFi and the NAS. Its WiFi
 bring-up then fails in ESP-Hosted's `esp_hosted_reconfigure` (`transport_drv_reconfigure()`
@@ -619,6 +731,20 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
   answers at once. The UTMI PHY is register RAM.
 - **SD timing** is off by default: a command and its data are done in the register write that
   starts them. `--sd-timing` times the bus but not the card's read access time.
+- **No cache model, so DMA coherency bugs pass.** The data cache is not modelled: the CPU and
+  every DMA engine see the same memory at once. Firmware that omits `esp_cache_msync` or whose
+  call fails, a DMA buffer that is not cache-line aligned or shares a line with other data, or a
+  buffer changed after the DMA was started all work here and can corrupt data on silicon. The
+  USB core reads IN data at the IN token (`Dwc2::token_in`), where buffer DMA fetches it once the
+  endpoint is enabled, so a buffer the driver changes after setting EPENA goes out changed here
+  (dcd_dwc2 cleans the buffer and then enables the endpoint, `edpt_schedule_packets`). A cheap
+  checker would keep two bits per 64-byte line of DMA-capable memory: written by the CPU since
+  the line was last cleaned, and written by DMA since it was last invalidated. CPU stores set the
+  first, DMA writes the second, and the cache controller's sync operations (CACHE_SYNC_CTRL with
+  CACHE_SYNC_MAP, CACHE_SYNC_ADDR and CACHE_SYNC_SIZE, cache_reg.h, which `esp_cache_msync` ends
+  in) clear them. A DMA read of a line with the first bit set, or a CPU read of a line with the
+  second, is a coherency bug to report, with the address and the PC. It sits on every store, so it
+  would be behind a flag, off by default.
 - **GPIO** has the P4's register layout (`periph::GpioP4`), but pin levels, interrupts and edges
   are the shared model's 49 pins; the P4 has 55.
 - **`--boot app`** maps the image and jumps to it without the clocks and caches the bootloader
@@ -631,10 +757,11 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 ## Handoff: where milestone 4 starts
 
 **Status.** Milestone 3 is done: the high-speed DWC2 core as a device with buffer DMA, a host on
-its port written in Rust (enumeration, SCSI over bulk-only transport, FAT32 written as Linux
-writes it, a command file for the CLI), IDF's tusb_msc example presenting the card to it (golden
-`usbmsc-p4`), and oxidrive enumerating to a car that records a clip which lands intact on the
-image ("Compared with a board"). Archive windows, in which oxidrive takes the card from the car
+its port written in Rust (enumeration, SCSI over bulk-only transport with Linux usb-storage's
+recovery, FAT32 written in a vfat-like order, a car paced to its camera, a command file for the
+CLI), IDF's tusb_msc example presenting the card to it (goldens `usbmsc-p4` and
+`usbmsc-p4-faults`), and oxidrive enumerating to a car that records a clip which lands intact on
+the image ("Compared with a board"). Archive windows, in which oxidrive takes the card from the car
 and the car sees MEDIUM NOT PRESENT, need WiFi and the NAS and move to milestone 4; the car's side
 of them is what the golden's eject already shows.
 
@@ -670,8 +797,41 @@ the test prints each command.
    the card from the car (TEST UNIT READY: MEDIUM NOT PRESENT), uploading a clip, giving it back,
    and the car's next writes landing intact.
 
-**Timed SD transfers** are there (`--sd-timing`): with them oxidrive takes the car's writes at
-11.0 MB/s where its board measured about 10.9 MB/s ("USB", "Throughput"). The card's read access
-time and its programming time per block (`--sd-prg-us` is per write) are what is left; an archive
-window's reads of the card on slot 0 and ESP-Hosted's traffic on slot 1 will share the one host,
-so timing both slots matters there.
+**Timed SD transfers** are there (`--sd-timing`). oxidrive's 11.0 MB/s with them against its
+board's 10.9 MB/s is a coincidence, not a calibration ("USB", "Throughput"): the card's
+programming time is 0 and cache and PSRAM stalls are not modelled. The card's read access time
+and its programming time per block (`--sd-prg-us` is per write; measure it on a card first) are
+what is left; an archive window's reads of the card on slot 0 and ESP-Hosted's traffic on slot 1
+will share the one host, so timing both slots matters there.
+
+**The car, for archive windows.** The car here checks the drive between commands. What a window
+needs from it, and what the sources say a window will meet:
+
+1. A car that keeps writing into a window: queued WRITE(10)s, chunk after chunk, until a command
+   fails or a poll says NOT READY, rather than stopping at the next poll. esp_tinyusb's default
+   READ(10) and WRITE(10) callbacks do not check who has the card (tinyusb_msc.c:1379-1388 and
+   1393-1411; `msc_storage_write_sector_deferred` writes whatever the mount point): a write that
+   arrives after the application took the card goes to the card under the application's FatFs.
+   Only TEST UNIT READY looks at the mount point (1321-1336), and it reports NOT READY, MEDIUM NOT
+   PRESENT; it never reports UNIT ATTENTION.
+2. A caching FAT layer, as Linux's page and buffer caches are: what the car knows of the FAT and
+   the directory stays valid until it sees the medium change, a NOT READY then READY, or a UNIT
+   ATTENTION, and only then is the volume read again. After the window: fsck the image and compare
+   every clip. Linux's media-change detection is `sd_check_events` (v6.12 drivers/scsi/sd.c:1710-1776):
+   a TEST UNIT READY per poll, MEDIUM NOT PRESENT under NOT READY or UNIT ATTENTION marks the
+   medium gone (`media_not_present`, 1682-1699), and a change either way or a UNIT ATTENTION is a
+   media-change event. sd polls removable disks (`DISK_EVENT_FLAG_POLL`, sd.c:4012-4016); the
+   kernel's default interval is 0, polling off (`disk_events_dfl_poll_msecs`, block/disk-events.c:38-39),
+   and systemd's udev rules set it to 2000 ms (systemd v256 rules.d/60-block.rules).
+3. Windows shorter than the poll interval: the card taken and given back between two polls. With
+   no UNIT ATTENTION from esp_tinyusb, a car polling every 2 s does not see such a window at all,
+   and its cached FAT and directory are written back over what the application changed.
+4. A writeback mode for the FAT32 writer, closer to Linux: data in page-cache batches, the FAT
+   and directory sectors held and written back periodically, the entry's size updated as inode
+   writeback does, FSInfo at sync or unmount, so that a clip cut off mid-write leaves what Linux
+   would. Not built; the vfat-like order is what the tests and goldens pin today.
+
+The tusb_msc example shows two more things a window will meet ("Faults"): a port reset, which is
+how Linux recovers from any transport error or timeout, takes the card back from an application
+that does not set `auto_mount_off`; and a bus reset during a write's data stage makes TinyUSB's
+MSC class assert in `proc_write10_cmd` (harmless there, not seen on silicon).

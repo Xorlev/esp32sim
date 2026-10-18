@@ -2,11 +2,11 @@
 //! Bulk-Only Transport 1.0, "BOT"), and the LUN as a block device.
 //!
 //! A command is a CBW out, the data stage, a CSW in (BOT §5). The host checks the CSW as §6.3
-//! says (13 bytes, signature, the CBW's tag; a status and residue that mean something) and
-//! recovers as §5.3 and §6.6 say: a STALLed data stage is cleared and the CSW read; a STALLed
-//! CSW is cleared and read once more; a phase error or a CSW it cannot trust ends in reset
-//! recovery (Bulk-Only Mass Storage Reset, then CLEAR_FEATURE(ENDPOINT_HALT) on both bulk
-//! endpoints, §5.3.4). A command that fails (status 1) is followed by REQUEST SENSE.
+//! says (13 bytes, signature, the CBW's tag; a status and residue that mean something): a
+//! STALLed data stage is cleared and the CSW read; a STALLed CSW is cleared and read once more.
+//! A phase error, a CSW it cannot trust or a command past its timeout is recovered as `Recovery`
+//! says: Linux usb-storage's port reset by default, BOT's reset recovery (§5.3.4) as the option.
+//! A command that fails (status 1) is followed by REQUEST SENSE.
 //! SCSI: SPC-4 (INQUIRY, TEST UNIT READY, REQUEST SENSE, MODE SENSE(6), PREVENT ALLOW MEDIUM
 //! REMOVAL) and SBC-3 (READ CAPACITY(10), READ(10), WRITE(10), START STOP UNIT, SYNCHRONIZE
 //! CACHE(10)).
@@ -60,9 +60,9 @@ pub enum MscError {
     Usb(UsbError),
     /// CHECK CONDITION, with what REQUEST SENSE said
     Check(Sense),
-    /// the device reported a phase error (status 2): reset recovery done
+    /// the device reported a phase error (status 2): recovered
     Phase,
-    /// a CSW that is not valid or not meaningful (BOT §6.3): reset recovery done
+    /// a CSW that is not valid or not meaningful (BOT §6.3): recovered
     BadCsw(String),
     /// the data stage moved less than the command needed
     Short { want: usize, got: usize, residue: u32 },
