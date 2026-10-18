@@ -81,6 +81,7 @@ dependencies = [
  "esp32",
  "esp32c3",
  "esp32c6",
+ "esp32p4",
  "esp32s3",
 ]
 
@@ -93,6 +94,7 @@ dependencies = [
  "esp32",
  "esp32c3",
  "esp32c6",
+ "esp32p4",
  "esp32s3",
  "esp32sim-wasm-jit",
  "xtensa-lx7",

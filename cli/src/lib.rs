@@ -1,5 +1,5 @@
-//! esp32sim — the command line, one front end for every chip (`--chip esp32|s3|c3|c6`; the `esp32sim-c3`
-//! and `esp32sim-c6` binaries are `--chip c3` / `--chip c6`). Parsing and everything a run does are chip-agnostic over
+//! esp32sim — the command line, one front end for every chip (`--chip esp32|s3|c3|c6|p4`; the `esp32sim-c3`,
+//! `esp32sim-c6` and `esp32sim-p4` binaries are `--chip c3` / `--chip c6` / `--chip p4`). Parsing and everything a run does are chip-agnostic over
 //! `Machine<S>`; the few flags a chip owns (board, WiFi, camera, PSRAM, register presets) live in
 //! its setup function.
 use esp_soc::observers::{BlockProfile, Breakpoints, Coverage, IrqLatency, MmioHeat, PcHist, RegTrace, Trace, Vcd, Watch};
@@ -11,7 +11,7 @@ pub mod cooja;
 mod camera;
 
 fn usage(chip: &str) -> ! {
-    eprintln!("usage: esp32sim [--chip esp32|s3|c3|c6] --boot rom|app --bootloader B.bin --ptable P.bin --app A.bin [--elf X.elf]... [options]");
+    eprintln!("usage: esp32sim [--chip esp32|s3|c3|c6|p4] --boot rom|app --bootloader B.bin --ptable P.bin --app A.bin [--elf X.elf]... [options]");
     eprintln!("       see docs/cli.md for every flag (default chip here: {})", chip);
     std::process::exit(2)
 }
@@ -211,7 +211,8 @@ pub fn run_cli(default_chip: &str) {
         "s3" | "esp32s3" => { let m = setup_s3(&o); run(m, &o) }
         "c3" | "esp32c3" => { let m = setup_c3(&o); run(m, &o) }
         "c6" | "esp32c6" => { let m = setup_c6(&o); run(m, &o) }
-        c => { eprintln!("--chip {}: s3, c3 or c6", c); std::process::exit(2) }
+        "p4" | "esp32p4" => { let m = setup_p4(&o); run(m, &o) }
+        c => { eprintln!("--chip {}: esp32, s3, c3, c6 or p4", c); std::process::exit(2) }
     }
 }
 
@@ -357,6 +358,19 @@ fn setup_c6(o: &Opts) -> esp32c6::Machine {
     }
     for (flag, on) in [("--cam-image", o.cam_image.is_some()), ("--cam-stream", o.cam_stream.is_some()), ("--cam-size", o.cam_size.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
         if on { eprintln!("{} is not available on the C6", flag); std::process::exit(2); }
+    }
+    m
+}
+
+/// The ESP32-P4 (rev < 3), a bare module: 16 MB of flash unless told otherwise, PSRAM with `--psram-mb`.
+fn setup_p4(o: &Opts) -> esp32p4::Machine {
+    let flash = o.flash_mb.unwrap_or(16) << 20;
+    let mut m = esp32p4::machine(o.mac.unwrap_or([0x30, 0xed, 0xa0, 0x00, 0x11, 0x22]), flash);
+    m.bus.set_flash_size(flash);   // the JEDEC capacity follows the size
+    if let Some(mb) = o.psram_mb { m.bus.set_psram_size(mb << 20).unwrap(); }
+    if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
+    for (flag, on) in [("--board", o.board != "atech14" && o.board != "none"), ("--wifi", o.wifi.is_some()), ("--cam-image", o.cam_image.is_some()), ("--cam-stream", o.cam_stream.is_some()), ("--cam-size", o.cam_size.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
+        if on { eprintln!("{} is not available on the P4", flag); std::process::exit(2); }
     }
     m
 }

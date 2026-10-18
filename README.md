@@ -57,7 +57,7 @@ esp32sim/
                   systimer, timer groups, interrupt matrix (per core), GPIO, USB-CDC,
                   UARTs, I2C, GDMA + I2S/LCD_CAM, RMT TX, regi2c, RTC WDT, WiFi MAC;
                   board/: atech14 / waveshare-cam / waveshare-lcd4b / waveshare-amoled18-v2 / none
-  cli/            the `esp32sim` command line, every chip (`--chip`); `esp32sim-c3` / `esp32sim-c6` are alias binaries
+  cli/            the `esp32sim` command line, every chip (`--chip`); `esp32sim-c3` / `esp32sim-c6` / `esp32sim-p4` are alias binaries
   ── ESP32-C3 and ESP32-C6 (RISC-V, single core) ──
   riscv-rv32/     RV32IMAC decoder (sampled objdump checks), interpreter, disassembler; RV32F
                   (soft-float) and its lazy-FPU traps for the ESP32-P4, behind misa.F
@@ -66,6 +66,9 @@ esp32sim/
   esp32c6/        the C6 SoC: unified memory map and MMU, interrupt matrix + PLIC/INTPRI, L1 cache,
                   PCR, the LP blocks (reset cause, software reset, RTC timer), ASSIST_DEBUG,
                   the 802.15.4 and WiFi MACs
+  ── ESP32-P4 (RISC-V, dual core, rev < 3) ──
+  esp32p4/        the P4 SoC: memory map with L2MEM and the flash and PSRAM MMUs, interrupt
+                  matrices and per-core CLICs, HP/LP system blocks, PSRAM (docs/esp32p4.md)
   tests/          golden-output regression tests and their fixtures (tests/README.md)
   ── shared ──
   wasm/           C-ABI crate wrapping all three Machines for the browser in one module

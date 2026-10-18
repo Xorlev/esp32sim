@@ -92,7 +92,8 @@ unsafe fn text<'a>(ptr: *const u8, len: usize) -> &'a str {
 /// `board` is a CLI board name (atech14, waveshare-cam, waveshare-lcd4b,
 /// waveshare-amoled18-v2, none) for the ESP32-S3, `esp32` (the bare esp32dev module) or a classic
 /// board such as `ttgo-tdisplay` for the classic ESP32, `esp32c6` or `waveshare-c6-lcd147` for the
-/// C6, or `esp32c3` for the C3, which is console-only and takes no board. Null on failure.
+/// C6, `esp32c3` for the C3 or `esp32p4` for the P4 (rev < 3), which are console-only and take no
+/// board. Null on failure.
 /// Flash and PSRAM are each limited to 32 MiB, matching the browser configuration form.
 ///
 /// # Safety
@@ -116,9 +117,10 @@ pub unsafe extern "C" fn esp32sim_new(board: *const u8, board_len: usize, flash_
     };
     // The classic ESP32: `esp32` is the bare module (esp32dev); its boards are named like the CLI's
     // `--board` (ttgo-tdisplay). `none`/`bare` stay the S3's, so the classic factory is not asked.
+    let p4 = matches!(board.as_str(), "esp32p4" | "p4");
     let classic_board = if board == "esp32" {
         esp32::board::make_board("esp32dev")
-    } else if c6_board.is_some() || matches!(board.as_str(), "none" | "bare") {
+    } else if p4 || c6_board.is_some() || matches!(board.as_str(), "none" | "bare") {
         None
     } else {
         esp32::board::make_board(&board)
@@ -137,6 +139,13 @@ pub unsafe extern "C" fn esp32sim_new(board: *const u8, board_len: usize, flash_
         m.console.mask = 2;                                  // the ROM mirrors its console to UART0 and USB-Serial/JTAG
         prepare(&mut m);
         MachineKind::C3(Box::new(m))
+    } else if p4 {
+        let mut m = esp32p4::machine([0x30, 0xed, 0xa0, 0x00, 0x11, 0x22], flash_bytes);
+        m.bus.set_flash_size(flash_bytes);
+        let _ = m.bus.set_psram_size(psram_bytes);
+        m.console.mask = 2;
+        prepare(&mut m);
+        MachineKind::P4(Box::new(m))
     } else if let Some(b) = c6_board {
         let mut m = esp32c6::machine([0xdc, 0x1e, 0xd5, 0x6e, 0x8c, 0xdc], flash_bytes);
         m.bus.board = b;
