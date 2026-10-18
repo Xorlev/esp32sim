@@ -42,6 +42,11 @@ hello_world, which `p4-hello.json` runs, is committed; the rest are pinned by SH
 `tools/fetch-p4-firmware.sh`, which fetches them from
 [mikroverk/esp32sim-firmware](https://github.com/mikroverk/esp32sim-firmware) at a pinned commit.
 Images over 1 MB, and images only the tests boot, go there rather than into this repository.
+The co-processor goldens' inputs are `public/p4-hosted*` and `c6-hosted*`: IDF v5.5.3's WiFi station
+example with esp_hosted 2.12.13 on the P4 and ESP-Hosted 2.12.13's slave on the C6, and the same
+pair with ESP-Hosted's raw throughput test, built as
+[`examples/esp-hosted-p4`](../../../examples/esp-hosted-p4/README.md) describes; their licences are in
+`public/hosted-NOTICE.txt`; `tools/fetch-p4-firmware.sh` pins them too.
 
 `tdisplay-prices.json` is the LilyGO TTGO T-Display demo on the classic ESP32: stock MicroPython
 v1.29.0 (`ESP32_GENERIC-20260824-v1.29.0.bin`, MIT, fetched from micropython.org by

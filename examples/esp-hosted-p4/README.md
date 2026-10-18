@@ -17,9 +17,10 @@ ESP32-P4-WIFI6 and Espressif's P4 boards:
   `idf.py set-target esp32c6 build`. SDIO is the default transport on the C6 (CMD 18, CLK 19,
   D0-D3 20-23, streaming send, high speed). Only its `dependencies.lock` is kept here.
 
-Built with ESP-IDF v5.5.3: `idf.py set-target esp32p4 build` in `station/`. The images are
-committed as `web/wasm/fw/public/p4-hosted-*.bin` and `c6-hosted-*.bin` (licences in
-`hosted-NOTICE.txt`) and are the input of the `hosted_p4` golden:
+Built with ESP-IDF v5.5.3: `idf.py set-target esp32p4 build` in `station/`, with
+`sdkconfig.defaults` selecting rev < 3. The images are `web/wasm/fw/public/p4-hosted-*.bin` and
+`c6-hosted-*.bin`, pinned and fetched by `tools/fetch-p4-firmware.sh` (licences in
+`hosted-NOTICE.txt`, committed), and are the input of the `hosted_p4` golden:
 
     ../../target/release/esp32sim-p4 --flash-mb 2 \
       --bootloader station/build/bootloader/bootloader.bin \
