@@ -1,7 +1,8 @@
 # ESP32-P4 — plan
 
-Status: in progress; the F extension and the lazy FPU traps are in `riscv-rv32`
-(`Cpu::new_esp32p4`), the rest of milestone 1 is not started. Tracks
+Status: milestone 1 in progress. The F extension and the lazy FPU traps are in `riscv-rv32`
+(`Cpu::new_esp32p4`); the chip crate `esp32p4/` boots the ROM and the bootloader
+([esp32p4.md](esp32p4.md) says how far it gets and what the core must provide next). Tracks
 [#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:

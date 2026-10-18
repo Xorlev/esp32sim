@@ -208,7 +208,7 @@ fn hello_world_c6_reboot() {
 #[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
 fn hello_world_p4() {
     let rom = rom("esp32p4_rev0");
-    let args = ["--rom", rom.to_str().unwrap(), "--flash-mb", "2", 
+    let args = ["--rom", rom.to_str().unwrap(), "--flash-mb", "2",
         "--bootloader", &format!("{FW}/p4-hello-bootloader.bin"), "--ptable", &format!("{FW}/p4-hello-ptable.bin"), "--app", &format!("{FW}/p4-hello_world.bin"), "--max-seconds", "0.05"];
     let r = run(BIN_P4, &args);
     assert!(r.stdout.contains("I (0) boot: End of partition table"), "the bootloader never listed the partitions:\n{}", r.stdout);

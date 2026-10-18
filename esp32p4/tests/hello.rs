@@ -77,6 +77,7 @@ fn external_oxidrive_console_matches_the_board() {
     let mut bootloader = file("bootloader.bin");
     bootloader[2] = 0;
     if bootloader[23] == 1 { let n = bootloader.len() - 32; let digest = sha256(&bootloader[..n]); bootloader[n..].copy_from_slice(&digest); }
+    // the board's efuse MAC, which its console prints as the MQTT topic suffix
     let mut m = esp32p4::machine([0x30, 0xed, 0xa0, 0x00, 0x11, 0x22], 32 << 20);
     esp_soc::SocBus::set_flash_size(&mut m.bus, 32 << 20);
     esp_soc::SocBus::set_psram_size(&mut m.bus, 32 << 20).unwrap();

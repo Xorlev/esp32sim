@@ -39,8 +39,6 @@ pub const FLASH_SPI0: u32 = 0x5008_C000;
 pub const PSRAM_MSPI0: u32 = 0x5008_E000;
 pub const SPI_MMU_ITEM_CONTENT: u32 = 0x37c;
 pub const SPI_MMU_ITEM_INDEX: u32 = 0x380;
-/// CPU-subsystem window (CLIC, debug), CPU peripherals (cache, ASSIST_DEBUG), HP and LP peripherals.
-const PERIPH_RANGES: [(u32, u32); 4] = [(0x2000_0000, 0x3000_0000), (0x3FF0_0000, 0x3FF2_0000), (0x5000_0000, 0x5010_0000), (0x5011_0000, 0x5013_0000)];
 
 /// Which MMU an item register belongs to.
 #[derive(Clone, Copy)]
@@ -111,8 +109,17 @@ impl SocBus {
         }
     }
 
+    /// The CPU-subsystem window (CLIC, debug), the CPU peripherals (cache, ASSIST_DEBUG) and the
+    /// HP and LP peripherals; the LP ROM and RAM between the last two are memory.
     #[inline]
-    fn is_periph(addr: u32) -> bool { PERIPH_RANGES.iter().any(|&(lo, hi)| (lo..hi).contains(&addr)) }
+    fn is_periph(addr: u32) -> bool {
+        match addr >> 28 {
+            0x2 => true,
+            0x3 => (0x3FF0_0000..0x3FF2_0000).contains(&addr),
+            0x5 => addr < 0x5010_0000 || (0x5011_0000..0x5013_0000).contains(&addr),
+            _ => false,
+        }
+    }
 
     fn mmu_reg(a: u32) -> Option<(Mmu, u32)> {
         let o = a & 0xfff;

@@ -505,6 +505,9 @@ impl DeviceSet for Peripherals {
 }
 
 impl Peripherals {
+    /// The UART has the C6's register map (IDF v5.5.3 register/hw_ver1/soc/uart_reg.h: RXFIFO_CNT
+    /// 7:0, CONF0_SYNC.RXFIFO_RST bit 22, CONF1 thresholds 7:0), as do the systimer and TIMG.
+    /// GPIO_STRAP_REG reads 0x30F, SPI fast flash boot (include/soc/boot_mode.h).
     pub fn new(mac: [u8; 6], wafer: (u32, u32)) -> Self {
         Peripherals {
             uart: [Uart::new(UartLayout::C6), Uart::new(UartLayout::C6)], usb: UsbSerialJtag::new(CPU_HZ), systimer: SystimerP4::default(),
