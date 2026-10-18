@@ -8,6 +8,7 @@ use emu_core::{Bus, Core};
 use std::path::PathBuf;
 
 pub mod cooja;
+pub mod cosim;
 mod camera;
 
 fn usage(chip: &str) -> ! {
@@ -87,6 +88,8 @@ pub struct Opts {
     pub stubs: Vec<String>, pub trace_fns: Vec<String>, pub stop_exc: u64, pub log_periph: bool, pub no_jit: bool, pub debug: Vec<String>,
     /// `--cooja`: run as a Cooja-NG external mote over NDJSON on stdin/stdout (ESP32-C6 only)
     pub cooja: bool, pub cooja_slice_us: u64, pub cooja_verbose: bool, pub cooja_rx_at_end: bool,
+    /// `--coproc c6:KEY=VALUE,...`: an ESP32-C6 co-processor on the P4's SDIO bus (`cosim`)
+    pub coproc: Option<String>,
 }
 
 pub fn parse(args: &[String], default_chip: &str) -> Opts {
@@ -176,6 +179,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--no-jit" => o.no_jit = true,
             "--debug" => o.debug.push(next()),
             "--cooja" => o.cooja = true,
+            "--coproc" => o.coproc = Some(next()),
             "--cooja-slice-us" => o.cooja_slice_us = next().parse().expect("slice-us"),
             "--cooja-verbose" => o.cooja_verbose = true,
             "--cooja-rx-timing" => o.cooja_rx_at_end = match next().as_str() { "start" => false, "end" => true, x => { eprintln!("--cooja-rx-timing {}: start or end", x); std::process::exit(2) } },
@@ -217,6 +221,7 @@ pub fn run_cli(default_chip: &str) {
     validate_timing(&o).unwrap_or_else(|e| usage_error(&e));
     if o.approximate_cache { cache_config().unwrap_or_else(|e| usage_error(&e)); }
     if o.cooja { return run_cooja(&mut o); }
+    if o.coproc.is_some() { return run_cosim(&o); }
     match o.chip.as_str() {
         "esp32" => { let m = setup_esp32(&o); run(m, &o) }
         "s3" | "esp32s3" => { let m = setup_s3(&o); run(m, &o) }
@@ -257,6 +262,93 @@ fn run_cooja(o: &mut Opts) {
     eprintln!("[cooja] {} steps, {} early yields, {} tx, {} rx ({} dropped), {} log lines; {:.3} s simulated in {:.1} s wall ({} cycles, {:.1} Mcycle/s)",
               summary.steps, summary.yields, summary.tx, summary.rx, summary.rx_dropped, summary.logs, summary.sim_ns as f64 / 1e9, dt, m.bus.cycles(), m.bus.cycles() as f64 / dt / 1e6);
     report(&mut m, o, match summary.stopped { Some(_) => Stop::Halted, None => Stop::MaxInsns }, dt);
+}
+
+/// `--coproc`: the P4 with an ESP32-C6 on its SDIO bus, both run in lock-step (`cosim`). The P4
+/// is set up and booted as for a normal run; `--wifi`, `--net` and `--debug` also go to the C6.
+/// Both consoles go to stdout line by line, the C6's prefixed `[c6] ` (or to `console=FILE`).
+fn run_cosim(o: &Opts) {
+    use std::io::Write;
+    if !matches!(o.chip.as_str(), "p4" | "esp32p4") { usage_error("--coproc: the co-processor joins an ESP32-P4 (--chip p4)"); }
+    let spec = cosim::CoprocSpec::parse(o.coproc.as_deref().unwrap()).unwrap_or_else(|e| usage_error(&format!("--coproc: {e}")));
+    let mut p4 = setup_p4(o);
+    let boot = prepare(&mut p4, o);
+    // the SDIO link's commands and data take their wire time, as `--sd-timing` gives the card
+    if o.sd_timing { p4.bus.periph.sdmmc.timed = true; }
+    let end_ns = if p4.max_cycles == u64::MAX { u64::MAX } else { (p4.max_cycles as u128 * 1_000_000_000 / esp32p4::periph::CPU_HZ as u128) as u64 };
+    p4.max_cycles = u64::MAX;
+    let c6 = setup_coproc(o, &spec);
+    let cfg = cosim::Config {
+        slice_ns: spec.slice_ns.unwrap_or(cosim::DEFAULT_SLICE_NS), en_pin: spec.en_pin.unwrap_or(cosim::DEFAULT_EN_PIN), en_inverted: spec.en_inverted,
+        reboot_p4: !o.no_reboot && boot == "rom", reboot_c6: !o.no_reboot, p4_console: p4.console.mask, c6_console: 2,
+    };
+    eprintln!("[cosim] ESP32-C6 on SDIO slot 1 (CLK 18, CMD 19, D0-D3 14-17), EN on GPIO {}{}, slices of {} µs",
+              if cfg.en_inverted { "!" } else { "" }, cfg.en_pin, cfg.slice_ns as f64 / 1000.0);
+    let mut c6_file = spec.console.as_ref().map(|p| std::fs::File::create(p).unwrap_or_else(|e| usage_error(&format!("--coproc console={p}: {e}"))));
+    let prefix = o.console_prefix;
+    let mut cs = cosim::CoSim::new(p4, c6, cfg);
+    cs.c6.borrow_mut().faults.plan = spec.faults.clone();
+    let t0 = std::time::Instant::now();
+    let stdout = std::io::stdout();
+    let mut stop = Stop::Halted;
+    while cs.now_ns < end_ns {
+        let step = (cs.now_ns + 1_000_000).min(end_ns);
+        let r = cs.run_until(step);
+        let mut out = stdout.lock();
+        for (from_c6, line) in cs.lines.drain(..) {
+            match (&mut c6_file, from_c6) {
+                (Some(f), true) => { let _ = writeln!(f, "{line}"); }
+                (None, true) => { let _ = writeln!(out, "[c6] {line}"); }
+                (_, false) => { let _ = writeln!(out, "{}{line}", if prefix { "[p4] " } else { "" }); }
+            }
+        }
+        let _ = out.flush();
+        if let Err(s) = r { stop = s; break; }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    report(&mut cs.p4, o, stop, dt);
+    let c = cs.c6.borrow();
+    let st = &c.m.bus.periph.optional.sdio.stats;
+    eprintln!("[c6] stop: {} — {} insns; ran {:.3}s of {:.3}s ({} cycles); {} exceptions, {} interrupts; {} power-ups by EN, {} chip resets",
+              c.halted.as_deref().unwrap_or(if c.held { "held in reset" } else { "running" }), c.m.insns(), c.m.seconds(), cs.now_ns as f64 / 1e9, c.m.bus.cycles(),
+              c.m.exceptions, c.m.interrupts, c.power_ups, c.resets);
+    let stale = if st.stale_new_packets > 0 { format!(", {} packets announced before their length", st.stale_new_packets) } else { String::new() };
+    eprintln!("[c6] sdio: {} commands, {} bytes to the host, {} from it, {} underflows, {} overflows{stale}", st.commands, st.to_host, st.from_host, st.underflows, st.overflows);
+    { let r = c.m.bus.report(); if !r.is_empty() { for l in r.lines() { eprintln!("[c6] {l}"); } } }
+    for (f, ns) in &c.faults.fired { eprintln!("[cosim] fault {} fired at {:.6}s", fault_label(f), *ns as f64 / 1e9); }
+    let late = if c.late_commands > 0 { format!(", {} commands late for the C6", c.late_commands) } else { String::new() };
+    let late = if c.en_glitches > 0 { format!("{late}, {} EN pulses too short to reset the C6", c.en_glitches) } else { late };
+    eprintln!("[cosim] {} slices, {} EN changes, {} P4 resets{late}{}", cs.summary.slices, cs.summary.en_changes, cs.summary.p4_resets, cs.summary.stopped.as_ref().map(|s| format!("; stopped: {s}")).unwrap_or_default());
+}
+
+/// The co-processor: a bare ESP32-C6 with the images of `--coproc`, booted from its ROM.
+fn setup_coproc(o: &Opts, spec: &cosim::CoprocSpec) -> esp32c6::Machine {
+    let flash = spec.flash_mb.unwrap_or(4) << 20;
+    // 40:4C:CA is an Espressif OUI; the rest is made up, so the C6 reports a MAC of its own
+    let mut m = esp32c6::machine(spec.mac.unwrap_or([0x40, 0x4c, 0xca, 0x00, 0x11, 0x22]), flash);
+    m.bus.set_flash_size(flash);
+    if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
+    if let Some(spec) = &o.wifi {
+        let (cfg, nat) = wifi_config(spec, &o.net, m.bus.debug.has("net"));
+        m.bus.attach_wifi(cfg, nat).unwrap_or_else(|e| usage_error(&format!("--wifi: {e}")));
+    }
+    let rom = spec.rom.as_ref().map(PathBuf::from).or_else(|| find_rom(<esp32c6::C6 as Soc>::ROM_ELF))
+        .unwrap_or_else(|| usage_error("--coproc: no esp32c6_rev0_rom.elf found (rom=FILE)"));
+    m.load_rom(&std::fs::read(&rom).unwrap_or_else(|e| usage_error(&format!("--coproc rom {}: {e}", rom.display())))).expect("C6 rom");
+    let read = |p: &str| std::fs::read(p).unwrap_or_else(|e| usage_error(&format!("--coproc {p}: {e}")));
+    for (off, path) in [(0, &spec.bootloader), (0x8000, &spec.ptable), (0x10000, &spec.app)] {
+        if let Some(p) = path { m.write_flash(off, &read(p)).unwrap_or_else(|e| usage_error(&format!("--coproc {p}: {e}"))); }
+    }
+    if let Some((p, off)) = &spec.otadata { m.write_flash(*off, &read(p)).unwrap_or_else(|e| usage_error(&format!("--coproc {p}: {e}"))); }
+    for p in &spec.elfs { m.add_symbols(&read(p)).unwrap_or_else(|e| usage_error(&format!("--coproc elf {p}: {e}"))); }
+    for st in &spec.stubs {
+        let (name, val) = stub_spec(st).unwrap_or_else(|e| usage_error(&format!("--coproc stub: {e}")));
+        let addr = m.resolve_stub(name).unwrap_or_else(|| usage_error(&format!("--coproc stub: unknown symbol {name}")));
+        m.stubs.insert(addr, val);
+    }
+    if o.no_jit { for c in &mut m.cores { c.set_jit(false); } }
+    m.boot_rom();
+    m
 }
 
 fn setup_s3(o: &Opts) -> esp32s3::Machine {
@@ -311,6 +403,15 @@ fn setup_s3(o: &Opts) -> esp32s3::Machine {
 
 /// `--wifi SPEC` with `--net`: the virtual access point's configuration and, for `--net nat`,
 /// the NAT to the host, the same for every chip.
+fn fault_label(f: &cosim::Fault) -> String {
+    match f.when {
+        cosim::When::Nth { n, byte: Some(k) } => format!("{}@{n}:{k}", f.kind.name()),
+        cosim::When::Nth { n, byte: None } => format!("{}@{n}", f.kind.name()),
+        cosim::When::At { ns, len: 0 } => format!("{}@{}s", f.kind.name(), ns as f64 / 1e9),
+        cosim::When::At { ns, len } => format!("{}@{}s+{}s", f.kind.name(), ns as f64 / 1e9, len as f64 / 1e9),
+    }
+}
+
 /// `--wifi` and `--net MODE[,epoch=UNIX_SECONDS]`: the access point, and the NAT for `nat` (or
 /// `user`); `epoch` fixes the virtual network's clock (its SNTP answers) at power-on.
 fn wifi_config(spec: &str, net: &str, net_log: bool) -> (esp_soc::wifi::ApConfig, Option<esp_soc::nat::Nat>) {
@@ -390,8 +491,8 @@ fn setup_p4(o: &Opts) -> esp32p4::Machine {
     m.bus.set_flash_size(flash);   // the JEDEC capacity follows the size
     if let Some(mb) = o.psram_mb { m.bus.set_psram_size(mb << 20).unwrap(); }
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
-    for (flag, on) in [("--board", o.board != "atech14" && o.board != "none"), ("--wifi", o.wifi.is_some()), ("--cam-image", o.cam_image.is_some()), ("--cam-stream", o.cam_stream.is_some()), ("--cam-size", o.cam_size.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
-        if on { eprintln!("{} is not available on the P4", flag); std::process::exit(2); }
+    for (flag, on) in [("--board", o.board != "atech14" && o.board != "none"), ("--wifi", o.wifi.is_some() && o.coproc.is_none()), ("--cam-image", o.cam_image.is_some()), ("--cam-stream", o.cam_stream.is_some()), ("--cam-size", o.cam_size.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
+        if on { eprintln!("{} is not available on the P4{}", flag, if flag == "--wifi" { " (it goes to a co-processor: --coproc)" } else { "" }); std::process::exit(2); }
     }
     m
 }
