@@ -102,10 +102,10 @@ fn single_and_multi_block_transfers_and_stop() {
     assert_eq!(state(r1), CardState::Tran as u32);
     assert_eq!(c.state(), CardState::Data);
     let mut b = [0u8; 512];
-    c.read_data(&mut b).unwrap();
+    c.read_data(0, &mut b).unwrap();
     assert_eq!(&b[..], &img[3 * 512..4 * 512]);
     assert_eq!(c.state(), CardState::Tran, "back to transfer after one block");
-    assert_eq!(c.read_data(&mut b), Err(SdDataError::Timeout), "nothing more to send");
+    assert_eq!(c.read_data(0, &mut b), Err(SdDataError::Timeout), "nothing more to send");
 
     let data: Vec<u8> = (0..3 * 512).map(|i| (i * 7) as u8).collect();
     short(c.command(0, 25, 100));
@@ -119,13 +119,13 @@ fn single_and_multi_block_transfers_and_stop() {
     short(c.command(0, 55, RCA_ARG));
     short(c.command(0, 22, 0));
     let mut n = [0u8; 4];
-    c.read_data(&mut n).unwrap();
+    c.read_data(0, &mut n).unwrap();
     assert_eq!(u32::from_be_bytes(n), 3, "ACMD22 counts the blocks written");
 
     short(c.command(0, 18, 99));
     let mut out = vec![0u8; 5 * 512];
-    c.read_data(&mut out[..1000]).unwrap();
-    c.read_data(&mut out[1000..]).unwrap();
+    c.read_data(0, &mut out[..1000]).unwrap();
+    c.read_data(0, &mut out[1000..]).unwrap();
     assert_eq!(&out[..512], &img[99 * 512..100 * 512]);
     assert_eq!(&out[512..4 * 512], &data[..]);
     assert_eq!(&out[4 * 512..], &img[103 * 512..104 * 512]);
@@ -137,7 +137,7 @@ fn single_and_multi_block_transfers_and_stop() {
     short(c.command(0, 23, 2));
     short(c.command(0, 18, 10));
     let mut two = vec![0u8; 1024];
-    c.read_data(&mut two).unwrap();
+    c.read_data(0, &mut two).unwrap();
     assert_eq!(c.state(), CardState::Tran, "CMD23 ends the read after its count");
 }
 
@@ -150,11 +150,11 @@ fn addresses_beyond_the_card_are_out_of_range() {
     assert_eq!(r1 & status::OUT_OF_RANGE, status::OUT_OF_RANGE);
     assert_eq!(c.state(), CardState::Tran, "and no data phase starts");
     let mut b = [0u8; 512];
-    assert_eq!(c.read_data(&mut b), Err(SdDataError::Timeout));
+    assert_eq!(c.read_data(0, &mut b), Err(SdDataError::Timeout));
     assert_eq!(short(c.command(0, 13, RCA_ARG)) & status::OUT_OF_RANGE, 0, "cleared by the response that reported it");
     short(c.command(0, 18, end - 1));
     let mut two = [0u8; 1024];
-    assert_eq!(c.read_data(&mut two), Err(SdDataError::Timeout), "a multi-block read stops at the end");
+    assert_eq!(c.read_data(0, &mut two), Err(SdDataError::Timeout), "a multi-block read stops at the end");
     short(c.command(0, 12, 0));
     let r1 = short(c.command(0, 24, end));
     assert_eq!(r1 & status::OUT_OF_RANGE, status::OUT_OF_RANGE);
@@ -169,7 +169,7 @@ fn registers_bus_width_and_high_speed() {
     let r1 = short(c.command(0, 51, 0));
     assert_eq!(r1 & status::APP_CMD, status::APP_CMD, "an ACMD's R1 says it was taken as one");
     let mut scr = [0u8; 8];
-    c.read_data(&mut scr).unwrap();
+    c.read_data(0, &mut scr).unwrap();
     assert_eq!(scr[..4], [0x02, 0x35, 0x80, 0x02], "SCR: SD 3.0x, security 2.00, 1- and 4-bit, CMD23");
     assert_eq!(c.bus_width(), Some(1));
     short(c.command(0, 55, RCA_ARG));
@@ -178,20 +178,20 @@ fn registers_bus_width_and_high_speed() {
     short(c.command(0, 55, RCA_ARG));
     short(c.command(0, 13, 0));
     let mut ssr = [0u8; 64];
-    c.read_data(&mut ssr).unwrap();
+    c.read_data(0, &mut ssr).unwrap();
     assert_eq!(ssr[0] >> 6, 2, "SD status: four lines");
     short(c.command(0, 6, 0x00ff_fff1));
     let mut sw = [0u8; 64];
-    c.read_data(&mut sw).unwrap();
+    c.read_data(0, &mut sw).unwrap();
     assert_eq!((sw[12], sw[13]), (0x80, 0x03), "group 1 offers default and high speed");
     assert_eq!(sw[16] & 0xf, 1, "a check of function 1 reports it would be selected");
     assert_eq!(sw[17], 1, "data structure version 1");
     assert_eq!(c.csd() >> 96 & 0xff, 0x32, "a check switches nothing");
     short(c.command(0, 6, 0x80ff_fff1));
-    c.read_data(&mut sw).unwrap();
+    c.read_data(0, &mut sw).unwrap();
     assert_eq!(c.csd() >> 96 & 0xff, 0x5a, "TRAN_SPEED 50 MHz after the switch");
     short(c.command(0, 6, 0x80ff_ff2f));
-    c.read_data(&mut sw).unwrap();
+    c.read_data(0, &mut sw).unwrap();
     assert_eq!(sw[16] >> 4, 0xf, "an unsupported function reads 0xF");
     assert_eq!(c.csd() >> 96 & 0xff, 0x5a, "and nothing switches");
 }
@@ -205,7 +205,7 @@ fn erase_zeroes_blocks() {
     short(c.command(0, 38, 0));
     short(c.command(0, 17, 6));
     let mut b = [0xffu8; 512];
-    c.read_data(&mut b).unwrap();
+    c.read_data(0, &mut b).unwrap();
     assert!(b.iter().all(|&x| x == 0), "erased blocks read 0");
     assert_eq!(short(c.command(0, 38, 0)) & status::ERASE_SEQ_ERROR, status::ERASE_SEQ_ERROR, "CMD38 needs CMD32 and CMD33");
 
@@ -532,7 +532,7 @@ fn faults_widths_and_missing_data_end_the_transfer() {
 struct Faulty { resp: Result<SdResponse, SdCmdError>, read: Result<(), SdDataError> }
 impl SdDevice for Faulty {
     fn command(&mut self, _now: u64, _cmd: u8, _arg: u32) -> Result<SdResponse, SdCmdError> { self.resp }
-    fn read_data(&mut self, buf: &mut [u8]) -> Result<(), SdDataError> { buf.fill(0x5a); self.read }
+    fn read_data(&mut self, _now: u64, buf: &mut [u8]) -> Result<(), SdDataError> { buf.fill(0x5a); self.read }
     fn write_data(&mut self, _now: u64, _data: &[u8]) -> Result<(), SdDataError> { Ok(()) }
     fn name(&self) -> &str { "faulty" }
 }
@@ -751,4 +751,41 @@ fn a_timed_bus_raises_command_and_data_done_when_the_bits_are_through() {
     assert_eq!(h.next_event_ns(), Some(data_end + 50_000), "the card's busy end is the next event");
     h.advance(data_end + 50_000);
     assert_eq!(h.read(reg::RINTSTS), int::CMD_DONE | int::DATA_OVER | int::BCI);
+}
+
+/// An SDIO function whose interrupt the test sets.
+struct Function(std::rc::Rc<std::cell::Cell<bool>>);
+impl SdDevice for Function {
+    fn command(&mut self, _now: u64, _cmd: u8, _arg: u32) -> Result<SdResponse, SdCmdError> { Ok(SdResponse::Short(0)) }
+    fn read_data(&mut self, _now: u64, _buf: &mut [u8]) -> Result<(), SdDataError> { Ok(()) }
+    fn write_data(&mut self, _now: u64, _data: &[u8]) -> Result<(), SdDataError> { Ok(()) }
+    fn interrupt(&self) -> bool { self.0.get() }
+    fn io(&self) -> bool { true }
+    fn name(&self) -> &str { "function" }
+}
+
+/// RINTSTS's SDIO bit for the slot is set when DAT1 goes low, once per assertion: cleared while
+/// DAT1 stays low it stays clear (IDF reads the D1 pin for the level, `sdmmc_host_io_int_wait`).
+/// A memory card on the other slot never raises it.
+#[test]
+fn an_sdio_interrupt_is_latched_on_its_falling_edge() {
+    let mut h = Sdmmc::new(SdmmcLayout::Esp32p4);
+    let line = std::rc::Rc::new(std::cell::Cell::new(false));
+    let card = h.attach(Box::new(card()));
+    let f = h.attach(Box::new(Function(line.clone())));
+    h.route = [Some(card), Some(f)];
+    h.write(reg::INTMASK, int::SDIO_SLOT0 << 1);
+    h.write(reg::CTRL, CTRL_INT_ENABLE);
+    assert!(!h.poll_sdio() && !h.irq());
+    line.set(true);
+    assert!(h.poll_sdio());
+    assert_eq!(h.read(reg::RINTSTS), int::SDIO_SLOT0 << 1, "slot 1's bit, not slot 0's");
+    assert!(h.irq());
+    h.write(reg::RINTSTS, int::SDIO_SLOT0 << 1);
+    assert!(!h.poll_sdio(), "still low: no new edge");
+    assert_eq!(h.read(reg::RINTSTS), 0);
+    line.set(false);
+    h.poll_sdio();
+    line.set(true);
+    assert!(h.poll_sdio(), "released and asserted again: a new edge");
 }

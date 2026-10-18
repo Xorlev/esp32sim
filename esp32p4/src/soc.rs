@@ -134,6 +134,7 @@ impl esp_soc::SocBus for SocBus {
         let cause = self.periph.lp.reset_cause;
         let old = std::mem::replace(&mut self.periph, periph::Peripherals::new(mac, self.wafer));
         let p = &mut self.periph;
+        p.cycle_base = self.cycles;
         p.efuse = old.efuse;
         p.misc.log_unknown = old.misc.log_unknown;
         p.usb.connected = old.usb.connected;
@@ -150,6 +151,8 @@ impl esp_soc::SocBus for SocBus {
         p.sdmmc.stats = old.sdmmc.stats;
         p.sdmmc.timed = old.sdmmc.timed;
         p.sd_pins = old.sd_pins;
+        p.has_sdio = old.has_sdio;
+        if p.has_sdio { p.sync_sdio(); }
         // The USB cable stays plugged in; the host sees the reset core's pull-up go.
         if let Some(link) = old.usb_otg.link { p.usb_otg.stats = old.usb_otg.stats; p.usb_otg.reattach(old.usb_otg.now, link); }
         esp_periph::Dispatch::refresh_optional(p, periph::USB_OTG_BLOCK);
