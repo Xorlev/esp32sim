@@ -70,6 +70,8 @@ pub struct Opts {
     pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub app: Option<String>, pub elfs: Vec<String>,
     pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
+    /// `--sd IMAGE` (copy-on-write) or `--sd-rw IMAGE` (write-through): a card in the SD socket
+    pub sd: Option<(String, bool)>,
     pub board: String, pub wifi: Option<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
@@ -106,6 +108,8 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--boot" => o.boot = Some(next()),
             "--flash-mb" => o.flash_mb = Some(next().parse().expect("mb")),
             "--psram-mb" => o.psram_mb = Some(next().parse().expect("mb")),
+            "--sd" => o.sd = Some((next(), false)),
+            "--sd-rw" => o.sd = Some((next(), true)),
             "--mac" => { let v = next(); let b: Vec<u8> = v.split(':').filter_map(|x| u8::from_str_radix(x, 16).ok()).collect(); if b.len() != 6 { eprintln!("--mac wants xx:xx:xx:xx:xx:xx"); std::process::exit(2); } let mut m = [0u8; 6]; m.copy_from_slice(&b); o.mac = Some(m); }
             "--strap" => o.strap = Some(hex(&next(), "strap")),
             "--reset-cause" => o.reset_cause = Some(hex(&next(), "reset-cause")),
@@ -463,6 +467,11 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
         let data = std::fs::read(path).unwrap_or_else(|e| { eprintln!("--flash-at: {}: {}", path, e); std::process::exit(2) });
         m.write_flash(off, &data).unwrap_or_else(|e| { eprintln!("--flash-at: {}", e); std::process::exit(2) });
         eprintln!("[emu] flash {:#x}: {} ({} bytes)", off, path, data.len());
+    }
+    if let Some((path, rw)) = &o.sd {
+        let image = if *rw { esp_periph::sdmmc::FileStore::write_through(path) } else { esp_periph::sdmmc::FileStore::copy_on_write(path) };
+        let image = image.unwrap_or_else(|e| usage_error(&format!("--sd {path}: {e}")));
+        match m.bus.attach_sd_card(Box::new(image)) { Ok(w) => eprintln!("[emu] SD card: {w}"), Err(e) => usage_error(&format!("--sd: {e}")) }
     }
     let mut ble_elf = esp_soc::elf::Elf::default();
     for p in &o.elfs {

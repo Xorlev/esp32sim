@@ -140,7 +140,11 @@ impl esp_soc::SocBus for SocBus {
         p.spi0.0.jedec = old.spi0.0.jedec;
         p.spi1.jedec = old.spi1.jedec;
         p.psram1.psram_mr = old.psram1.psram_mr;      // the PSRAM keeps its mode registers
-        p.gpio.strap = old.gpio.strap;
+        p.gpio.g.strap = old.gpio.g.strap;
+        // The card in the socket keeps its power and its state; IDF's init resets it with CMD0.
+        p.sdmmc.devices = old.sdmmc.devices;
+        p.sdmmc.stats = old.sdmmc.stats;
+        p.sd_pins = old.sd_pins;
         *self.mmu_flash = [0; MMU_ENTRIES];
         *self.mmu_psram = [0; MMU_ENTRIES];
         self.mmu_flash_index = 0;
@@ -167,7 +171,7 @@ impl esp_soc::SocBus for SocBus {
         self.irq_dirty |= before != u.irq();
     }
     fn gpio_set_input(&mut self, pin: u8, level: bool) {
-        self.irq_dirty |= self.periph.gpio.set_input(pin, level);
+        self.irq_dirty |= self.periph.gpio.g.set_input(pin, level);
         if let Some(ev) = &mut self.gpio_events { ev.push((self.cycles, pin, level)); }
     }
     fn set_flash_size(&mut self, bytes: usize) {
@@ -175,7 +179,7 @@ impl esp_soc::SocBus for SocBus {
         let cap = bytes.trailing_zeros() as u8; self.periph.spi1.jedec[2] = cap; self.periph.spi0.0.jedec[2] = cap;
     }
     fn set_psram_size(&mut self, bytes: usize) -> Result<(), String> { self.psram = vec![0; bytes]; Ok(()) }
-    fn set_strap(&mut self, v: u32) { self.periph.gpio.strap = v; }
+    fn set_strap(&mut self, v: u32) { self.periph.gpio.g.strap = v; }
     fn set_reset_cause(&mut self, c: u32) { self.periph.lp.reset_cause = c; }
     fn set_debug(&mut self, f: &esp_soc::DebugFlags) {
         self.debug = f.clone();
@@ -184,10 +188,23 @@ impl esp_soc::SocBus for SocBus {
     }
     fn observe_gpio(&mut self, on: bool) { self.gpio_events = if on { Some(Vec::new()) } else { None }; }
     fn take_gpio_events(&mut self) -> Vec<(u64, u8, bool)> { self.gpio_events.as_mut().map(std::mem::take).unwrap_or_default() }
-    fn gpio_input(&self) -> u64 { self.periph.gpio.input }
+    fn gpio_input(&self) -> u64 { self.periph.gpio.g.input }
     fn board(&mut self) -> &mut dyn BoardModel { &mut *self.board }
     fn board_ref(&self) -> &dyn BoardModel { &*self.board }
     fn audio(&self) -> (&[i16], u32) { (&[], 44100) }
     /// `line` is the CPU interrupt line, CLIC ID - 16.
     fn irq_sources_of(&self, core: usize, line: u32) -> Vec<usize> { self.periph.sources_of(core, line + CLIC_EXT_OFFSET) }
+    /// The card goes in the reference board's socket, on slot 0's IO MUX pins; firmware reaches
+    /// it through slot 0 or, routing those pins through the GPIO matrix, slot 1.
+    fn attach_sd_card(&mut self, image: Box<dyn esp_periph::sdmmc::SdStore>) -> Result<String, String> {
+        let card = esp_periph::sdmmc::SdCard::new(image)?;
+        let what = format!("{}, {} blocks, at CLK {} CMD {} D0-D3 {:?}", card.describe(), card.blocks(), periph::SdPins::SOCKET.clk, periph::SdPins::SOCKET.cmd, periph::SdPins::SOCKET.data);
+        self.periph.attach_sd(periph::SdPins::SOCKET, Box::new(card));
+        Ok(what)
+    }
+    fn report(&self) -> String {
+        let s = &self.periph.sdmmc.stats;
+        if self.periph.sdmmc.devices.is_empty() && s.commands == 0 { return String::new(); }
+        format!("[sdmmc] {} commands ({} unanswered), {} bytes read, {} written", s.commands, s.timeouts, s.bytes_read, s.bytes_written)
+    }
 }

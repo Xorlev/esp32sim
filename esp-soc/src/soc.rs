@@ -220,6 +220,8 @@ pub trait SocBus: Bus {
     fn set_reset_cause(&mut self, cause: u32);
     /// Chip-specific end-of-run statistics (audio, WiFi, crypto, DMA engines).
     fn report(&self) -> String { String::new() }
+    /// Put an SD card holding `image` in the board's SD socket; says where it went.
+    fn attach_sd_card(&mut self, _image: Box<dyn esp_periph::sdmmc::SdStore>) -> Result<String, String> { Err("this chip has no SD card host".into()) }
 }
 
 /// Attach and synchronize the shared host source bank without adding device-tick work.
