@@ -37,6 +37,8 @@ pub mod src {
     pub const MCPWM0: usize = 61;
     // IDF v5.5.4 components/soc/esp32c6/include/soc/interrupts.h:83-85.
     pub const PARLIO: usize = 63;
+    // IDF v5.5.3 components/soc/esp32c6/include/soc/interrupts.h:86, ETS_SLC0_INTR_SOURCE.
+    pub const SLC0: usize = 64;
     pub const DMA_IN_CH0: usize = 66; pub const DMA_OUT_CH0: usize = 69; pub const GPSPI2: usize = 72;
     pub const AES: usize = 73; pub const SHA: usize = 74; pub const RSA: usize = 75; pub const ECC: usize = 76;
     pub const COUNT: usize = 77;
@@ -353,6 +355,7 @@ pub struct OptionalPeripherals {
     pub i2s0: esp_periph::I2s,
     pub ecc: crate::ecc::Ecc,
     pub parlio: crate::parlio::Parlio,
+    pub sdio: crate::sdio::SdioSlave,
 }
 
 pub struct Peripherals {
@@ -410,6 +413,10 @@ device_set! { Peripherals; inline always; clock: (clock) CPU_HZ, [(ClockDomain::
     0x03 "SPI1" (spi1) => [];
     0x06 "RMT" (rmt) => [src::RMT];
     0x15 "PARL_IO" optional (optional.parlio) => [src::PARLIO];
+    // The SDIO slave: HINF, SLC and SLCHOST (IDF v5.5.3 soc/esp32c6/register/soc/reg_base.h:35-37), one device.
+    0x17 "SDIO_SLC" optional (optional.sdio) delta 0x1000 => [src::SLC0];
+    0x16 "SDIO_HINF" alias (optional.sdio) => [];
+    0x18 "SDIO_SLCHOST" alias (optional.sdio) delta 0x2000 => [];
     0x07 "LEDC" optional (ledc) => [src::LEDC];
     0x08 "TIMG0" (timg[0]) => [src::TG0_T0];
     0x09 "TIMG1" (timg[1]) => [src::TG1_T0];
@@ -477,7 +484,7 @@ impl Peripherals {
             intmtx: IntMatrix::new(), intc: Intc::new(), cache: Cache::new(), lpsys: LpSys::new(), pcr: Pcr::new(), ana_mst: AnaMst::new(), assist_debug: AssistDebug::new(),
             rng: Rng::new(), cpu_sub: RegRam::new(),
             misc: Misc::new(), spi_exec: false, clock: Self::new_clock(),
-            optional: Box::new(OptionalPeripherals { i2s0: esp_periph::I2s::new(CPU_HZ), ecc: Default::default(), parlio: crate::parlio::Parlio::new() }), work_pending: false,
+            optional: Box::new(OptionalPeripherals { i2s0: esp_periph::I2s::new(CPU_HZ), ecc: Default::default(), parlio: crate::parlio::Parlio::new(), sdio: Default::default() }), work_pending: false,
         }
     }
 
