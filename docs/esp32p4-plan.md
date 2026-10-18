@@ -1,12 +1,13 @@
 # ESP32-P4 — plan
 
-Status: milestones 1 to 4a done, 4b next. hello_world boots to `app_main` on one and on both
-cores and reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr counters,
-CLIC mode and two harts. The SDMMC host and an SD card carry IDF's sdmmc example through a FAT32
-mount. The high-speed USB-OTG core presents the card to a host written in Rust, which records a
-clip on it like a car. An emulated C6 on SDIO runs unmodified ESP-Hosted slave firmware in
-lock-step with the P4: IDF's WiFi station example takes a lease through it and ESP-Hosted's raw
-throughput test runs both ways ([esp32p4.md](esp32p4.md)). Tracks
+Status: milestones 1 to 4 done. hello_world boots to `app_main` on one and on both cores and
+reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr counters, CLIC mode
+and two harts. The SDMMC host and an SD card carry IDF's sdmmc example through a FAT32 mount. The
+high-speed USB-OTG core presents the card to a host written in Rust, which records a clip on it
+like a car. An emulated C6 on SDIO runs unmodified ESP-Hosted slave firmware in lock-step with the
+P4: IDF's WiFi station example takes a lease through it, ESP-Hosted's raw throughput test runs
+both ways, and guest-to-host forwards take the P4's TCP to servers on the host
+([esp32p4.md](esp32p4.md); its "Not there yet" lists what is left). Tracks
 [#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:
@@ -129,7 +130,7 @@ slave on the C6, as a golden.
   throughput test both ways (goldens `hosted-rawtp-rx`, `hosted-rawtp-tx`); deterministic fault
   hooks on the link with ESP-Hosted's reaction to each; a fixed network clock (`epoch=`), so a
   firmware that asks for the time runs the same every time (esp32p4.md, "The co-processor").
-- **4b**: real servers on the host for firmware on the virtual network: guest-to-host TCP
+- **4b, done**: real servers on the host for firmware on the virtual network: guest-to-host TCP
   forwards (`--net none,fwd=GUEST:PORT=HOST:PORT`, which keep everything else inside the virtual
   network; [networking-howto.md](networking-howto.md)), and a car that writes a dashcam's
   directory tree (directories, long names, MP4 clips).
