@@ -173,7 +173,7 @@ fn every_rounding_mode_matches_the_round_to_odd_reference() {
 #[test]
 fn round_to_nearest_even_matches_the_host_on_any_bits() {
     let mut r = Rng(0x2545_f491_4f6c_dd1d);
-    // A bit test, not is_nan(): an optimised build folded is_nan() of a host sqrt to false for a NaN input.
+    // NaN is tested on the bits, so the oracle does not depend on how the optimiser treats is_nan() after sqrt.
     let host = |v: f32| if v.to_bits() & 0x7fff_ffff > 0x7f80_0000 { CANONICAL_NAN } else { v.to_bits() };
     for _ in 0..CASES * 4 {
         let any = |r: &mut Rng| match r.below(3) { 0 => r.next() as u32, 1 => anywhere(r), _ => [0, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0001, 0x7f80_0001, 1, 0x7f7f_ffff, 0x0080_0000][r.below(9) as usize] };
