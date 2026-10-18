@@ -35,7 +35,8 @@ ESP32-S3 peripheral MMIO reads and writes must be aligned 32-bit accesses. Byte 
 | PCNT | 0x60017000 | full | 4 units × 2 channels, pos/neg/ctrl modes via the GPIO matrix, limits/thresholds/zero events, counter reset/pause |
 | LEDC | 0x60019000 | partial | timers, fractional dividers, static duty latching, interrupts and GPIO-matrix output; hardware fades — |
 | MCPWM0/1 | 0x6001E000/2C000 | partial | up-counting timers, compare latching, simple generator actions, interrupts and GPIO-matrix output; sync, capture, fault, carrier and dead time — |
-| TWAI, SDMMC, USB-OTG | — | — | |
+| TWAI, USB-OTG | — | — | |
+| SDMMC | 0x60028000 | — | the DesignWare host and SD card are modelled in `esp-periph/src/sdmmc.rs` and wired on the ESP32-P4 only (esp32p4.md, "SD card") |
 | WiFi baseband/PHY/RF, BT | — | — | radio registers are faked, not modelled; see wifi-plan.md |
 
 CPU-side: full base ISA, FPU (single precision), MAC16, booleans, PIE (all esp-dl/esp-dsp

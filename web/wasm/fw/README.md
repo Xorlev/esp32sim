@@ -32,10 +32,12 @@ accompany them. They are native CI fixtures; no new browser manifest is required
 The classic ESP32 hello inputs are `public/classic-hello-*`, built from
 [`examples/hello_world-classic`](../../../examples/hello_world-classic/README.md).
 `classic-hello-NOTICE.txt` lists only linked firmware components.
-The ESP32-P4 goldens' inputs are `public/p4-hello*`, ESP-IDF v5.5.3's hello_world for one and for
-both cores, built from [`examples/hello_world-p4`](../../../examples/hello_world-p4/README.md). The
-single-core images, which `p4-hello.json` runs, are committed; the two-core `p4-hello-smp*` are
-pinned by SHA-256 in `tools/fetch-p4-firmware.sh`, which fetches them from
+The ESP32-P4 goldens' inputs are `public/p4-hello*`, `p4-sdcard*` and `p4-sdsectors*`, ESP-IDF
+v5.5.3 examples built from [`examples/hello_world-p4`](../../../examples/hello_world-p4/README.md)
+(one and both cores), [`sd_card-p4`](../../../examples/sd_card-p4/README.md) and
+[`sd_card-p4-sectors`](../../../examples/sd_card-p4-sectors/README.md). The single-core hello_world,
+which `p4-hello.json` runs, is committed; the rest are pinned by SHA-256 in
+`tools/fetch-p4-firmware.sh`, which fetches them from
 [mikroverk/esp32sim-firmware](https://github.com/mikroverk/esp32sim-firmware) at a pinned commit.
 Images over 1 MB, and images only the tests boot, go there rather than into this repository.
 

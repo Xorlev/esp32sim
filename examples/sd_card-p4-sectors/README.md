@@ -14,8 +14,9 @@ The block moves raw sectors with `sdmmc_write_sectors` and `sdmmc_read_sectors`:
 - and the card status (CMD13).
 
 It prints each result and the time the first write and read took. Built with
-`idf.py set-target esp32p4 build`; committed as `web/wasm/fw/public/p4-sdsectors-bootloader.bin`
-and `p4-sdsectors.bin`, with hello_world's partition table (the same bytes). The
+`idf.py set-target esp32p4 build`, as `web/wasm/fw/public/p4-sdsectors-bootloader.bin` and
+`p4-sdsectors.bin` (pinned and fetched by `tools/fetch-p4-firmware.sh`), with hello_world's
+partition table (the same bytes). The
 `sdcard-sectors-p4` golden runs it with a card that programs for 2 ms after each write
 (`--sd-prg-us 2000`), so the write's time includes the driver polling CMD13 until the card is
 ready:

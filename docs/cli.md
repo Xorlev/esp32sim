@@ -26,6 +26,8 @@ default too, with 16 MB of flash ([esp32p4.md](esp32p4.md)).
 | `--elf F` (repeatable) | symbols for logs/profiles (app ELF, bootloader ELF) |
 | `--flash-mb N`, `--psram-mb N` | flash size (JEDEC follows it) and octal PSRAM size (default 8 / 2, or 16 / 8 for StopWatch; the octal PSRAM's MR2 density follows it for 4, 8, 16, 32 and 64) |
 | `--flash-octal` | octal SPI flash (ESP32-S3-WROOM-2): Macronix octal commands, JEDEC C2 80 xx, efuse FLASH_TYPE octal; S3 only. An `--efuse-regs` dump is loaded after it: a dump that includes RD_REPEAT_DATA3 (efuse +0x3c) replaces that word, FLASH_TYPE (bit 9) with it |
+| `--sd IMAGE`, `--sd-rw IMAGE` | (P4) an SD card in the reference board's socket (CLK 43, CMD 44, D0-D3 39-42), holding the image: a high capacity card of the image's size, rounded down to 512 KiB. `--sd` is copy-on-write: what the firmware writes stays in memory and the file is never modified. `--sd-rw` writes through to the file. See [esp32p4.md](esp32p4.md), "SD card" |
+| `--sd-prg-us N`, `--sd-serial HEX` | (P4) the card's programming time after a write or an erase, in microseconds of emulated time (default 0: instant), and its CID serial number (default: derived from the image size) |
 | `--board atech14\|waveshare-cam\|waveshare-lcd4b\|waveshare-amoled18-v2\|stopwatch\|none` | board model (default atech14); on the C6: `waveshare-c6-lcd147` or `none`; on the classic ESP32: `ttgo-tdisplay` (alias `tdisplay`), `esp32dev-loopback` or `none`/`esp32dev` |
 | `--strap HEX`, `--reset-cause HEX`, `--efuse-regs F`, `--regs-init F` | reproduce a real chip's boot state (used by the differential tests) |
 | `--no-reboot` | stop at the first chip reset instead of rebooting from ROM |
