@@ -1,7 +1,7 @@
 use super::*;
 
 fn config() -> ApConfig {
-    ApConfig { ssid: "esp32sim".into(), bssid: [2, 0x53, 0x49, 0x4d, 0, 1], channel: 6, psk: None }
+    ApConfig { ssid: "esp32sim".into(), bssid: [2, 0x53, 0x49, 0x4d, 0, 1], channel: 6, psk: None, epoch_s: None }
 }
 
 fn station_frame(fc: u16, payload: &[u8]) -> Vec<u8> {

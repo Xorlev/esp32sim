@@ -280,7 +280,7 @@ impl SocBus {
     fn wifi_rx_deliver(&mut self, frame: &[u8], now_us: u64) {
         const RX_CTRL: usize = 92;
         let mac = &self.periph.wifi_mac;
-        if mac.rx_next == 0 { self.periph.wifi_mac.link.drop_rx(); return; }
+        if mac.rx_next == 0 { self.periph.wifi_mac.link.drop_rx_unarmed(); return; }
         let desc = mac.addr(mac.rx_next);
         let log = mac.link.ap().is_some_and(|ap| ap.log);
         let (dw0, buf, next) = (self.sram32(desc), self.sram32(desc.wrapping_add(4)), self.sram32(desc.wrapping_add(8)));
