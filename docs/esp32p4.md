@@ -577,8 +577,8 @@ The USB port and the timed SD bus cost the other chips nothing and the P4 nothin
 the core is an optional device-table entry, the bus tests one flag per round for the link and
 one for a timed SD bus, whose work and deadline sit in cold functions (inlined, they cost the P4
 hello demos 0.9-1.0%). Measured against 6bc9b9cf with `cargo build --release --bins`,
-alternating runs, median `user` time, identical instruction counts; the P4 rows on the final
-tree, the others on the tree before the timed SD bus, which only the P4 runs:
+alternating runs, median `user` time, identical instruction counts; the P4 rows on the tree at
+4b57750e, the others on the tree before the timed SD bus, which only the P4 runs:
 
 | demo | runs | 6bc9b9cf | this branch | instructions |
 | --- | --- | --- | --- | --- |
@@ -620,13 +620,13 @@ What the sources say about the hand-overs (TinyUSB 0.21.0~2, esp_tinyusb 2.4.0):
 So a port reset, which Linux's usb-storage does to recover from any transport error or timeout,
 takes the card from an application that is using it, unless the firmware sets `auto_mount_off`.
 
-The assertion after the aborted write is a race in the stack, not in the model as far as the
-sources show: dcd_dwc2's bus reset handler closes the endpoints in the interrupt (it clears
+The assertion after the aborted write reads, from the sources, as a race in the stack rather than
+in the model: dcd_dwc2's bus reset handler closes the endpoints in the interrupt (it clears
 `xfer_status`, dcd_dwc2.c:775) while the TinyUSB task still holds the write's last transfer
 completion; asking for the next chunk then finds bulk OUT closed (`dcd_edpt_xfer`,
 dcd_dwc2.c:687-688) and msc_device.c:910 asserts. The bus reset event that follows resets the
 class (`mscd_reset`). A 5 ms timeout cuts a live transfer, which is what opens the window; Linux's
-30 s timeout aborts a device that has stopped. Not seen on silicon.
+30 s timeout aborts a device that has stopped. Seen only in emulation; not checked on silicon.
 
 **Open points**, each a guess where the sources disagree or say nothing:
 
@@ -834,4 +834,5 @@ needs from it, and what the sources say a window will meet:
 The tusb_msc example shows two more things a window will meet ("Faults"): a port reset, which is
 how Linux recovers from any transport error or timeout, takes the card back from an application
 that does not set `auto_mount_off`; and a bus reset during a write's data stage makes TinyUSB's
-MSC class assert in `proc_write10_cmd` (harmless there, not seen on silicon).
+MSC class assert in `proc_write10_cmd` (harmless there; seen only in emulation, not checked on
+silicon).
