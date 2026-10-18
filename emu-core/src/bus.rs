@@ -139,6 +139,15 @@ pub trait Bus {
     /// The pc of the instruction about to execute, for buses that attribute accesses to code.
     #[inline(always)]
     fn note_pc(&mut self, pc: u32) { let _ = pc; }
+    /// A load-reserved by the running core at `addr`, for a bus shared by several harts: their
+    /// stores to the reservation set must break it (RISC-V unprivileged ISA, "Zalrsc"). Wrappers
+    /// must forward it.
+    #[inline(always)]
+    fn reserve(&mut self, addr: u32) { let _ = addr; }
+    /// Whether the running core's reservation at `addr` still holds for its store-conditional;
+    /// the reservation is used up either way. A bus with one hart leaves this to the core.
+    #[inline(always)]
+    fn reservation_held(&mut self, addr: u32) -> bool { let _ = addr; true }
     /// True when the last instruction may have changed an interrupt line, so a block must end
     /// and let the machine re-derive the CPU's interrupt inputs before the next instruction.
     #[inline(always)]

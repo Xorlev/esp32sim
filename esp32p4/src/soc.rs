@@ -57,10 +57,13 @@ impl<R: Revision> Soc for Esp32p4<R> {
     const ROM_DATA_TABLE: &'static [&'static str] = &["_data_table_start"];
     const ROM_DATA_TABLE_END: &'static [&'static str] = &["_data_table_end"];
     const ROM_DATA_TABLE_STRIDE: u32 = 12;
-    /// RV32IMAFC with the P4's EXT_ILL CSR; Xesppie and the hardware loops decode as illegal.
-    fn new_core(_i: usize) -> Cpu { let mut c = Cpu::new_esp32p4(); c.pc = RESET_VECTOR; c }
-    /// Both cores reset into the mask ROM. `mhartid` reads 0 on every core of this CPU model.
+    /// RV32IMAFC with the P4's EXT_ILL CSR and CLIC mode; Xesppie and the hardware loops decode
+    /// as illegal. `mhartid` is the core's index.
+    fn new_core(i: usize) -> Cpu { let mut c = Cpu::new_esp32p4(); c.hartid = i as u32; c.pc = RESET_VECTOR; c }
+    /// Both cores reset into the mask ROM, which sends core 1 to the boot address in LP_SYSTEM.
     fn reset_core(c: &mut Cpu, _i: usize) { Cpu::reset(c); c.pc = RESET_VECTOR; }
+    /// A reset core has no interrupt input until the lines are presented again.
+    fn reset_core_with_bus(c: &mut Cpu, bus: &mut SocBus, i: usize) { Self::reset_core(c, i); bus.irq_dirty = true; }
     fn boot_core(c: &mut Cpu, entry: u32) {
         Self::reset_core(c, 0);
         c.pc = entry;
@@ -82,15 +85,9 @@ impl<R: Revision> Soc for Esp32p4<R> {
         bus.irq_dirty = true;
     }
     fn select_core(bus: &mut SocBus, core: usize) { bus.cur_core = core; }
-    /// Core 1 stays held even when HP_SYS_CLKRST releases it: `mhartid` reads 0 on every core of
-    /// this CPU model, so it would run the ROM as core 0. The release is reported once.
+    /// Core 1 runs once HP_SYS_CLKRST gives it its clock and releases its reset.
     fn core_state(bus: &SocBus, core: usize) -> CoreState {
-        if core == 0 { return CoreState::Running; }
-        if !bus.periph.hp_clkrst.core1_released() { return CoreState::Reset; }
-        if !bus.core1_reported.replace(true) {
-            eprintln!("[esp32p4] core 1 released from reset (boot address {:#010x}); not started: the core model's mhartid reads 0 on every hart", bus.periph.lp.core1_boot_addr());
-        }
-        CoreState::Held
+        if core == 0 || bus.periph.hp_clkrst.core1_released() { CoreState::Running } else { CoreState::Reset }
     }
 }
 
@@ -148,7 +145,7 @@ impl esp_soc::SocBus for SocBus {
         *self.mmu_psram = [0; MMU_ENTRIES];
         self.mmu_flash_index = 0;
         self.mmu_psram_index = 0;
-        self.core1_reported.set(false);
+        self.reservation = [None; 2];
         for area in self.debug.iter() { esp_periph::Dispatch::debug(&mut self.periph, area, true); }
         self.periph.misc.log_all = self.debug.has("mmio");
         cause

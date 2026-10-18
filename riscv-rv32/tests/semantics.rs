@@ -370,3 +370,15 @@ fn clic_mode_is_the_p4_cores_alone() {
     assert_eq!((c6.read_csr(csr::MTVT), c6.read_csr(csr::MINTSTATUS_P4)), (0x1234, 0x55));
     assert!(!c6.clic);
 }
+
+/// mhartid reads the core's index, read-only, and a reset keeps it with the rest of the P4
+/// configuration.
+#[test]
+fn mhartid_survives_reset() {
+    let mut c = Cpu::new_esp32p4();
+    c.hartid = 1;
+    c.write_csr(csr::MHARTID, 5);
+    c.reset();
+    assert_eq!((c.read_csr(csr::MHARTID), c.clic, c.user_counters), (1, true, true));
+    assert_eq!(Cpu::new_rv32imac().read_csr(csr::MHARTID), 0);
+}

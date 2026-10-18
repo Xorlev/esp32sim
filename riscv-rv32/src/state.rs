@@ -123,6 +123,8 @@ pub struct Cpu {
     pub clic: bool,
     /// the hardware-vectoring table base (CSR 0x307), 64-byte aligned
     pub mtvt: u32,
+    /// what mhartid reads: which core of the chip this is; a reset keeps it
+    pub hartid: u32,
     /// mintstatus.mil: the level of the interrupt being handled, 0 outside any handler
     pub mil: u32,
     /// the address an `lr.w` reserved, until the next `sc.w`
@@ -144,7 +146,7 @@ impl Cpu {
             mstatus: 0x1800,          // MPP = machine
             mtvec: 0, mepc: 0, mcause: 0, mtval: 0, mie: 0, mscratch: 0,
             insn_count: 0, retired_count: 0, cycle_count: 0, cycle_base: 0, instret_base: 0, waiting: false, irq: None, misa: MISA_RV32IMC,
-            has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, user_counters: false, clic: false, mtvt: 0, mil: 0, reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
+            has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, user_counters: false, clic: false, mtvt: 0, hartid: 0, mil: 0, reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
         }
     }
     pub fn new_rv32imac() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAC; c }
@@ -159,11 +161,11 @@ impl Cpu {
         // the trace, so a chip reset must not rewind it (a reset that did made the browser UI
         // report a negative instruction rate). The architectural cycle counter is separately
         // monotonic and firmware reads its reset-relative value.
-        let (insns, retired, cycles, misa, ext_ill, counters, clic, bloom) = (self.insn_count, self.retired_count, self.cycle_count, self.misa, self.has_ext_ill, self.user_counters, self.clic, self.boundary_bloom);
+        let (insns, retired, cycles, misa, ext_ill, counters, clic, hart, bloom) = (self.insn_count, self.retired_count, self.cycle_count, self.misa, self.has_ext_ill, self.user_counters, self.clic, self.hartid, self.boundary_bloom);
         *self = Cpu::new();
         self.insn_count = insns; self.retired_count = retired; self.cycle_count = cycles;
         self.cycle_base = cycles; self.instret_base = retired;
-        self.misa = misa; self.has_ext_ill = ext_ill; self.user_counters = counters; self.clic = clic; self.boundary_bloom = bloom;
+        self.misa = misa; self.has_ext_ill = ext_ill; self.user_counters = counters; self.clic = clic; self.hartid = hart; self.boundary_bloom = bloom;
     }
 
     #[inline(always)]
@@ -210,7 +212,7 @@ impl Cpu {
             CYCLEH if self.user_counters => (self.cycle_count.wrapping_sub(self.cycle_base) >> 32) as u32,
             INSTRET if self.user_counters => self.retired_count.wrapping_sub(self.instret_base) as u32,
             INSTRETH if self.user_counters => (self.retired_count.wrapping_sub(self.instret_base) >> 32) as u32,
-            MVENDORID => 0, MARCHID => 0, MIMPID => 0, MHARTID => 0,
+            MVENDORID => 0, MARCHID => 0, MIMPID => 0, MHARTID => self.hartid,
             FFLAGS if self.has_f() => self.fcsr & 0x1f,
             FRM if self.has_f() => (self.fcsr >> 5) & 7,
             FCSR if self.has_f() => self.fcsr,

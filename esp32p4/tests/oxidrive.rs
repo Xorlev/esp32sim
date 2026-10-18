@@ -30,11 +30,19 @@ fn board_mac(log: &str) -> [u8; 6] {
     match suffix { Some([d, e, f]) => [0x30, 0xed, 0xa0, d, e, f], None => [0x30, 0xed, 0xa0, 0x00, 0x11, 0x22] }
 }
 
+/// Lines that differ because the ECO0 ROM stands in for the board's ECO2 one: the banner, and
+/// the heap region below the ROM's own data, which IDF sizes from the ROM's `ets_rom_layout`
+/// (`_dram0_rtos_reserved_start` is 0x4FF3FBA4 in the ECO0 ELF; the board's ROM ends it 12 bytes
+/// later).
+fn known_rom_difference(line: usize, emu: &str, board: &str) -> bool {
+    line < 2 || (emu.starts_with("I () heap_init: At 4FF3AFC0 len ") && board.starts_with("I () heap_init: At 4FF3AFC0 len "))
+}
+
 /// The owner's oxidrive firmware (not in this repository), booted from the same bootloader,
 /// partition table and app as the board whose console is `board-boot.log`, and compared line
-/// for line with timestamps stripped. The first two lines differ by construction (the ECO0 ROM
-/// stands in for the board's ECO2 one). Not expected to pass yet: it reports how far the console
-/// matches, the first line that does not, and why the run stopped there.
+/// for line with timestamps stripped and the ROM's known differences set aside. Not expected to
+/// pass yet: it reports how far the console matches, the first line that does not, and where
+/// the run stopped.
 #[test]
 #[ignore = "needs the oxidrive images under ~/Code/dlp/sim-fixtures"]
 fn external_oxidrive_console_matches_the_board() {
@@ -58,9 +66,16 @@ fn external_oxidrive_console_matches_the_board() {
     let board: Vec<String> = board_log.lines().skip_while(|l| !l.starts_with("ESP-ROM:")).map(strip_timestamp).collect();
     let emu: Vec<String> = String::from_utf8_lossy(&m.console.uart0).lines().map(strip_timestamp).collect();
     assert!(board.len() > 2 && emu.len() > 2, "no console to compare: board {} lines, emulator {}", board.len(), emu.len());
-    eprintln!("[oxidrive] banner (ECO0 ROM, not the board's ECO2): {:?} / {:?} vs the board's {:?} / {:?}", emu[0], emu[1], board[0], board[1]);
-    let same = emu.iter().zip(&board).skip(2).take_while(|(e, b)| e == b).count() + 2;
-    let why = if m.bus.periph.hp_clkrst.core1_released() { "core 1 was released from reset and is held: the core model's mhartid reads 0 on every hart" } else { "see the run's stderr" };
+    let mut same = 0;
+    for (i, (e, b)) in emu.iter().zip(&board).enumerate() {
+        if e == b { same += 1; continue; }
+        if !known_rom_difference(i, e, b) { break; }
+        eprintln!("[oxidrive] line {}, the ROM's: the emulator printed {e:?}, the board {b:?}", i + 1);
+        same += 1;
+    }
+    // SDMMC (0x50083000) is not modelled: its CTRL reset bits never clear, so sdmmc_host_reset
+    // waits with vTaskDelay before the scheduler runs, which panics.
+    let why = if m.bus.periph.misc.generic.contains_key(&0x50083) { "the firmware reached the SDMMC host (0x50083000), which is not modelled" } else { "see the run's stderr" };
     eprintln!("[oxidrive] {same} of {} board lines match; the run stopped ({stop:?}) at pc {:#010x} after {} instructions; {why}", board.len(), m.cores[0].pc(), m.insns());
     if let Some(e) = emu.get(same) { panic!("line {}: the emulator printed {e:?} where the board printed {:?}", same + 1, board.get(same)); }
     assert_eq!(same, board.len(), "the console matches the board's for {same} lines, then stops; the board's next line is {:?} ({why})", board.get(same));

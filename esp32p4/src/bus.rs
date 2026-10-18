@@ -71,8 +71,8 @@ pub struct SocBus {
     pub debug: esp_soc::DebugFlags,
     /// the core the machine is running, for the core-local CLIC window (`Soc::select_core`)
     pub cur_core: usize,
-    /// core 1's release from reset has been reported
-    pub(crate) core1_reported: std::cell::Cell<bool>,
+    /// each hart's LR reservation (the word); a store by the other hart to it breaks it
+    pub reservation: [Option<u32>; 2],
 }
 
 impl SocBus {
@@ -83,7 +83,7 @@ impl SocBus {
             flash: vec![0xff; flash_size], psram: Vec::new(),
             mmu_flash: Box::new([0; MMU_ENTRIES]), mmu_psram: Box::new([0; MMU_ENTRIES]), mmu_flash_index: 0, mmu_psram_index: 0,
             periph: Peripherals::new(mac, wafer), wafer, board: Box::new(esp_soc::NoBoard),
-            cycles: 0, last_fault: None, irq_dirty: true, gpio_events: None, debug: Default::default(), cur_core: 0, core1_reported: Default::default(),
+            cycles: 0, last_fault: None, irq_dirty: true, gpio_events: None, debug: Default::default(), cur_core: 0, reservation: [None; 2],
         }
     }
 
@@ -232,8 +232,19 @@ macro_rules! rd {
     }};
 }
 
+impl SocBus {
+    /// A store by the running hart breaks the other hart's reservation of the same word.
+    #[inline(always)]
+    fn break_reservation(&mut self, addr: u32) {
+        let other = &mut self.reservation[self.cur_core ^ 1];
+        if *other == Some(addr & !3) { *other = None; }
+    }
+}
+
 impl Bus for SocBus {
     fn note_code_page(&mut self, _vidx: u32) {} // This bus has no decode cache.
+    fn reserve(&mut self, addr: u32) { self.reservation[self.cur_core] = Some(addr & !3); }
+    fn reservation_held(&mut self, addr: u32) -> bool { self.reservation[self.cur_core].take() == Some(addr & !3) }
     fn read8(&mut self, addr: u32) -> Result<u8, Fault> {
         if Self::is_periph(addr) { return Ok(self.periph_read(addr, 1) as u8); }
         rd!(self, addr, 1, |b: &[u8]| b[0])
@@ -248,6 +259,7 @@ impl Bus for SocBus {
     }
     fn write8(&mut self, addr: u32, v: u8) -> Result<(), Fault> {
         if Self::is_periph(addr) { self.periph_write(addr, v as u32, 1); return Ok(()); }
+        self.break_reservation(addr);
         match self.resolve(addr) {
             Some((b, o, true)) if o < b.len() => { b[o] = v; Ok(()) }
             _ => { self.last_fault = Some((addr, true)); Err(Fault::Prohibited) }
@@ -255,6 +267,7 @@ impl Bus for SocBus {
     }
     fn write16(&mut self, addr: u32, v: u16) -> Result<(), Fault> {
         if Self::is_periph(addr) { self.periph_write(addr, v as u32, 2); return Ok(()); }
+        self.break_reservation(addr);
         match self.resolve(addr) {
             Some((b, o, true)) if o + 2 <= b.len() => { b[o..o + 2].copy_from_slice(&v.to_le_bytes()); Ok(()) }
             _ => { self.last_fault = Some((addr, true)); Err(Fault::Prohibited) }
@@ -262,6 +275,7 @@ impl Bus for SocBus {
     }
     fn write32(&mut self, addr: u32, v: u32) -> Result<(), Fault> {
         if Self::is_periph(addr) { self.periph_write(addr, v, 4); return Ok(()); }
+        self.break_reservation(addr);
         match self.resolve(addr) {
             Some((b, o, true)) if o + 4 <= b.len() => { b[o..o + 4].copy_from_slice(&v.to_le_bytes()); Ok(()) }
             _ => { self.last_fault = Some((addr, true)); Err(Fault::Prohibited) }
@@ -353,6 +367,48 @@ mod tests {
         b.write32(PSRAM_MSPI0 + SPI_MMU_ITEM_INDEX, 0).unwrap();
         b.write32(PSRAM_MSPI0 + SPI_MMU_ITEM_CONTENT, MMU_PSRAM_VALID | 1 << 10 | 1).unwrap();
         assert_eq!(b.read32(PSRAM_LOW + 4).unwrap(), 0x5a6b_7c8d);
+    }
+
+    /// Two harts on one bus: a store by the other hart to the reserved word makes the SC fail,
+    /// a store elsewhere or by the same hart does not (RISC-V unprivileged ISA, "Zalrsc").
+    #[test]
+    fn a_store_from_the_other_hart_breaks_a_reservation() {
+        use riscv_rv32::{step, Cpu};
+        let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
+        let (prog, data) = (L2MEM_LOW + 0x100, L2MEM_LOW + 0x200);
+        for (k, w) in [0x1005_a52fu32, 0x18d5_a62f].iter().enumerate() { b.write32(prog + 4 * k as u32, *w).unwrap(); }   // lr.w a0,(a1); sc.w a2,a3,(a1)
+        let sc_after = |b: &mut SocBus, store: Option<(usize, u32)>| {
+            let mut c = Cpu::new_esp32p4();
+            c.pc = prog; c.x[11] = data; c.x[13] = 0x55;
+            b.cur_core = 0;
+            step(&mut c, b).unwrap();
+            if let Some((hart, addr)) = store { b.cur_core = hart; b.write32(addr, 7).unwrap(); b.cur_core = 0; }
+            step(&mut c, b).unwrap();
+            c.x[12]
+        };
+        assert_eq!(sc_after(&mut b, None), 0);
+        assert_eq!(sc_after(&mut b, Some((1, data))), 1, "core 1 stored to the word");
+        assert_eq!(sc_after(&mut b, Some((1, data + 4))), 0);
+        assert_eq!(sc_after(&mut b, Some((0, data))), 0, "the same hart's store");
+        b.cur_core = 1;
+        b.reserve(data);
+        b.cur_core = 0;
+        assert!(!b.reservation_held(data), "core 0 holds no reservation of its own");
+        b.cur_core = 1;
+        assert!(b.reservation_held(data));
+    }
+
+    /// Core 1 sees its own CLIC block at 0x20800000 and core 0's at 0x20810000.
+    #[test]
+    fn the_clic_window_is_per_core() {
+        let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
+        b.cur_core = 1;
+        b.write32(0x2080_0008, 0x7f << 24).unwrap();
+        b.write8(0x2081_1000 + 4 * 20 + 1, 1).unwrap();
+        assert_eq!((b.periph.clic.core[1].thresh, b.periph.clic.core[0].thresh), (0x7f << 24, 0));
+        assert!(b.periph.clic.core[0].enabled(20) && !b.periph.clic.core[1].enabled(20));
+        b.cur_core = 0;
+        assert_eq!((b.read32(0x2080_0008).unwrap(), b.read32(0x2081_0008).unwrap()), (0, 0x7f << 24));
     }
 
     #[test]
