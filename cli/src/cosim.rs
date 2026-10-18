@@ -306,6 +306,8 @@ impl CoSim {
     }
 
     /// The lines between the chips at a slice end: DAT1 into the P4, the P4's EN line into the C6.
+    /// EN is sampled here only, so it takes effect up to a slice late and a pulse shorter than a
+    /// slice can be missed (ESP-Hosted's is 10 ms).
     fn exchange(&mut self, t: u64) {
         self.p4.bus.sync_sdio();
         self.p4.sync_irq();

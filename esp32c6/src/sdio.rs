@@ -285,8 +285,10 @@ impl SdioSlave {
     fn reset_rx(&mut self) { self.rx = RxLink::default(); self.rx_kick = false; self.new_packet_armed = false; }
     fn reset_tx(&mut self) { self.tx = TxLink::default(); }
 
-    /// The I/O reset (CCCR RES, §4.4): every function back to its power-on state, CMD5 needed
-    /// again; the SLC side is the C6's and stays as its driver left it.
+    /// The I/O reset (CCCR RES, §4.4): the card's side back to its power-on state, CMD5 needed
+    /// again. The SLC side and SLCHOST's counters stay as the C6's driver left them: the driver
+    /// resets the counters itself and the host is to ask it to (sdio_slave.c, header comment;
+    /// ESP-Hosted's slave does on the host's reset interrupt, `sdio_reset`).
     fn io_reset(&mut self) {
         (self.state, self.rca, self.ioe, self.ien, self.ehs, self.xfer) = (CardState::Inactive, 0, 0, 0, false, None);
         self.bus_ctrl &= 0x80;                        // CD Disable is not affected by a reset (§6.9)
@@ -331,8 +333,8 @@ impl SdioSlave {
         if func as u32 > IO_FUNCTIONS { return R5_CMD | R5_FUNCTION; }
         let out = if write {
             self.io_write(func, addr, data, mem);
-            if raw { self.host_read(func, addr) } else { data }
-        } else { self.host_read(func, addr) };
+            if raw { self.host_read(func, addr, mem) } else { data }
+        } else { self.host_read(func, addr, mem) };
         R5_CMD | out as u32
     }
 
@@ -355,12 +357,14 @@ impl SdioSlave {
         if x.func == 1 && x.addr >= FIFO_START {
             let take = (n as u32).min(x.packet) as usize;
             let got = self.rx_pull(mem, &mut buf[..take]);
+            // Reading past the link: zeros, RX_UDF, and the CMD53 succeeds. Guessed; silicon may
+            // stall the bus and retry instead (SLC0_HOST_RD_RETRY_INT, SLC0_RD_RETRY_THRESHOLD).
             if got < take { self.host_raw |= hint::RX_UDF; self.stats.underflows += 1; }
             buf[got..].fill(0);                       // past the packet: zero filled
             x.packet -= take as u32;
             self.stats.to_host += got as u64;
         } else {
-            for b in buf[..n].iter_mut() { *b = self.host_read(x.func, x.addr); if x.incr { x.addr += 1; } }
+            for b in buf[..n].iter_mut() { *b = self.host_read(x.func, x.addr, mem); if x.incr { x.addr += 1; } }
             buf[n..].fill(0);
         }
         x.left -= n as u32;
@@ -419,7 +423,8 @@ impl SdioSlave {
     }
 
     /// A packet's bytes into the receive buffers; `end` closes it with EOF. Without a buffer the
-    /// bytes are lost (TX_OVF to both sides).
+    /// bytes are lost (TX_OVF to both sides) and the CMD53 still succeeds: guessed, as the host
+    /// is expected to wait for TOKEN1 and never get here.
     fn tx_push(&mut self, mem: &mut dyn DmaMem, mut data: &[u8], end: bool) {
         let mut steps = 0;
         while !data.is_empty() && steps < MAX_DESCS {
@@ -449,9 +454,16 @@ impl SdioSlave {
         (self.tx.last, self.tx.cur, self.tx.fill) = (self.tx.cur, d.next, 0);
     }
 
-    /// A byte the host reads, with the bookkeeping behind `SdioStats::stale_new_packets`.
-    fn host_read(&mut self, func: u8, addr: u32) -> u8 {
+    /// A byte the host reads with CMD52 or a CMD53 below the FIFO, with the bookkeeping behind
+    /// `SdioStats::stale_new_packets`. A CMD52 into the FIFO takes the packet's next byte.
+    fn host_read(&mut self, func: u8, addr: u32, mem: &mut dyn DmaMem) -> u8 {
         if func == 1 {
+            if addr >= FIFO_START {
+                let mut b = [0u8];
+                if self.rx_pull(mem, &mut b) == 0 { self.host_raw |= hint::RX_UDF; self.stats.underflows += 1; }
+                else { self.stats.to_host += 1; }
+                return b[0];
+            }
             if addr == host::INT_RAW + 2 && self.host_raw & hint::NEW_PACKET != 0 && self.len == self.host_len { self.stats.stale_new_packets += 1; }
             if addr == host::PKT_LEN { self.host_len = self.len; }
         }
@@ -471,7 +483,8 @@ impl SdioSlave {
         match func {
             0 => self.cia_write(addr, v),
             1 if addr < FIFO_START => self.host_write_byte(addr, v),
-            1 => { self.tx_push(mem, &[v], true); self.stats.from_host += 1; }
+            // one byte of a packet of 0x1F800 - addr bytes: the last one closes it
+            1 if addr < FIFO_END => { self.tx_push(mem, &[v], addr == FIFO_END - 1); self.stats.from_host += 1; }
             _ => {}
         }
     }

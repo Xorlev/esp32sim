@@ -327,3 +327,29 @@ fn the_hand_back_waits_for_the_end_of_the_data_phase() {
     assert_eq!((ram.r32(BASE + 0x200) >> 31, Device::read(&mut s, SLC + slc::INT_RAW) & sint::RX_EOF), (0, sint::RX_EOF));
     assert_eq!(s.next_due(), None);
 }
+
+/// CMD52 into function 1's FIFO is a one-byte transfer to address A, so it follows the same rule
+/// as CMD53: a packet of 0x1F800 - A bytes, closed by its last byte; a read takes the next byte of
+/// the packet on the send link.
+#[test]
+fn cmd52_into_the_fifo_moves_packet_bytes() {
+    let (mut s, mut ram) = (SdioSlave::new(), Ram::new());
+    selected(&mut s, &mut ram);
+    ram.desc(BASE + 0x100, 64, 0, false, BASE + 0x1000, 0);
+    Device::write(&mut s, SLC + slc::TX_LINK_ADDR, BASE + 0x100);
+    Device::write(&mut s, SLC + slc::TX_LINK, slc::LINK_START);
+    wr(&mut s, &mut ram, 1, FIFO_END - 2, 0xa1);
+    assert_eq!(ram.r32(BASE + 0x100) >> 31, 1, "a two-byte packet: still open after its first byte");
+    wr(&mut s, &mut ram, 1, FIFO_END - 1, 0xa2);
+    assert_eq!(ram.r32(BASE + 0x100), 64 | 2 << 14 | 1 << 30, "closed by its last byte");
+    assert_eq!(&ram.0[0x1000..0x1002], &[0xa1, 0xa2]);
+    ram.desc(BASE + 0x200, 4, 2, true, BASE + 0x1800, 0);
+    ram.0[0x1800..0x1802].copy_from_slice(&[0x5a, 0x5b]);
+    Device::write(&mut s, SLC + slc::RX_LINK_ADDR, BASE + 0x200);
+    Device::write(&mut s, SLC + slc::RX_LINK, slc::LINK_START);
+    s.run_dma(&mut ram.mem());
+    assert_eq!((rd(&mut s, &mut ram, 1, FIFO_END - 2), rd(&mut s, &mut ram, 1, FIFO_END - 1)), (0x5a, 0x5b));
+    assert_eq!(Device::read(&mut s, SLC + slc::INT_RAW) & sint::RX_EOF, sint::RX_EOF);
+    assert_eq!(rd(&mut s, &mut ram, 1, FIFO_END - 1), 0, "nothing left: an underflow");
+    assert_eq!(s.stats.underflows, 1);
+}
