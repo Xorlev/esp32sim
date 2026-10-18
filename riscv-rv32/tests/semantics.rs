@@ -371,6 +371,18 @@ fn clic_mode_is_the_p4_cores_alone() {
     assert!(!c6.clic);
 }
 
+/// mhartid reads the core's index, read-only, and a reset keeps it with the rest of the P4
+/// configuration.
+#[test]
+fn mhartid_survives_reset() {
+    let mut c = Cpu::new_esp32p4();
+    c.hartid = 1;
+    c.write_csr(csr::MHARTID, 5);
+    c.reset();
+    assert_eq!((c.read_csr(csr::MHARTID), c.clic, c.user_counters), (1, true, true));
+    assert_eq!(Cpu::new_rv32imac().read_csr(csr::MHARTID), 0);
+}
+
 fn clic_irq(line: u32, level: u32, shv: bool) -> Option<u32> {
     use riscv_rv32::exec::{CLIC_IRQ_LEVEL_SHIFT, CLIC_IRQ_SHV};
     Some(line | level << CLIC_IRQ_LEVEL_SHIFT | if shv { CLIC_IRQ_SHV } else { 0 })
@@ -417,6 +429,34 @@ fn clic_mie_blocks_and_wfi_wakes() {
     cpu.mil = 0;
     assert_eq!(core(&mut cpu).kind, emu_core::StepKind::TrapBefore(Trap::Interrupt(1)));
     assert_eq!(cpu.pc, BASE + 0x200);
+}
+
+/// An interrupt between LR and SC breaks the P4 core's reservation, so the SC cannot overwrite
+/// what the handler stored there (the RISC-V unprivileged ISA allows an SC to fail at any time).
+/// The C6 core keeps its reservation across a trap, as before.
+#[test]
+fn a_trap_breaks_the_p4_cores_reservation() {
+    // lr.w a0,(a1); sc.w a2,a3,(a1)
+    let prog = asm("1005a52f 18d5a62f");
+    let handler = asm("c194 30200073");                               // sw a3,0(a1); mret
+    for (cpu, sc_result) in [(Cpu::new_esp32p4(), 1), (Cpu::new_rv32imac(), 0)] {
+        let (mut cpu, mut ram) = machine_on(cpu, &prog, "lr.w a0,(a1)");
+        ram.mem[0x200..0x200 + handler.len()].copy_from_slice(&handler);
+        cpu.x[11] = BASE + 0x100; cpu.x[13] = 0x55;
+        cpu.write_csr(csr::MTVEC, BASE + 0x200 + if cpu.clic { 3 } else { 0 });
+        step(&mut cpu, &mut ram).unwrap();
+        cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+        cpu.set_irq(if cpu.clic { clic_irq(4, 0x3f, false) } else { Some(4) });
+        assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Interrupt(4)));
+        cpu.set_irq(None);
+        cpu.x[13] = 0x66;
+        step(&mut cpu, &mut ram).unwrap();                            // the handler's store
+        step(&mut cpu, &mut ram).unwrap();                            // mret
+        cpu.x[13] = 0x77;
+        step(&mut cpu, &mut ram).unwrap();                            // sc.w
+        assert_eq!(cpu.x[12], sc_result, "SC result on the {} core", if cpu.clic { "P4" } else { "C6" });
+        assert_eq!(ram.mem[0x100], if sc_result == 1 { 0x66 } else { 0x77 });
+    }
 }
 
 /// A fault on the hardware-vectoring table read is an instruction access fault at the table

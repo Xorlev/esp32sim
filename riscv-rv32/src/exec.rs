@@ -51,6 +51,7 @@ fn clic_take<B: Bus>(cpu: &mut Cpu, bus: &mut B, irq: u32, pc: u32) -> StepOutco
     cpu.insn_count += 1; cpu.cycle_count += 1;
     cpu.mepc = pc;
     cpu.mtval = 0;
+    cpu.reservation = None;
     let mpie = if cpu.mstatus & mstatus::MIE != 0 { mstatus::MPIE } else { 0 };
     cpu.mstatus = (cpu.mstatus & !(mstatus::MIE | mstatus::MPIE)) | mpie | mstatus::MPP;
     cpu.mcause = mcause::INTERRUPT | cpu.mil << mcause::MPIL_SHIFT | id;
@@ -191,10 +192,12 @@ pub fn exec_insn<B: Bus>(cpu: &mut Cpu, bus: &mut B, i: &Insn, pc: u32) -> Resul
 
         Fence | FenceI => {}
 
-        // RV32A. One core, so a reservation is only ever lost to our own SC or a trap in between.
-        LrW => { let v = ld!(cpu, bus, read32, a, pc); cpu.reservation = Some(a); cpu.set(i.rd, v); }
+        // RV32A. The core keeps its own reservation; the bus says whether another hart's store
+        // has broken it (one hart: never).
+        LrW => { let v = ld!(cpu, bus, read32, a, pc); cpu.reservation = Some(a); bus.reserve(a); cpu.set(i.rd, v); }
         ScW => {
-            if cpu.reservation == Some(a) { st!(cpu, bus, write32, a, b, pc); cpu.set(i.rd, 0); } else { cpu.set(i.rd, 1); }
+            let held = bus.reservation_held(a);
+            if cpu.reservation == Some(a) && held { st!(cpu, bus, write32, a, b, pc); cpu.set(i.rd, 0); } else { cpu.set(i.rd, 1); }
             cpu.reservation = None;
         }
         AmoSwapW | AmoAddW | AmoXorW | AmoAndW | AmoOrW | AmoMinW | AmoMaxW | AmoMinuW | AmoMaxuW => {
