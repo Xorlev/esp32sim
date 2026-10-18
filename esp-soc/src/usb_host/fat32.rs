@@ -1,11 +1,13 @@
 //! FAT32 on the host side of a block device, for the files a host writes to a mass-storage
 //! device: mount (an MBR's first FAT32 partition, or a volume from LBA 0), list, read, and
-//! write 8.3 files in the root directory in a vfat-like pattern: the directory entry first, the
-//! data in chunks as it comes, the FAT sectors covering each chunk's clusters (both copies), and
-//! at the end the entry's size and first cluster and FSInfo. It is not Linux's writeback order
-//! (page-cache batches, buffered metadata, periodic inode writeback, FSInfo at sync or unmount):
-//! a file cut off mid-write here keeps size 0 and no cluster, its data orphaned. Field offsets:
-//! Microsoft FAT32 File System Specification 1.03 (fatgen103).
+//! write files in a vfat-like pattern: the directory entry first, the data in chunks as it comes,
+//! the FAT sectors covering each chunk's clusters (both copies), and at the end the entry's size
+//! and first cluster and FSInfo. It is not Linux's writeback order (page-cache batches, buffered
+//! metadata, periodic inode writeback, FSInfo at sync or unmount): a file cut off mid-write here
+//! keeps size 0 and no cluster, its data orphaned. Paths reach subdirectories (`mkdir_all`), and
+//! a name that is not an upper-case 8.3 name gets long-name entries before its short one, as
+//! Windows writes them. Field offsets: Microsoft FAT32 File System Specification 1.03
+//! (fatgen103), "FAT Directory Structure" and "FAT Long Directory Entries".
 
 /// Blocks on the other end, by number.
 pub trait BlockDevice {
@@ -72,7 +74,7 @@ pub fn write_paced(fs: &mut Fat32, dev: &mut dyn BlockDevice, name: &str, data: 
     let t0 = dev.now_ns();
     let mut st = PacedStats { chunks: data.len().div_ceil(chunk), ..Default::default() };
     let (mut half_t, mut half_bytes) = (t0, 0u64);
-    let mut f = fs.create(dev, name)?;
+    let mut f = fs.create_path(dev, name)?;
     f.fat_every = fat_every;
     for (i, part) in data.chunks(chunk).enumerate() {
         let due = t0 + i as u64 * gap_ns;
@@ -136,6 +138,102 @@ fn display_name(raw: &[u8]) -> String {
     let ext = String::from_utf8_lossy(&raw[8..11]).trim_end().to_string();
     if ext.is_empty() { base } else { format!("{base}.{ext}") }
 }
+
+const ATTR_VOLUME_ID: u8 = 0x08;
+const ATTR_DIRECTORY: u8 = 0x10;
+const ATTR_ARCHIVE: u8 = 0x20;
+const ATTR_LONG_NAME: u8 = 0x0f;
+/// Where a long-name entry keeps its 13 UCS-2 characters.
+const LFN_SLOTS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+
+/// The checksum of a short name that its long-name entries carry.
+pub fn lfn_checksum(short: &[u8; 11]) -> u8 { short.iter().fold(0u8, |s, &b| s.rotate_right(1).wrapping_add(b)) }
+
+/// The name a short entry reads as, with Windows NT's lower-case flags (byte 12: 0x08 the base,
+/// 0x10 the extension), which Linux and FatFs honour.
+fn short_display(e: &[u8]) -> String {
+    let (base, ext) = (String::from_utf8_lossy(&e[..8]).trim_end().to_string(), String::from_utf8_lossy(&e[8..11]).trim_end().to_string());
+    let base = if e[12] & 0x08 != 0 { base.to_ascii_lowercase() } else { base };
+    let ext = if e[12] & 0x10 != 0 { ext.to_ascii_lowercase() } else { ext };
+    if ext.is_empty() { base } else { format!("{base}.{ext}") }
+}
+
+/// The short name a long one is stored under: upper case, characters a short name cannot hold
+/// as `_`, and where anything was lost the base cut to fit `~N` with the first N not `taken`
+/// (fatgen103, "Basis-Name Generation Algorithm").
+fn basis_name(name: &str, taken: impl Fn(&[u8; 11]) -> bool) -> Result<[u8; 11], String> {
+    let valid = |c: u8| c.is_ascii_alphanumeric() || b"$%'-_@~`!(){}^#&".contains(&c);
+    let upper = name.to_ascii_uppercase();
+    let trimmed = upper.trim_start_matches('.');
+    let mut lossy = trimmed.len() != upper.len();
+    let (base, ext) = trimmed.rsplit_once('.').unwrap_or((trimmed, ""));
+    let mut conv = |s: &str, n: usize| -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in s.bytes() {
+            if c == b' ' || c == b'.' { lossy = true; continue; }
+            let c = if valid(c) { c } else { lossy = true; b'_' };
+            if out.len() < n { out.push(c) } else { lossy = true }
+        }
+        out
+    };
+    let (b, e) = (conv(base, 8), conv(ext, 3));
+    if b.is_empty() { return Err(format!("{name}: no short name to make of it")); }
+    let mut raw = [b' '; 11];
+    raw[8..8 + e.len()].copy_from_slice(&e);
+    if !lossy {
+        raw[..b.len()].copy_from_slice(&b);
+        if !taken(&raw) { return Ok(raw); }
+    }
+    for n in 1..1_000_000u32 {
+        let tail = format!("~{n}");
+        let keep = b.len().min(8 - tail.len());
+        raw[..8].fill(b' ');
+        raw[..keep].copy_from_slice(&b[..keep]);
+        raw[keep..keep + tail.len()].copy_from_slice(tail.as_bytes());
+        if !taken(&raw) { return Ok(raw); }
+    }
+    Err(format!("{name}: every short name is taken"))
+}
+
+/// A short entry of `attr` for `raw` at `cluster`, size 0, with the fixed time stamp.
+fn short_entry(raw: &[u8; 11], attr: u8, cluster: u32) -> [u8; 32] {
+    let mut e = [0u8; 32];
+    e[..11].copy_from_slice(raw);
+    e[11] = attr;
+    // a fixed time stamp, 2024-01-01 00:00, so the image is the same on every run
+    let date = ((2024 - 1980) << 9 | 1 << 5 | 1) as u16;
+    for at in [16, 18, 24] { e[at..at + 2].copy_from_slice(&date.to_le_bytes()); }
+    e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+    e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    e
+}
+
+/// The long-name entries for `name` stored under `short`, in the order they go in the directory:
+/// the last part first with 0x40 in its ordinal, the name ended by 0x0000 and padded with 0xFFFF.
+fn long_entries(name: &str, short: &[u8; 11]) -> Result<Vec<[u8; 32]>, String> {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    if units.is_empty() || units.len() > 255 { return Err(format!("{name}: a long name holds 1 to 255 characters")); }
+    let parts = units.len().div_ceil(13);
+    let sum = lfn_checksum(short);
+    Ok((1..=parts).rev().map(|ord| {
+        let mut e = [0u8; 32];
+        e[0] = ord as u8 | if ord == parts { 0x40 } else { 0 };
+        e[11] = ATTR_LONG_NAME;
+        e[13] = sum;
+        for (i, &at) in LFN_SLOTS.iter().enumerate() {
+            let k = (ord - 1) * 13 + i;
+            let u = match k.cmp(&units.len()) { std::cmp::Ordering::Less => units[k], std::cmp::Ordering::Equal => 0, _ => 0xffff };
+            e[at..at + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        e
+    }).collect())
+}
+
+/// A directory entry as `Fat32::dir_entries` finds it, with its short name.
+#[derive(Clone, Debug)]
+struct Found { entry: DirEntry, short: [u8; 11] }
+
+fn components(path: &str) -> Vec<&str> { path.split('/').filter(|c| !c.is_empty()).collect() }
 
 impl Fat32 {
     pub fn mount(dev: &mut dyn BlockDevice) -> Result<Self, String> {
@@ -298,6 +396,177 @@ impl Fat32 {
         self.allocated = 0;
         dev.write_blocks(lba, &s)
     }
+
+    fn dir_sectors(&self, dev: &mut dyn BlockDevice, cluster: u32) -> Result<Vec<u64>, String> {
+        let spc = self.sectors_per_cluster as u64;
+        Ok(self.chain(dev, cluster)?.into_iter().flat_map(|c| { let l = self.cluster_lba(c); (0..spc).map(move |i| l + i) }).collect())
+    }
+
+    /// The entries of the directory at `cluster` but `.`, `..` and the volume label, each under
+    /// its long name where a long name with the short entry's checksum comes right before it.
+    fn dir_entries(&self, dev: &mut dyn BlockDevice, cluster: u32) -> Result<Vec<Found>, String> {
+        struct Long { units: Vec<u16>, sum: u8, next: usize }
+        let mut out = Vec::new();
+        let mut long: Option<Long> = None;
+        for lba in self.dir_sectors(dev, cluster)? {
+            let mut s = [0u8; 512];
+            dev.read_blocks(lba, &mut s)?;
+            for e in s.as_chunks::<32>().0 {
+                if e[0] == 0 { return Ok(out); }
+                if e[0] == 0xe5 { long = None; continue; }
+                if e[11] & 0x3f == ATTR_LONG_NAME {
+                    let ord = (e[0] & 0x3f) as usize;
+                    if e[0] & 0x40 != 0 { long = Some(Long { units: vec![0xffff; ord * 13], sum: e[13], next: ord }); }
+                    long = long.take().filter(|l| ord >= 1 && ord == l.next && e[13] == l.sum).map(|mut l| {
+                        for (i, &at) in LFN_SLOTS.iter().enumerate() { l.units[(ord - 1) * 13 + i] = get16(e, at); }
+                        l.next = ord - 1;
+                        l
+                    });
+                    continue;
+                }
+                let short: [u8; 11] = e[..11].try_into().unwrap();
+                let name = match long.take() {
+                    Some(l) if l.next == 0 && l.sum == lfn_checksum(&short) => {
+                        let end = l.units.iter().position(|&u| u == 0 || u == 0xffff).unwrap_or(l.units.len());
+                        String::from_utf16_lossy(&l.units[..end])
+                    }
+                    _ => short_display(e),
+                };
+                if e[11] & ATTR_VOLUME_ID != 0 || short[0] == b'.' { continue; }
+                let entry = DirEntry { name, size: get32(e, 28), cluster: (get16(e, 20) as u32) << 16 | get16(e, 26) as u32, attr: e[11] };
+                out.push(Found { entry, short });
+            }
+        }
+        Ok(out)
+    }
+
+    fn find(&self, dev: &mut dyn BlockDevice, dir: u32, name: &str) -> Result<Option<Found>, String> {
+        Ok(self.dir_entries(dev, dir)?.into_iter().find(|f| f.entry.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// The first cluster of the directory the components name, from the root.
+    fn dir_of(&self, dev: &mut dyn BlockDevice, comps: &[&str]) -> Result<u32, String> {
+        let mut dir = self.root_cluster;
+        for (i, c) in comps.iter().enumerate() {
+            let f = self.find(dev, dir, c)?.ok_or_else(|| format!("{}: no such directory", comps[..=i].join("/")))?;
+            if f.entry.attr & ATTR_DIRECTORY == 0 { return Err(format!("{}: not a directory", comps[..=i].join("/"))); }
+            dir = if f.entry.cluster == 0 { self.root_cluster } else { f.entry.cluster };
+        }
+        Ok(dir)
+    }
+
+    /// The entries of the directory at `path` (`/`-separated from the root; "" is the root).
+    pub fn list(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>, String> {
+        let dir = self.dir_of(dev, &components(path))?;
+        Ok(self.dir_entries(dev, dir)?.into_iter().map(|f| f.entry).collect())
+    }
+
+    /// The entry at `path`, if there is one.
+    pub fn stat(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Option<DirEntry>, String> {
+        let comps = components(path);
+        let Some((name, parents)) = comps.split_last() else { return Err("the root has no entry".into()) };
+        let dir = self.dir_of(dev, parents)?;
+        Ok(self.find(dev, dir, name)?.map(|f| f.entry))
+    }
+
+    /// The contents of the file at `path`.
+    pub fn read_path(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u8>, String> {
+        let e = self.stat(dev, path)?.filter(|e| e.attr & (ATTR_DIRECTORY | ATTR_VOLUME_ID) == 0).ok_or_else(|| format!("{path}: no such file"))?;
+        let chain = if e.size == 0 { Vec::new() } else { self.chain(dev, e.cluster)? };
+        let mut out = Vec::with_capacity(e.size as usize);
+        let mut i = 0;
+        while i < chain.len() && out.len() < e.size as usize {
+            let mut j = i + 1;
+            while j < chain.len() && chain[j] == chain[j - 1] + 1 && (j - i + 1) * self.cluster_bytes() <= 128 << 10 { j += 1; }
+            let mut buf = vec![0u8; (j - i) * self.cluster_bytes()];
+            dev.read_blocks(self.cluster_lba(chain[i]), &mut buf)?;
+            out.extend_from_slice(&buf);
+            i = j;
+        }
+        if out.len() < e.size as usize { return Err(format!("{path}: the chain holds {} of {} bytes", out.len(), e.size)); }
+        out.truncate(e.size as usize);
+        Ok(out)
+    }
+
+    /// The entries that store `name` in the directory at `dir`: long-name entries unless it is an
+    /// upper-case 8.3 name, then the short entry.
+    fn name_entries(&self, dev: &mut dyn BlockDevice, dir: u32, name: &str, attr: u8, cluster: u32) -> Result<Vec<[u8; 32]>, String> {
+        if let Some(raw) = short_name(name).ok().filter(|_| name == name.to_ascii_uppercase()) { return Ok(vec![short_entry(&raw, attr, cluster)]); }
+        let shorts: Vec<[u8; 11]> = self.dir_entries(dev, dir)?.into_iter().map(|f| f.short).collect();
+        let raw = basis_name(name, |r| shorts.contains(r))?;
+        let mut entries = long_entries(name, &raw)?;
+        entries.push(short_entry(&raw, attr, cluster));
+        Ok(entries)
+    }
+
+    /// Write `entries` into the first run of free slots of the directory at `dir` that holds them
+    /// all, a sector at a time; where the last one, the short entry, went.
+    fn put_entries(&self, dev: &mut dyn BlockDevice, dir: u32, entries: &[[u8; 32]]) -> Result<(u64, usize), String> {
+        let sectors = self.dir_sectors(dev, dir)?;
+        let mut cache: Vec<(u64, [u8; 512])> = Vec::new();
+        let (mut start, mut run, mut ended) = (0, 0, false);
+        'scan: for (i, &lba) in sectors.iter().enumerate() {
+            let mut s = [0u8; 512];
+            dev.read_blocks(lba, &mut s)?;
+            cache.push((lba, s));
+            for slot in 0..16 {
+                let first = s[slot * 32];
+                ended |= first == 0;
+                if ended || first == 0xe5 {
+                    if run == 0 { start = i * 16 + slot; }
+                    run += 1;
+                    if run == entries.len() { break 'scan; }
+                } else { run = 0; }
+            }
+        }
+        if run < entries.len() { return Err("the directory is full (it is not extended)".into()); }
+        for (k, e) in entries.iter().enumerate() {
+            let at = start + k;
+            cache[at / 16].1[at % 16 * 32..at % 16 * 32 + 32].copy_from_slice(e);
+        }
+        let (first, last) = (start / 16, (start + entries.len() - 1) / 16);
+        for (lba, s) in &cache[first..=last] { dev.write_blocks(*lba, s)?; }
+        let end = start + entries.len() - 1;
+        Ok((sectors[end / 16], end % 16))
+    }
+
+    /// Make the directories of `path` that are missing, as `mkdir -p` does; the first cluster of
+    /// the last one. A new directory is one cluster: its FAT entry first, then the cluster with
+    /// `.` and `..`, then its entry in the parent, then FSInfo.
+    pub fn mkdir_all(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<u32, String> {
+        let mut dir = self.root_cluster;
+        for c in components(path) {
+            if let Some(f) = self.find(dev, dir, c)? {
+                if f.entry.attr & ATTR_DIRECTORY == 0 { return Err(format!("{c}: exists and is not a directory")); }
+                dir = f.entry.cluster;
+                continue;
+            }
+            let new = self.allocate(dev, 1)?[0];
+            self.write_fat(dev, &[(new, EOC)])?;
+            let mut buf = vec![0u8; self.cluster_bytes()];
+            buf[..32].copy_from_slice(&short_entry(b".          ", ATTR_DIRECTORY, new));
+            buf[32..64].copy_from_slice(&short_entry(b"..         ", ATTR_DIRECTORY, if dir == self.root_cluster { 0 } else { dir }));
+            dev.write_blocks(self.cluster_lba(new), &buf)?;
+            let entries = self.name_entries(dev, dir, c, ATTR_DIRECTORY, new)?;
+            self.put_entries(dev, dir, &entries)?;
+            self.write_fsinfo(dev)?;
+            dir = new;
+        }
+        Ok(dir)
+    }
+
+    /// Start a file at `path` in a directory that exists: its entries written at once, size 0 and
+    /// no cluster, as `open(O_CREAT)` leaves them. An upper-case 8.3 name in the root is `create`.
+    pub fn create_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<FileWriter, String> {
+        let comps = components(path);
+        let Some((name, parents)) = comps.split_last() else { return Err("a file needs a name".into()) };
+        if parents.is_empty() && short_name(name).is_ok() && *name == name.to_ascii_uppercase() { return self.create(dev, name); }
+        let dir = self.dir_of(dev, parents)?;
+        if self.find(dev, dir, name)?.is_some() { return Err(format!("{path}: exists")); }
+        let entries = self.name_entries(dev, dir, name, ATTR_ARCHIVE, 0)?;
+        let (dir_lba, dir_slot) = self.put_entries(dev, dir, &entries)?;
+        Ok(FileWriter { dir_lba, dir_slot, first: 0, last: 0, size: 0, pending: Vec::new(), fat_every: 1, chunks: 0 })
+    }
 }
 
 /// A file being written.
@@ -379,4 +648,61 @@ pub fn file_bytes(name: &str, len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// A file of `len` bytes in the ISO base media file format with its index box last: top-level
+/// boxes `ftyp`, an `mdat` holding `file_bytes(name, ..)`, and a `moov` (ISO/IEC 14496-12,
+/// "Object Structure"), which is what a reader checks for a complete file. `len` is at least 48.
+pub fn bmff_bytes(name: &str, len: usize) -> Vec<u8> {
+    const FTYP: [u8; 24] = *b"\0\0\0\x18ftypisom\0\0\x02\0isommp41";
+    const MOOV: [u8; 16] = *b"\0\0\0\x10moov\0\0\0\x08mvhd";
+    let mdat = len.max(48) - FTYP.len() - MOOV.len();
+    let mut out = Vec::with_capacity(len.max(48));
+    out.extend_from_slice(&FTYP);
+    out.extend_from_slice(&(mdat as u32).to_be_bytes());
+    out.extend_from_slice(b"mdat");
+    out.extend_from_slice(&file_bytes(name, mdat - 8));
+    out.extend_from_slice(&MOOV);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_names_for_long_ones_follow_the_basis_name_rules() {
+        let none = |_: &[u8; 11]| false;
+        assert_eq!(&basis_name("entry.bin", none).unwrap(), b"ENTRY   BIN", "fits, so no tail");
+        assert_eq!(&basis_name("2026-01-01_00-00-00", none).unwrap(), b"2026-0~1   ");
+        assert_eq!(&basis_name("HostData", none).unwrap(), b"HOSTDATA   ");
+        assert_eq!(&basis_name("a+b.long-ext", none).unwrap(), b"A_B~1   LON", "an invalid character and a long extension");
+        assert_eq!(&basis_name(".hidden", none).unwrap(), b"HIDDEN~1   ", "a leading period is dropped, which is a loss");
+        let taken = [*b"2026-0~1   ", *b"2026-0~2   "];
+        assert_eq!(&basis_name("2026-01-01_00-02-00", |r| taken.contains(r)).unwrap(), b"2026-0~3   ");
+        assert_eq!(&basis_name("entry.bin", |r| r == b"ENTRY   BIN").unwrap(), b"ENTRY~1 BIN");
+    }
+
+    /// The checksum is fatgen103's rotate-right-and-add over the 11 bytes; a long name of 19
+    /// characters takes two entries, the second-numbered first with 0x40, ended by 0x0000 and
+    /// padded with 0xFFFF.
+    #[test]
+    fn long_entries_carry_the_name_in_ucs2_and_the_short_name_checksum() {
+        assert_eq!(lfn_checksum(b"           "), (0..11).fold(0u8, |s, _| s.rotate_right(1).wrapping_add(b' ')));
+        assert_ne!(lfn_checksum(b"2026-0~1   "), lfn_checksum(b"2026-0~2   "));
+        let short = *b"2026-0~1   ";
+        let e = long_entries("2026-01-01_00-00-00", &short).unwrap();
+        assert_eq!(e.len(), 2);
+        assert_eq!((e[0][0], e[1][0]), (0x42, 0x01));
+        for x in &e { assert_eq!((x[11], x[12], x[13], x[26], x[27]), (ATTR_LONG_NAME, 0, lfn_checksum(&short), 0, 0)); }
+        let units = |x: &[u8; 32]| LFN_SLOTS.iter().map(|&at| get16(x, at)).collect::<Vec<u16>>();
+        let name: Vec<u16> = "2026-01-01_00-00-00".encode_utf16().collect();
+        assert_eq!(units(&e[1]), name[..13]);
+        let mut tail = name[13..].to_vec();
+        tail.push(0);
+        tail.resize(13, 0xffff);
+        assert_eq!(units(&e[0]), tail);
+        assert_eq!(long_entries("x".repeat(13).as_str(), &short).unwrap().len(), 1, "exactly 13: no terminator needed");
+        assert!(long_entries("", &short).is_err());
+    }
 }

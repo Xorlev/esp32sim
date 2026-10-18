@@ -471,3 +471,92 @@ fn script_lines_parse_with_their_tolerance_and_faults() {
                        (6, Cmd::Tolerate(Box::new(Cmd::FatWrite { name: "A.BIN".into(), bytes: 100, chunk: 64 << 10, gap_ms: 16, fat_every: 1 })))]);
     assert!(parse("inject reset 5").is_err() && parse("recovery windows").is_err());
 }
+
+/// A tree of three directory levels with long names, a lower-case file
+/// name under a long entry, two directories whose long names share a short basis, and the files
+/// read back by path; the root keeps its 8.3 view.
+#[test]
+fn fat32_directories_and_long_names_round_trip() {
+    use super::fat32::bmff_bytes;
+    let img = std::env::temp_dir().join(format!("usbhost-fat-tree-{}.img", std::process::id()));
+    sd_image::fat32(&img, 64 << 20, 512, "").unwrap();
+    let mut mem = MemDisk(std::fs::read(&img).unwrap());
+    let _ = std::fs::remove_file(&img);
+    let mut fs = Fat32::mount(&mut mem).unwrap();
+    let (a, b) = ("HostData/FirstGroup/2026-01-01_00-00-00", "HostData/FirstGroup/2026-01-01_00-01-00");
+    let da = fs.mkdir_all(&mut mem, a).unwrap();
+    let db = fs.mkdir_all(&mut mem, b).unwrap();
+    assert_eq!(fs.mkdir_all(&mut mem, a).unwrap(), da, "an existing directory is found, not made again");
+    let content = bmff_bytes("entry-a", 100_000);
+    assert_eq!((&content[4..8], &content[28..32], &content[content.len() - 12..content.len() - 8]), (&b"ftyp"[..], &b"mdat"[..], &b"moov"[..]));
+    assert_eq!(u32::from_be_bytes(content[24..28].try_into().unwrap()) as usize + 24 + 16, content.len(), "the boxes tile the file");
+    write_paced(&mut fs, &mut mem, &format!("{a}/entry.bin"), &content, 64 << 10, 0, 1).unwrap();
+    assert_eq!(fs.read_path(&mut mem, &format!("{a}/entry.bin")).unwrap(), content);
+    assert_eq!(fs.read_path(&mut mem, &format!("{a}/ENTRY.BIN")).unwrap(), content, "names compare without case");
+    let names = |fs: &Fat32, mem: &mut MemDisk, p: &str| fs.list(mem, p).unwrap().into_iter().map(|e| e.name).collect::<Vec<_>>();
+    assert_eq!(names(&fs, &mut mem, "HostData/FirstGroup"), ["2026-01-01_00-00-00", "2026-01-01_00-01-00"]);
+    assert_eq!(names(&fs, &mut mem, a), ["entry.bin"]);
+    assert!(names(&fs, &mut mem, b).is_empty());
+    assert_eq!(fs.list_root(&mut mem).unwrap().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["HOSTDATA"], "the root's short view");
+    assert!(fs.create_path(&mut mem, &format!("{a}/entry.bin")).is_err(), "an existing file");
+    assert!(fs.create_path(&mut mem, "HostData/ThirdGroup/x.bin").is_err(), "a missing directory");
+    assert!(fs.mkdir_all(&mut mem, &format!("{a}/entry.bin/x")).is_err(), "a file in the way");
+    // the stamp directories: `.` is itself, `..` the parent; the parent's entries a long name
+    // and the short ones 2026-0~1 and 2026-0~2
+    let group = fs.stat(&mut mem, "HostData/FirstGroup").unwrap().unwrap().cluster;
+    let top_dir = fs.stat(&mut mem, "HostData").unwrap().unwrap().cluster;
+    let cluster = |c: u32| { let o = (fs.data_lba + (c as u64 - 2) * fs.sectors_per_cluster as u64) as usize * 512; mem.0[o..o + 512].to_vec() };
+    let d = cluster(db);
+    assert_eq!((&d[..11], u16::from_le_bytes([d[26], d[27]]) as u32), (&b".          "[..], db));
+    assert_eq!((&d[32..43], u16::from_le_bytes([d[58], d[59]]) as u32), (&b"..         "[..], group));
+    let s = cluster(group);
+    let shorts: Vec<&[u8]> = s.chunks(32).filter(|e| e[0] != 0 && e[11] != 0x0f).map(|e| &e[..11]).collect();
+    assert_eq!(shorts, [&b".          "[..], b"..         ", b"2026-0~1   ", b"2026-0~2   "]);
+    let top = cluster(top_dir);
+    assert_eq!(u16::from_le_bytes([top[58], top[59]]), 0, "`..` of a directory in the root is cluster 0");
+}
+
+/// The same tree on a 3 GiB card with 32 KiB clusters, checked by the system's FAT checker
+/// (`sd_image::fsck`): the long names, their checksums, `.` and `..`, the chains and the free
+/// count must all satisfy it.
+#[test]
+#[ignore = "needs a FAT checker: fsck_msdos (macOS) or fsck.fat (Linux), or FSCK_FAT"]
+fn external_fat32_tree_passes_fsck() {
+    use super::fat32::bmff_bytes;
+    let img = std::env::temp_dir().join(format!("usbhost-fat-fsck-{}.img", std::process::id()));
+    sd_image::fat32(&img, 3 << 30, 32 << 10, "ESP32SIM").unwrap();
+    let mut file = FileDisk(std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap());
+    let mut fs = Fat32::mount(&mut file).unwrap();
+    for (i, stamp) in ["2026-01-01_00-00-00", "2026-01-01_00-01-00", "2026-01-01_00-02-00"].iter().enumerate() {
+        let dir = format!("HostData/{}/{stamp}", if i == 2 { "SecondGroup" } else { "FirstGroup" });
+        fs.mkdir_all(&mut file, &dir).unwrap();
+        let content = bmff_bytes(stamp, 300_000 + i * 70_000);
+        write_paced(&mut fs, &mut file, &format!("{dir}/entry.bin"), &content, 64 << 10, 0, 1).unwrap();
+        assert_eq!(fs.read_path(&mut file, &format!("{dir}/entry.bin")).unwrap(), content);
+    }
+    let mut f = fs.create(&mut file, "README.TXT").unwrap();
+    f.write(&mut fs, &mut file, b"8.3 in the root").unwrap();
+    f.close(&mut fs, &mut file).unwrap();
+    drop(file);
+    let r = sd_image::fsck(&img);
+    let _ = std::fs::remove_file(&img);
+    let out = r.unwrap_or_else(|e| panic!("{e}"));
+    eprintln!("{out}");
+}
+
+/// A card image file as a block device.
+struct FileDisk(std::fs::File);
+impl super::fat32::BlockDevice for FileDisk {
+    fn block_size(&self) -> u32 { 512 }
+    fn blocks(&self) -> u64 { self.0.metadata().unwrap().len() / 512 }
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), String> {
+        use std::io::{Read, Seek};
+        self.0.seek(std::io::SeekFrom::Start(lba * 512)).map_err(|e| e.to_string())?;
+        self.0.read_exact(buf).map_err(|e| e.to_string())
+    }
+    fn write_blocks(&mut self, lba: u64, data: &[u8]) -> Result<(), String> {
+        use std::io::{Seek, Write};
+        self.0.seek(std::io::SeekFrom::Start(lba * 512)).map_err(|e| e.to_string())?;
+        self.0.write_all(data).map_err(|e| e.to_string())
+    }
+}
