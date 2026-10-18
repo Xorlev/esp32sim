@@ -38,14 +38,19 @@ pub fn is_beacon(f: &[u8]) -> bool { f.len() >= 2 && f[0] & 0x0c == 0 && (f[0] >
 pub const RSN_IE: &[u8] = &[48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0];
 
 #[derive(Clone, Debug)]
-pub struct ApConfig { pub ssid: String, pub bssid: [u8; 6], pub channel: u8, pub psk: Option<String> }
+pub struct ApConfig {
+    pub ssid: String, pub bssid: [u8; 6], pub channel: u8, pub psk: Option<String>,
+    /// the network's clock at power-on, seconds since 1970 (`epoch=`); without it the host's clock
+    /// at the first SNTP answer
+    pub epoch_s: Option<u64>,
+}
 
 impl ApConfig {
     /// Parse the shared CLI/browser AP configuration. Unknown keys are errors so a
     /// misspelled passphrase option cannot silently configure an open network.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let mut cfg = Self {
-            ssid: "esp32sim".into(), bssid: [0x02, 0x53, 0x49, 0x4d, 0x00, 0x01], channel: 6, psk: None,
+            ssid: "esp32sim".into(), bssid: [0x02, 0x53, 0x49, 0x4d, 0x00, 0x01], channel: 6, psk: None, epoch_s: None,
         };
         if spec.is_empty() { return Ok(cfg); }
         for entry in spec.split(',') {
@@ -58,6 +63,7 @@ impl ApConfig {
                         .ok_or_else(|| format!("invalid WiFi channel '{value}': expected 1 through 14"))?;
                 }
                 "psk" | "password" | "pass" => cfg.psk = Some(value.to_string()),
+                "epoch" => cfg.epoch_s = Some(value.parse().map_err(|_| format!("invalid epoch '{value}': expected seconds since 1970"))?),
                 "bssid" => {
                     let invalid = || format!("invalid WiFi BSSID '{value}': expected six hexadecimal octets");
                     let mut octets = value.split(':');
@@ -395,6 +401,8 @@ pub struct StationLink {
     rx_frames: u64,
     /// received frames with no usable descriptor
     rx_dropped: u64,
+    /// frames on the air before the station's receive ring was set up
+    rx_unarmed: u64,
     /// relayed frames that were too long or found the relay queue full
     tx_dropped: u64,
 }
@@ -424,6 +432,7 @@ impl StationLink {
     pub fn attach_new(&mut self, cfg: ApConfig, nat: Option<crate::nat::Nat>, debug: &crate::DebugFlags) {
         let mut net = crate::net::VirtualNet::new(debug.has("net"));
         net.nat = nat;
+        net.epoch_us = cfg.epoch_s.map(|s| s.saturating_mul(1_000_000));
         self.attach(Some(VirtualAp::new(cfg, debug.has("wifi-frames"))), Some(net));
     }
     /// What a guest reboot keeps: the host's access point, network and relay mode. The queues, the
@@ -442,6 +451,7 @@ impl StationLink {
     pub fn tx_frames(&self) -> u64 { self.tx_frames }
     pub fn rx_frames(&self) -> u64 { self.rx_frames }
     pub fn rx_dropped(&self) -> u64 { self.rx_dropped }
+    pub fn rx_unarmed(&self) -> u64 { self.rx_unarmed }
     pub fn tx_dropped(&self) -> u64 { self.tx_dropped }
 
     /// The station sent `frame` at `now_us`: the access point hears it, and what it passes on as
@@ -497,6 +507,8 @@ impl StationLink {
     pub fn rx_delivered(&mut self, desc: u32) { self.last_rx_desc = desc; self.rx_frames += 1; }
     /// A frame found no usable descriptor.
     pub fn drop_rx(&mut self) { self.rx_dropped += 1; }
+    /// A frame went by before the driver gave the MAC its receive ring.
+    pub fn drop_rx_unarmed(&mut self) { self.rx_unarmed += 1; }
 
     /// The network behind the access point answers what the station sent at once and reads the
     /// host's sockets every `NET_POLL_US`. Nothing to do in relay mode: the host has the frames.
@@ -535,7 +547,10 @@ impl StationLink {
     /// the station never used the radio and there is no network.
     pub fn report(&self) -> String {
         let mut lines = Vec::new();
-        if self.tx_frames + self.rx_frames > 0 { lines.push(format!("[emu] wifi: {} frames sent by the station, {} received ({} dropped: no descriptor){}", self.tx_frames, self.rx_frames, self.rx_dropped, self.ap.as_ref().map_or(String::new(), |ap| format!("; AP: {} beacons, {} probe responses, {} data frames from the station, state {:?}", ap.stats.0, ap.stats.1, ap.stats.2, ap.state)))); }
+        if self.tx_frames + self.rx_frames + self.rx_dropped + self.rx_unarmed > 0 {
+            let unarmed = if self.rx_unarmed > 0 { format!(", {} before the receive ring was set up", self.rx_unarmed) } else { String::new() };
+            lines.push(format!("[emu] wifi: {} frames sent by the station, {} received ({} dropped: no descriptor{unarmed}){}", self.tx_frames, self.rx_frames, self.rx_dropped, self.ap.as_ref().map_or(String::new(), |ap| format!("; AP: {} beacons, {} probe responses, {} data frames from the station, state {:?}", ap.stats.0, ap.stats.1, ap.stats.2, ap.state))));
+        }
         if let Some(n) = &self.net { lines.push(format!("[emu] net: {} DHCP leases, {} ARP replies, {} DNS answers, {} NTP answers, {} TCP refused, {} pings, {} frames ignored", n.dhcp_acks, n.arp_replies, n.dns_answers, n.ntp_answers, n.tcp_rejects, n.pings, n.unhandled));
             if let Some(t) = &n.nat { lines.push(format!("[emu] nat: {} TCP connections ({} failed), {} UDP flows ({} evicted, {} send errors), {} bytes out, {} bytes in", t.tcp_opened, t.tcp_refused, t.udp_flows, t.udp_evicted, t.udp_send_errors, t.bytes_to_host, t.bytes_to_guest)); } }
         lines.join("\n")

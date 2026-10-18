@@ -178,7 +178,7 @@ fn the_coproc_spec_parses_its_keys() {
 const FW: &str = "web/wasm/fw/public";
 
 /// The committed ESP-Hosted slave on a C6 booted from its mask ROM, the virtual access point on
-/// its radio and no NAT behind it.
+/// its radio, no NAT behind it, and the network's clock fixed so SNTP answers the same every run.
 fn hosted_slave() -> esp32c6::Machine {
     let read = |name: &str| std::fs::read(root().join(FW).join(name)).unwrap_or_else(|e| panic!("{FW}/{name}: {e}"));
     let mut c6 = esp32c6::machine([0x40, 0x4c, 0xca, 0x00, 0x11, 0x22], 4 << 20);
@@ -187,7 +187,7 @@ fn hosted_slave() -> esp32c6::Machine {
     for (off, f) in [(0, "c6-hosted-bootloader.bin"), (0x8000, "c6-hosted-ptable.bin"), (0xd000, "c6-hosted-otadata.bin"), (0x10000, "c6-hosted-slave.bin")] { c6.write_flash(off, &read(f)).unwrap(); }
     // bb_init, the PHY's baseband calibration (riscv32-esp-elf-nm on network_adapter.elf)
     c6.stubs.insert(0x420b_ac5c, 0);
-    c6.bus.attach_wifi(esp_soc::wifi::ApConfig::parse("ssid=esp32sim,psk=esp32sim-pass").unwrap(), None).unwrap();
+    c6.bus.attach_wifi(esp_soc::wifi::ApConfig::parse("ssid=esp32sim,psk=esp32sim-pass,epoch=1767225600").unwrap(), None).unwrap();
     c6.boot_rom();
     c6
 }

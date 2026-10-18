@@ -473,7 +473,7 @@ fn hosted_p4() {
     let coproc = format!("c6:bootloader={FW}/c6-hosted-bootloader.bin,ptable={FW}/c6-hosted-ptable.bin,app={FW}/c6-hosted-slave.bin,otadata={FW}/c6-hosted-otadata.bin,rom={},stub=0x420bac5c=0", rom_c6.display());
     let r = run(BIN_P4, &["--rom", rom_p4.to_str().unwrap(), "--flash-mb", "2", "--no-dump",
         "--bootloader", &format!("{FW}/p4-hosted-bootloader.bin"), "--ptable", &format!("{FW}/p4-hosted-ptable.bin"), "--app", &format!("{FW}/p4-hosted-station.bin"),
-        "--coproc", &coproc, "--wifi", "ssid=esp32sim,psk=esp32sim-pass", "--net", "none", "--max-seconds", "4"]);
+        "--coproc", &coproc, "--wifi", "ssid=esp32sim,psk=esp32sim-pass", "--net", "none,epoch=1767225600", "--max-seconds", "4"]);
     assert!(r.stdout.contains("[c6] I (115) co-pro-main:                 ESP-Hosted-MCU Slave FW version :: 2.12.13"), "{}", r.stdout);
     assert!(r.stdout.contains("transport: Identified slave [esp32c6]") && r.stdout.contains("wifi station: got ip:10.0.2.15"), "{}\n{}", r.stdout, r.stderr);
     assert!(!r.stdout.contains("Guru Meditation") && !r.stdout.contains("Version mismatch"), "{}", r.stdout);
