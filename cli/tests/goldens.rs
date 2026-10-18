@@ -12,6 +12,7 @@ use common::*;
 const BIN: &str = env!("CARGO_BIN_EXE_esp32sim");
 const BIN_C3: &str = env!("CARGO_BIN_EXE_esp32sim-c3");
 const BIN_C6: &str = env!("CARGO_BIN_EXE_esp32sim-c6");
+const BIN_P4: &str = env!("CARGO_BIN_EXE_esp32sim-p4");
 const FW: &str = "web/wasm/fw/public";
 
 fn atech(extra: &[&str]) -> (Run, Vec<u8>) {
@@ -198,6 +199,64 @@ fn hello_world_c6_reboot() {
     assert!(r.stdout.contains("rst:0xc (SW_CPU)") && r.stdout.contains("Saved PC:0x4001975a"), "the second boot banner differs from silicon:\n{}", r.stdout);
     expect_text("hello-c6-reboot.console.txt", &r.stdout);
     expect_u64("hello-c6-reboot.insns", r.insns);
+}
+
+fn p4_hello(seconds: &str) -> (Vec<String>, Run) { p4_run("p4-hello", seconds) }
+
+/// A P4 example image the page does not run, which tools/fetch-p4-firmware.sh pins and fetches.
+fn fetched(name: &str) -> String {
+    assert!(root().join(FW).join(name).exists(), "{FW}/{name} is missing: tools/fetch-p4-firmware.sh fetches it");
+    format!("{FW}/{name}")
+}
+
+fn p4_run(images: &str, seconds: &str) -> (Vec<String>, Run) {
+    let rom = rom("esp32p4_rev0");
+    let (bl, app) = if images == "p4-hello" { (format!("{FW}/p4-hello-bootloader.bin"), format!("{FW}/p4-hello_world.bin")) }
+        else { (fetched(&format!("{images}-bootloader.bin")), fetched(&format!("{images}_world.bin"))) };
+    let args: Vec<String> = ["--rom", rom.to_str().unwrap(), "--flash-mb", "2",
+        "--bootloader", &bl, "--ptable", &format!("{FW}/p4-hello-ptable.bin"), "--app", &app, "--max-seconds", seconds].iter().map(|s| s.to_string()).collect();
+    let r = run(BIN_P4, &args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    (args, r)
+}
+
+/// hello_world for the ESP32-P4 rev < 3 from the ECO0 mask ROM (docs/esp32p4.md), single-core,
+/// with the default boot mode and console: through the bootloader into FreeRTOS, `app_main` and
+/// the countdown, on the CLIC's systimer tick and yield interrupts.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn hello_world_p4() {
+    let (args, r) = p4_hello("3");
+    assert!(r.stdout.contains("Hello world!") && r.stdout.contains("Restarting in 9 seconds..."), "app_main never printed:\n{}", r.stdout);
+    expect_text("hello-p4.console.txt", &r.stdout);
+    expect_u64("hello-p4.insns", r.insns);
+    let mut chip = vec!["--chip", "p4"];
+    chip.extend(args.iter().map(|s| s.as_str()));
+    let r2 = run(BIN, &chip);
+    assert_eq!(r.stdout, r2.stdout); assert_eq!(r.insns, r2.insns);
+}
+
+/// The P4's esp_restart(): a software CPU reset through LP_CLKRST, back through the ROM with
+/// the reset cause and core 0's saved PC, and into app_main again.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn hello_world_p4_reboot() {
+    let (_, r) = p4_hello("12");
+    assert!(r.stderr.contains("[emu] chip reset at t="), "no reset seen:\n{}", r.stderr);
+    assert!(r.stdout.matches("Hello world!").count() >= 2, "the app did not come back after the reset:\n{}", r.stdout);
+    assert!(r.stdout.contains("rst:0xc (SW_CPU_RESET)"), "the second boot banner lacks the reset cause:\n{}", r.stdout);
+    expect_text("hello-p4-reboot.console.txt", &r.stdout);
+    expect_u64("hello-p4-reboot.insns", r.insns);
+}
+
+/// The same hello_world built for both cores (`examples/hello_world-p4/sdkconfig.defaults.smp`):
+/// the ROM starts core 1 at the boot address the app gives it, FreeRTOS schedules both cores,
+/// each on its own systimer alarm and cross-core interrupt, and esp_restart() brings both back.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn hello_world_p4_smp() {
+    let (_, r) = p4_run("p4-hello-smp", "12");
+    assert!(r.stdout.contains("cpu_start: Multicore app") && r.stdout.matches("Hello world!").count() >= 2, "both boots should reach app_main:\n{}", r.stdout);
+    let core1: u64 = r.stderr.lines().find(|l| l.starts_with("[emu] stop:")).and_then(|l| l.split("core1 ").nth(1)).and_then(|t| t.split_whitespace().next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+    assert!(core1 > 1_000_000_000, "core 1 did not run:\n{}", r.stderr);
+    expect_text("hello-p4-smp.console.txt", &r.stdout);
+    expect_u64("hello-p4-smp.insns", r.insns);
 }
 
 /// The IEEE 802.15.4 energy scanner on the Waveshare ESP32-C6-LCD-1.47 (its owner's firmware,
