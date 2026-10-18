@@ -48,7 +48,8 @@ pub const CLIC_HIGH: u32 = 0x2082_0000;
 enum Mmu { Flash, Psram }
 
 /// What the SDMMC host's IDMAC and the USB-OTG core's DMA reach: L2MEM and PSRAM
-/// (SOC_SDMMC_PSRAM_DMA_CAPABLE, SOC_PSRAM_DMA_CAPABLE, IDF v5.5.3 include/soc/soc_caps.h), at
+/// (SOC_SDMMC_PSRAM_DMA_CAPABLE, SOC_PSRAM_DMA_CAPABLE, IDF v5.5.3 include/soc/soc_caps.h;
+/// components/usb/hcd_dwc.c:50, the USB-DWC's DMA reaching external RAM on the P4), at
 /// their cached or uncached addresses. Caches are not modelled, so a DMA access sees what the
 /// cores wrote.
 struct DmaView<'a> { l2mem: &'a mut [u8], psram: &'a mut [u8], mmu: &'a [u32; MMU_ENTRIES] }

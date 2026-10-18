@@ -343,9 +343,9 @@ impl Device for LpAon {
             // HP_SDMMC_EMAC_RST_CTRL.RST_EN_SDMMC (bit 28) resets the SDMMC host
             // (lp_clkrst_reg.h:989-1005; sdmmc_ll_reset_register pulses it)
             (1, 0x4c) => { self.ram[1].write(o, v); if v & (1 << 28) != 0 { return WriteEffect::PERIPH_RESET; } }
-            // HP_USB_CLKRST_CTRL1.RST_EN_USB_OTG20 (bit 2) resets the USB-OTG HS core
+            // HP_USB_CLKRST_CTRL1.RST_EN_USB_OTG20 (bit 2) holds the USB-OTG HS core in reset
             // (lp_clkrst_reg.h:928-952; _usb_utmi_ll_reset_register pulses it)
-            (1, 0x48) => { self.ram[1].write(o, v); if v & (1 << 2) != 0 { return WriteEffect::PERIPH_RESET; } }
+            (1, 0x48) => { let old = self.ram[1].read(o); self.ram[1].write(o, v); if (old ^ v) & (1 << 2) != 0 { return WriteEffect::PERIPH_RESET; } }
             (2, 0x10) => { if v & (1 << 28) != 0 { self.time_latch = self.slow_ticks; } self.ram[2].write(o, v); }
             (b, o) if b < 3 => self.ram[b].write(o, v),
             _ => {}
@@ -656,7 +656,11 @@ impl Peripherals {
         let fx = mmio::write32(self, addr, v);
         if fx.contains(WriteEffect::SPI_EXEC | WriteEffect::PERIPH_RESET) {
             if fx.contains(WriteEffect::PERIPH_RESET) {
-                if addr == 0x5011_1048 { self.usb_otg.reset_registers(); Dispatch::refresh_optional(self, USB_OTG_BLOCK); } else { self.sdmmc.reset_registers(); }
+                match addr {
+                    0x5011_1048 => { self.usb_otg.set_reset(v & (1 << 2) != 0); Dispatch::refresh_optional(self, USB_OTG_BLOCK); }
+                    0x5011_104c => self.sdmmc.reset_registers(),
+                    _ => {}
+                }
             }
             if fx.contains(WriteEffect::SPI_EXEC) { if addr >> 12 == 0x5008f { self.psram_exec = true; } else { self.spi_exec = true; } }
         }
@@ -892,6 +896,23 @@ mod tests {
         assert_eq!(p.read32(0x5008_3024), 0, "INTMASK back to its reset value");
         assert_eq!(p.sdmmc.devices.len(), 1, "the card stays in its socket");
         assert_eq!(p.read32(0x5011_104c), 0);
+    }
+
+    /// HP_USB_CLKRST_CTRL1.RST_EN_USB_OTG20 holds the USB-OTG core in reset while set; other bits
+    /// of the register leave it alone.
+    #[test]
+    fn lp_clkrst_holds_the_usb_otg_core_in_reset() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        p.write32(0x5000_0008, 1);
+        assert_eq!(p.read32(0x5000_0008), 1);
+        p.write32(0x5011_1048, 1 << 2);
+        assert_eq!(p.read32(0x5000_0008), 0, "GAHBCFG back to its reset value");
+        p.write32(0x5000_0008, 1);
+        assert_eq!(p.read32(0x5000_0008), 0, "writes are ignored while the reset is held");
+        p.write32(0x5011_1048, 0);
+        p.write32(0x5000_0008, 1);
+        p.write32(0x5011_1048, 1 << 30);
+        assert_eq!(p.read32(0x5000_0008), 1, "the PHY clock bit is not a reset");
     }
 
     #[test]

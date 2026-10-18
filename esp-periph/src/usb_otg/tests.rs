@@ -550,3 +550,46 @@ fn control_writes_of_one_and_two_packets_end_in_a_data1_status() {
     }
     assert_eq!(b.link().stats.toggle_errors, 0);
 }
+
+/// EPDIS completes only once the endpoint NAKs: an IN endpoint after SNAK (INEPNE), an OUT
+/// endpoint under the global OUT NAK (BOUTNAKEFF); until then it stays set and the endpoint
+/// enabled.
+#[test]
+fn an_endpoint_disable_waits_for_its_nak() {
+    let mut b = Bench::new();
+    b.enumerate();
+    b.open_bulk1();
+    b.arm(false, 1, BUF, 512);
+    let c = b.rd(in_reg(1, reg::EPCTL));
+    b.wr(in_reg(1, reg::EPCTL), c | epctl::EPDIS);
+    assert_eq!(b.rd(in_reg(1, reg::EPCTL)) & (epctl::EPENA | epctl::EPDIS), epctl::EPENA | epctl::EPDIS, "not NAKing: pending");
+    assert_eq!(b.rd(in_reg(1, reg::EPINT)) & epint::EPDISD, 0);
+    let c = b.rd(in_reg(1, reg::EPCTL));
+    b.wr(in_reg(1, reg::EPCTL), c | epctl::SNAK);
+    assert_eq!(b.rd(in_reg(1, reg::EPCTL)) & (epctl::EPENA | epctl::EPDIS), 0, "SNAK lets it complete");
+    assert_ne!(b.rd(in_reg(1, reg::EPINT)) & epint::EPDISD, 0);
+    b.arm(true, 1, BUF, 512);
+    let c = b.rd(out_reg(1, reg::EPCTL));
+    b.wr(out_reg(1, reg::EPCTL), c | epctl::SNAK | epctl::EPDIS);
+    assert_ne!(b.rd(out_reg(1, reg::EPCTL)) & epctl::EPDIS, 0, "an OUT endpoint needs the global OUT NAK");
+    b.wr(reg::DCTL, dctl::SGONAK);
+    assert_eq!(b.rd(out_reg(1, reg::EPCTL)) & (epctl::EPENA | epctl::EPDIS), 0);
+    assert_ne!(b.rd(out_reg(1, reg::EPINT)) & epint::EPDISD, 0);
+}
+
+/// The block's reset line: asserting it resets the registers, writes are ignored while it is
+/// held, and releasing it leaves the core at its reset values.
+#[test]
+fn the_reset_line_holds_the_core() {
+    let mut b = Bench::new();
+    b.dcd_init();
+    assert_ne!(b.rd(reg::GAHBCFG), 0);
+    b.d.set_reset(true);
+    assert_eq!(b.rd(reg::GAHBCFG), 0);
+    b.wr(reg::GAHBCFG, GAHBCFG_GINT);
+    assert_eq!(b.rd(reg::GAHBCFG), 0, "ignored while held");
+    b.d.set_reset(true);
+    b.d.set_reset(false);
+    b.wr(reg::GAHBCFG, GAHBCFG_GINT);
+    assert_eq!(b.rd(reg::GAHBCFG), GAHBCFG_GINT);
+}

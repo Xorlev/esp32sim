@@ -161,6 +161,10 @@ pub struct Dwc2 {
     pub now: u64,
     pub link: Option<Box<UsbLink>>,
     pending: bool,
+    /// the block's reset line is asserted: registers at reset values, writes ignored
+    held: bool,
+    /// a (micro)frame in ticks at the enumerated speed
+    frame: u64,
     pub stats: Dwc2Stats,
     log: bool,
 }
@@ -171,7 +175,8 @@ impl Dwc2 {
             dieptxf: [0; 15], pcgcctl: 0, dcfg: 0, dctl: 0, diepmsk: 0, doepmsk: 0, daintmsk: 0, diepempmsk: 0,
             ep_in: [Ep::default(); 16], ep_out: [Ep::default(); 16], ram: RegRam::new(), vbus: false, speed: None, sof_since: None,
             sof_ack: 0, suspended: false, setup_phase: false, setup_stash: None, pullup_seen: false, now: 0, link: None, pending: false,
-            stats: Dwc2Stats::default(), log: false };
+            held: false, frame: 0, stats: Dwc2Stats::default(), log: false };
+        d.set_speed(None);
         d.reset_registers();
         d
     }
@@ -209,6 +214,19 @@ impl Dwc2 {
         self.stats.resets += 1;
     }
 
+    /// The block's reset line (LP_CLKRST RST_EN_USB_OTG20 on the P4): asserting it resets the
+    /// registers, which ignore writes until it is released.
+    pub fn set_reset(&mut self, asserted: bool) {
+        if asserted && !self.held { self.reset_registers(); }
+        self.held = asserted;
+    }
+
+    fn set_speed(&mut self, speed: Option<Speed>) {
+        self.speed = speed;
+        let ns = if speed == Some(Speed::High) { 125_000 } else { 1_000_000 };
+        self.frame = ((ns as u128 * self.cfg.hz as u128 / 1_000_000_000) as u64).max(1);
+    }
+
     /// Attach a cable to a host: it sees whatever the core presents from now on.
     pub fn attach(&mut self, now: u64, link: UsbLink) {
         self.now = now;
@@ -242,7 +260,7 @@ impl Dwc2 {
     /// `--debug usb_otg` is on.
     pub fn logging(&self) -> bool { self.log }
 
-    fn frame_ticks(&self) -> u64 { let ns = if self.speed == Some(Speed::High) { 125_000 } else { 1_000_000 }; (ns as u128 * self.cfg.hz as u128 / 1_000_000_000) as u64 }
+    fn frame_ticks(&self) -> u64 { self.frame }
 
     /// GINTSTS.SOF: a (micro)frame has started since software last cleared it.
     fn sof_due(&self) -> bool {
@@ -339,14 +357,26 @@ impl Dwc2 {
         if v & SD0PID != 0 { e.pid = false; }
         if v & SD1PID != 0 { e.pid = true; }
         if v & EPENA != 0 { ctl |= EPENA; }
-        // Disabling acts on an enabled endpoint only, and control OUT 0 cannot be disabled.
-        if v & EPDIS != 0 && old & EPENA != 0 && !(out && ep == 0) { ctl &= !EPENA; e.int |= epint::EPDISD; }
+        // EPDIS asks to disable an enabled endpoint (control OUT 0 cannot be); it stays set until
+        // the disable can complete (`finish_disable`).
+        if v & EPDIS != 0 && old & EPENA != 0 && !(out && ep == 0) { ctl |= EPDIS; }
         if ep == 0 { ctl |= USBAEP; }
-        e.ctl = ctl & !(SNAK | CNAK | SD0PID | SD1PID | EPDIS);
+        e.ctl = ctl & !(SNAK | CNAK | SD0PID | SD1PID);
+        self.finish_disable(ep, out);
         if !out && ctl & EPENA != 0 && old & EPENA == 0 && self.tx_fifo_bytes(ep) < self.mps(ep, false) {
             self.stats.fifo_errors += 1;
             if self.log { eprintln!("[usb_otg] IN{} enabled with a {}-byte TX FIFO for {}-byte packets", ep, self.tx_fifo_bytes(ep), self.mps(ep, false)); }
         }
+    }
+
+    /// A pending EPDIS completes (EPENA and EPDIS cleared, EPDISD) once its endpoint NAKs: an IN
+    /// endpoint with NAK set (INEPNE), an OUT endpoint under the global OUT NAK (BOUTNAKEFF), the
+    /// order dcd_dwc2's edpt_disable follows.
+    fn finish_disable(&mut self, ep: usize, out: bool) {
+        let gonak = self.dctl & dctl::GONSTS != 0;
+        let e = if out { &mut self.ep_out[ep] } else { &mut self.ep_in[ep] };
+        if e.ctl & epctl::EPDIS == 0 { return; }
+        if if out { gonak } else { e.ctl & epctl::NAKSTS != 0 } { e.ctl &= !(epctl::EPENA | epctl::EPDIS); e.int |= epint::EPDISD; }
     }
 
     fn write_grstctl(&mut self, v: u32) {
@@ -375,6 +405,7 @@ impl Dwc2 {
         if v & dctl::CGONAK != 0 { d &= !dctl::GONSTS; }
         let wake = d & dctl::RWUSIG != 0 && self.dctl & dctl::RWUSIG == 0;
         self.dctl = d;
+        if d & dctl::GONSTS != 0 { for n in 1..self.cfg.eps { self.finish_disable(n, true); } }
         self.notify_pullup();
         if wake { let now = self.now; if let Some(l) = &mut self.link { l.device_remote_wakeup(now); } }
     }
@@ -416,7 +447,7 @@ impl Dwc2 {
 impl UsbFunction for Dwc2 {
     fn vbus(&mut self, _now: u64, on: bool) {
         if on && !self.vbus { self.gintsts |= gint::SRQINT; }
-        if !on && self.vbus { self.gotgint |= GOTGINT_SEDET; self.speed = None; self.sof_since = None; self.suspended = false; }
+        if !on && self.vbus { self.gotgint |= GOTGINT_SEDET; self.set_speed(None); self.sof_since = None; self.suspended = false; }
         self.vbus = on;
     }
     fn pullup(&self) -> bool { Dwc2::pullup(self) }
@@ -435,7 +466,7 @@ impl UsbFunction for Dwc2 {
         if self.log { eprintln!("[usb_otg] bus reset"); }
     }
     fn enumerated(&mut self, _now: u64, speed: Speed) {
-        self.speed = Some(speed);
+        self.set_speed(Some(speed));
         self.gintsts |= gint::ENUMDNE;
         if self.log { eprintln!("[usb_otg] enumeration done, {:?} speed", speed); }
     }
@@ -591,6 +622,7 @@ impl Device for Dwc2 {
 
     fn write(&mut self, off: u32, v: u32) -> WriteEffect {
         use reg::*;
+        if self.held { return WriteEffect::NONE; }
         if let Some((n, out, r)) = Self::ep_regs(off) {
             if n >= self.cfg.eps { return WriteEffect::NONE; }
             match r {
