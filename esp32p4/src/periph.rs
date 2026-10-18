@@ -560,6 +560,9 @@ pub struct Peripherals {
     pub spi_exec: bool,
     pub psram_exec: bool,
     clock: ClockTree<4>,
+    /// CPU cycles from power-on to the start of this peripheral set: the device clock restarts at a
+    /// chip reset, and the SD bus's time (its card's busy period, a co-processor's clock) does not
+    pub cycle_base: u64,
     last_status: [u32; 4],
 }
 
@@ -631,7 +634,7 @@ impl Peripherals {
             spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true), psram1: psram_controller(),
             sha: Sha::new(), intmtx: IntMatrix::new(), clic: Clic::default(), cache: Cache::new(), hp_sys: HpSys::default(), hp_clkrst: HpClkRst::new(),
             lp: LpAon::new(), ana_mst: AnaMst::default(), assist_debug: AssistDebug::default(), rng: Rng::new(),
-            misc: Misc::new(), spi_exec: false, psram_exec: false, clock: Self::new_clock(), last_status: [0; 4],
+            misc: Misc::new(), spi_exec: false, psram_exec: false, clock: Self::new_clock(), cycle_base: 0, last_status: [0; 4],
         }
     }
 
@@ -717,8 +720,8 @@ impl Peripherals {
         changed
     }
 
-    /// Emulated time in nanoseconds, from the device clock.
-    pub fn now_ns(&self) -> u64 { (self.clock.cycles() as u128 * 1_000_000_000 / CPU_HZ as u128) as u64 }
+    /// Emulated time in nanoseconds since power-on, from the device clock.
+    pub fn now_ns(&self) -> u64 { ((self.cycle_base + self.clock.cycles()) as u128 * 1_000_000_000 / CPU_HZ as u128) as u64 }
 
     /// Advance every clocked device by `cycles` CPU cycles.
     pub fn tick(&mut self, cycles: u64) { Dispatch::tick(self, cycles); }

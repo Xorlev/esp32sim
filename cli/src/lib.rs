@@ -313,7 +313,8 @@ fn run_cosim(o: &Opts) {
               c.m.exceptions, c.m.interrupts, c.power_ups, c.resets);
     eprintln!("[c6] sdio: {} commands, {} bytes to the host, {} from it, {} underflows, {} overflows", st.commands, st.to_host, st.from_host, st.underflows, st.overflows);
     { let r = c.m.bus.report(); if !r.is_empty() { for l in r.lines() { eprintln!("[c6] {l}"); } } }
-    eprintln!("[cosim] {} slices, {} EN changes, {} P4 resets{}", cs.summary.slices, cs.summary.en_changes, cs.summary.p4_resets, cs.summary.stopped.as_ref().map(|s| format!("; stopped: {s}")).unwrap_or_default());
+    let late = if c.late_commands > 0 { format!(", {} commands late for the C6", c.late_commands) } else { String::new() };
+    eprintln!("[cosim] {} slices, {} EN changes, {} P4 resets{late}{}", cs.summary.slices, cs.summary.en_changes, cs.summary.p4_resets, cs.summary.stopped.as_ref().map(|s| format!("; stopped: {s}")).unwrap_or_default());
 }
 
 /// The co-processor: a bare ESP32-C6 with the images of `--coproc`, booted from its ROM.

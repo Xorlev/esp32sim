@@ -72,11 +72,13 @@ pub struct Coproc {
     /// power-ups after EN, chip resets the C6 asked for
     pub power_ups: u64,
     pub resets: u64,
+    /// commands whose time the C6 had already passed: the two clocks disagree
+    pub late_commands: u64,
 }
 
 impl Coproc {
     pub fn new(m: C6Machine) -> Self {
-        Coproc { m, origin: 0, held: false, halted: None, reboot: true, console_mask: 2, console: Vec::new(), power_ups: 0, resets: 0 }
+        Coproc { m, origin: 0, held: false, halted: None, reboot: true, console_mask: 2, console: Vec::new(), power_ups: 0, resets: 0, late_commands: 0 }
     }
 
     /// Where the C6 stands on the shared clock, in its own cycles.
@@ -136,6 +138,7 @@ pub struct SdioLink(pub Rc<RefCell<Coproc>>);
 impl SdDevice for SdioLink {
     fn command(&mut self, now: u64, cmd: u8, arg: u32) -> Result<SdResponse, SdCmdError> {
         let mut c = self.0.borrow_mut();
+        if c6_cycle_of_ns(now) < c.now_cycles() { c.late_commands += 1; }
         c.advance_to(now);
         if !c.running() { return Err(SdCmdError::NoResponse); }
         let r = c.m.bus.sdio_command(cmd, arg);

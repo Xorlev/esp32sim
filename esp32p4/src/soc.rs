@@ -134,6 +134,7 @@ impl esp_soc::SocBus for SocBus {
         let cause = self.periph.lp.reset_cause;
         let old = std::mem::replace(&mut self.periph, periph::Peripherals::new(mac, self.wafer));
         let p = &mut self.periph;
+        p.cycle_base = self.cycles;
         p.efuse = old.efuse;
         p.misc.log_unknown = old.misc.log_unknown;
         p.usb.connected = old.usb.connected;

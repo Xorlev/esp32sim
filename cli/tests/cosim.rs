@@ -17,10 +17,11 @@ const SDMMC: u32 = 0x5008_3000;
 const GPIO: u32 = 0x500e_0000;
 const J_SELF: [u8; 4] = [0x6f, 0, 0, 0];
 
-/// Both chips spinning: the P4 in L2MEM, the C6 in SRAM, its ROM's reset vector a loop too.
+/// Both chips spinning: each in its RAM, and each ROM's reset vector a loop too.
 fn spinning(cfg: Config) -> CoSim {
     let mut p4 = esp32p4::machine([0x30, 0xed, 0xa0, 0, 0, 1], 1 << 20);
     p4.bus.load_bytes(0x4ff0_0000, &J_SELF).unwrap();
+    p4.bus.load_bytes(0x4fc0_0000, &J_SELF).unwrap();
     p4.cores[0].pc = 0x4ff0_0000;
     let mut c6 = esp32c6::machine([0x40, 0x4c, 0xca, 0, 0, 1], 1 << 20);
     c6.bus.load_bytes(0x4080_0000, &J_SELF).unwrap();
@@ -85,6 +86,24 @@ fn the_c6_meets_each_command_at_its_time() {
     command(&mut cs, 7, rca).unwrap();
     assert_eq!(command(&mut cs, 52, 0x08 << 9), Some(0x1000 | esp32c6::sdio::CARD_CAP as u32), "CMD52 reads CCCR 0x08");
     assert_eq!(command(&mut cs, 8, 0x1aa), None, "an I/O-only card does not answer CMD8");
+}
+
+/// A P4 chip reset starts its device clock again but not the shared one: the C6 still meets each
+/// command at the command's time.
+#[test]
+fn the_c6_meets_each_command_at_its_time_after_a_p4_reset() {
+    let mut cs = spinning(Config::default());
+    cs.run_until(100_000).unwrap();
+    cs.p4.bus.request_reset(esp_periph::RST_SW_SYS);
+    cs.run_until(110_000).unwrap();
+    assert_eq!(cs.summary.p4_resets, 1);
+    route_slot1(&mut cs);
+    p4_alone(&mut cs, 157_000);
+    command(&mut cs, 5, 0).expect("the slave answers CMD5");
+    let p4_ns = cs.p4.bus.periph.now_ns();
+    assert!(p4_ns >= 157_000, "the P4's SD bus counts from power-on, not from the reset: {p4_ns} ns");
+    assert_eq!(cs.c6.borrow().now_cycles(), c6_cycle_of_ns(p4_ns), "the C6 at the command's nanosecond");
+    assert_eq!(cs.c6.borrow().late_commands, 0);
 }
 
 /// The slave's interrupt reaches the P4 on DAT1 by the end of the slice: D1's input level goes low
