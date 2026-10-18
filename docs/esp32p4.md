@@ -4,8 +4,10 @@ The fourth chip, and the first with two RISC-V cores: silicon **rev < 3** (v0.x,
 Waveshare ESP32-P4-WIFI6 (v1.0) the plan targets ([esp32p4-plan.md](esp32p4-plan.md), milestone 1).
 Unmodified ESP-IDF firmware boots from the real mask ROM, through the real 2nd-stage bootloader,
 into FreeRTOS on one or both cores, reaches an SD card in the board's socket through the SDMMC
-host (milestone 2, "SD card" below), and presents it as a USB mass-storage device to a host on
-the high-speed USB-OTG port, a car written in Rust (milestone 3, "USB" below).
+host (milestone 2, "SD card" below), presents it as a USB mass-storage device to a host on
+the high-speed USB-OTG port, a car written in Rust (milestone 3, "USB" below), and reaches WiFi
+through an emulated ESP32-C6 on SDIO running unmodified ESP-Hosted slave firmware, the two chips
+in lock-step in one process (milestone 4, "The co-processor" below).
 
 ```sh
 cargo build --release
@@ -208,9 +210,8 @@ through the GPIO matrix: it reaches a device whose clock pad is a GPIO (function
 `SD_CARD_CCLK_2_PAD_OUT_IDX` (gpio_sig_map.h). The `--sd` card sits on slot 0's pins, as on the
 reference board; IDF's example reaches it through slot 1 and the matrix (`SDMMC_HOST_DEFAULT()`
 is slot 1 on the P4), an application configured for slot 0 through the IO MUX. ESP-Hosted's C6
-(milestone 4) will be an `SdDevice` attached at CLK 18, CMD 19, D0-D3 14-17
-(`Peripherals::attach_sd`, which replaces a device already on those pins), which slot 1 reaches
-the same way; the trait already carries the SDIO interrupt (DAT1), unused so far.
+is an `SdDevice` attached at CLK 18, CMD 19, D0-D3 14-17 (`Peripherals::attach_sd`, which
+replaces a device already on those pins), which slot 1 reaches the same way ("The co-processor").
 CDETECT and WRTPRT read `SD_CARD_DETECT_N_1/2` and `SD_CARD_WRITE_PRT_1/2` (signals 126, 127,
 130, 131) through FUNCn_IN_SEL: a pin's level or a constant, inverted if asked. The driver
 routes constant low to card detect and inverted constant high to write protect when the board
@@ -219,7 +220,7 @@ has neither line, so a card counts as present on both slots.
 **Clocks, reset, pins, power.** HP_SYS_CLKRST's SOC_CLK_CTRL1.REG_SDMMC_SYS_CLK_EN (bit 14) and
 PERI_CLK_CTRL01/02 (the SDIO_LS clock source, enable and divider edges) read back, which is what
 `sdmmc_host_get_real_freq` computes the bus frequency from (160 MHz PLL / 8 = 20 MHz for the
-example, / 4 = 40 MHz for `SDMMC_FREQ_HIGHSPEED`); the clock gate is not checked. LP_CLKRST
+example, / 4 = 40 MHz for ESP-Hosted's link); the clock gate is not checked. LP_CLKRST
 HP_SDMMC_EMAC_RST_CTRL.RST_EN_SDMMC (0x5011104C bit 28) resets the host's registers and leaves
 what is attached (lp_clkrst_reg.h). IO_MUX is register RAM; the driver only writes it. The card's
 on-chip LDO (channel 4, `sd_pwr_ctrl_by_on_chip_ldo.c` through `hal/esp32p4/include/hal/ldo_ll.h`)
@@ -597,6 +598,286 @@ class (`mscd_reset`). A 5 ms timeout cuts a live transfer, which is what opens t
 - The NAK retry at the next microframe is one controller's policy, not the specification's; a
   controller that retries within the microframe would see a NAKing device sooner.
 
+## The co-processor
+
+The P4 has no radio. On the reference board an ESP32-C6 sits on SDIO slot 1 and runs ESP-Hosted's
+slave firmware; the P4's application calls `esp_wifi_*` as usual, and esp_wifi_remote and
+ESP-Hosted's host driver carry the calls and the packets over SDIO. `--coproc` puts an emulated C6
+there, running the unmodified slave, and runs both chips in one process ([cli.md](cli.md),
+"Co-processor (P4)"). IDF v5.5.3's WiFi station example with esp_hosted 2.12.13 and ESP-Hosted
+2.12.13's slave (`examples/esp-hosted-p4`, golden `hosted-p4`) join the virtual access point
+through the C6's radio:
+
+```sh
+./target/release/esp32sim-p4 --flash-mb 2 --bootloader $FW/p4-hosted-bootloader.bin \
+    --ptable $FW/p4-hosted-ptable.bin --app $FW/p4-hosted-station.bin \
+    --coproc c6:bootloader=$FW/c6-hosted-bootloader.bin,ptable=$FW/c6-hosted-ptable.bin,app=$FW/c6-hosted-slave.bin,otadata=$FW/c6-hosted-otadata.bin,stub=0x420bac5c=0 \
+    --wifi ssid=esp32sim,psk=esp32sim-pass --net none --max-seconds 4
+```
+
+```
+W (81) H_SDIO_DRV: Reset slave using GPIO[54]
+[c6] ESP-ROM:esp32c6-20220919
+[c6] I (115) co-pro-main:                 ESP-Hosted-MCU Slave FW version :: 2.12.13
+[c6] I (115) SDIO_SLAVE: sdio_init: sending mode: SDIO_SLAVE_SEND_STREAM
+I (1601) sdio_wrapper: SDIO master: Slot 1, Data-Lines: 4-bit Freq(KHz)[40000 KHz]
+I (1621) sdio_wrapper: Function 1 Blocksize: 512
+I (1721) H_SDIO_DRV: Card init success, TRANSPORT_RX_ACTIVE
+I (1771) transport: Identified slave [esp32c6]
+I (1771) transport: capabilities: 0xd
+[c6] W (2728) slave_wifi_std: Sta mode connected
+I (2771) RPC_WRAP: ESP Event: Station mode: Connected
+I (3771) wifi station: got ip:10.0.2.15
+```
+
+The P4 holds the C6's EN low for 10 ms on GPIO 54 and waits 1.5 s
+(CONFIG_ESP_HOSTED_SDIO_RESET_DELAY_MS) while the C6 boots again; the card comes up (CMD52 I/O
+reset, CMD0, CMD8, CMD5 twice, CMD3, CMD7, then CMD52 for the function, its interrupt enables,
+four lines, high speed and both block sizes), the host opens the data path with a slave
+interrupt, and the slave answers with its INIT event: the chip, the capabilities and its firmware
+version. The host compares that with its own and prints `Version mismatch` only when the
+major.minor differ (transport_drv.c, `compare_fw_version`); it prints nothing here, 2.12 against
+2.12. The station's RPCs follow, the C6 joins the access point, and the P4's lwIP takes a lease
+through the link 3.77 s after power-up. The golden pins both consoles in the order the slices
+produced them, the P4's instruction count, the C6's run and its SDIO, WiFi and network counts.
+19 frames go by before the C6's driver has given its MAC a receive ring (beacons before the
+radio is on; the report counts them apart from frames that find no free descriptor, of which
+there are none). Co-simulating costs about a second of CPU per emulated second while the
+station idles: the golden's 4 s take 3.6 s, 8 s take 7.7 s (both chips, one host thread).
+
+### The slave
+
+`esp32c6/src/sdio.rs` models the three blocks IDF v5.5.3's sdio_slave driver programs
+(`esp_driver_sdio/src/sdio_slave.c`, `hal/sdio_slave_hal.c`, `hal/esp32c6/include/hal/sdio_slave_ll.h`;
+registers: `soc/esp32c6/register/soc/sdio_hinf_reg.h`, `sdio_slc_reg.h`, `sdio_slc_host_reg.h`),
+HINF at 0x60016000, SLC at 0x60017000 and SLCHOST at 0x60018000 (`reg_base.h:35-37`), as one
+optional device: the SLC entry raises source 64, `ETS_SLC0_INTR_SOURCE` (`interrupts.h:86`), and
+HINF and SLCHOST are aliases of it. SLC's "rx" link carries slave-to-host data, its "tx" link
+host-to-slave data, the driver's sending and receiving. A C6 run without a host costs the table
+entries and one address compare after a peripheral write.
+
+| block, register | modelled |
+| --- | --- |
+| HINF CFG_DATA0 0x00 | DEVICE_ID_FN1 0x6666, USER_ID_FN1 0x0092 at reset; the CIS's MANFID |
+| HINF CFG_DATA1 0x04 | SDIO_ENABLE (the card answers nothing without it), IOREADY1/2 (CCCR I/O Ready), HIGHSPEED_ENABLE (CCCR SHS), SDIO_INT_MASK, SDIO_VER 0x232 at reset; the read-only HIGHSPEED_MODE, IOENABLE1/2 and CD_DISABLE show the host's CCCR |
+| SLC SLCCONF0 0x00 | TX_RST and RX_RST reset a link; RX_AUTO_WRBACK writes a sent descriptor back with the owner cleared |
+| SLC SLC0INT_RAW/ST/ENA/CLR 0x04-0x10 | FRHOST_BIT0-7 from the host, TX_OVF, TX_DONE, TX_SUC_EOF, RX_DONE, RX_EOF; ST is RAW & ENA, the SLC0 line |
+| SLC SLC0RX_LINK, SLC0RX_LINK_ADDR 0x3C, 0x40 | START reads the descriptor at once and raises RX_DONE when the hardware owns it (the driver polls RX_DONE right after); STOP |
+| SLC SLC0TX_LINK, SLC0TX_LINK_ADDR 0x44, 0x48 | START, STOP; RESTART follows the next pointer of the last buffer closed |
+| SLC SLCINTVEC_TOHOST 0x5C | bits 7:0 raise SLCHOST's TOHOST_BIT0-7 |
+| SLC SLC0TOKEN0/1 0x60, 0x64 | WR, INC, INC_MORE; the count at 27:16 and at SLCHOST TOKEN_RDATA |
+| SLC SLC0_LEN_CONF, SLC0_LENGTH 0xF4, 0xF8 | LEN_WR, LEN_INC, LEN_INC_MORE set the cumulative length SLCHOST PKT_LEN shows (20 bits, wrapping); the first length write after a START on a packet raises the host's RX_NEW_PACKET |
+| SLCHOST TOKEN_RDATA 0x44 | TOKEN1 at 27:16, TOKEN0 at 11:0 (TOKEN1 can be held for a fault test) |
+| SLCHOST SLC0HOST_INT_RAW/ST 0x50, 0x58 | TOHOST_BIT0-7, RX_UDF, TX_OVF, RX_NEW_PACKET; ST is RAW & FUNC1_INT_ENA |
+| SLCHOST PKT_LEN 0x60 | the length in 19:0; LEN_CHECK (31:20) reads 0 |
+| SLCHOST CONF_W0-W15 0x6C-0xB8 | shared scratch, both sides; CONF_W7's low byte is the host's interrupt to the slave (FRHOST_BIT0-7) and reads 0 |
+| SLCHOST SLC0HOST_INT_CLR, FUNC1_INT_ENA 0xD4, 0xDC | write 1 to clear; the interrupt enable |
+| the rest | register RAM (timing, check sums, the windows, SLC1, function 2) |
+
+The card the host sees follows the SDIO Simplified Specification v3.00 (SD Specifications Part
+E1, 2011):
+
+| command | the card |
+| --- | --- |
+| CMD5 | R4 (§3.3): C set, two I/O functions, no memory, I/O OCR 2.7-3.6 V; answered only before an RCA is assigned, and with argument 0 it does not start initialization (§3.1.2); nothing else is answered before a CMD5 since power-up or the I/O reset |
+| CMD3 | R6 (§4.3): RCA 0x0001, the SDIO-only status bits zero |
+| CMD7 | with the RCA: selected, R1b; with another: deselected, no answer (§6.14) |
+| CMD52 | R5 (§5.2.1): IO_CURRENT_STATE CMD, the data; read after write (RAW); FUNCTION_NUMBER for a function past two |
+| CMD53 | R5 with IO_CURRENT_STATE TRN (§5.3): bytes (count 0 is 512) or blocks of the function's block size, incrementing or fixed address; infinite block counts are not modelled |
+| CMD0, CMD8, ACMD41, CMD1 and the rest | no answer: an I/O-only card ignores memory commands (§4.4: CMD0 does not reset the I/O part) |
+
+Function 0 is the CCCR (§6.9 Table 6-1: revisions from SDIO_VER, I/O Enable, I/O Ready, Int
+Enable, Int Pending, I/O Abort with RES and the abort select, Bus Interface Control, Card
+Capability 0x17, the common CIS pointer, FN0 block size, Bus Speed Select with SHS and EHS), the
+FBR's block sizes (§6.10) and the common CIS at 0x1000: DEVICE, MANFID 0092/6666, FUNCID, FUNCE,
+CONFIG, CFTABLE_ENTRY and END, the tuples IDF's `sdmmc_io_print_cis_info` printed for an ESP32-C6
+slave (esp_hosted 2.12.13 `docs/esp32_p4_function_ev_board.md`). The I/O reset (§4.4) clears the
+function enables, interrupt enables, bus width, high speed and block sizes and takes the card
+back to needing CMD5; the SLC side is the C6's and stays as its driver left it. Function 1 is
+Espressif's protocol (IDF v5.5.3 `docs/en/api-reference/protocols/esp_sdio_slave_protocol.rst`):
+addresses below 0x400 reach SLCHOST's registers a byte at a time (ESP-Hosted and
+esp_serial_slave_link mask register addresses with 0x3FF), and above them is the FIFO, where a
+transfer to address A carries a packet of 0x1F800 - A bytes:
+
+- **Slave to host.** The driver's send link is a chain of descriptors with EOF on the last
+  (stream mode collects every queued packet). A host read takes the packet's bytes from the
+  descriptors in SRAM, zero-fills past the packet (ESP-Hosted reads whole 512-byte blocks), hands
+  each descriptor back with RX_DONE and the last with RX_EOF, which is when the driver returns
+  the buffers and starts the next chain. Reading more than the link holds is an underflow
+  (RX_UDF, zeros, and the CMD53 succeeds). Starting the link on a descriptor the hardware owns
+  raises the slave's RX_DONE at once: the driver starts a one-byte descriptor and waits for that
+  RX_DONE (`send_isr_invoker_enable`). The host's RX_NEW_PACKET waits for the length the driver
+  writes right after the START (`send_new_packet`): raised at the START, ESP-Hosted's combined
+  register read (INT_RAW to PKT_LEN in one CMD53) could land between the two, see a packet with
+  the old length, clear the interrupt and wait for ever. `SdioStats::stale_new_packets` counts host
+  reads of INT_RAW that show RX_NEW_PACKET with PKT_LEN where the host last read it (an upper
+  bound: a host PKT_LEN poll in between also counts); the report names it when it is not zero.
+  A CMD52 into the FIFO is a one-byte transfer to address A: a read takes the packet's next
+  byte, a write is a byte of a packet of 0x1F800 - A bytes and closes it at the last address.
+- **Host to slave.** The driver loads receive buffers (START for the first, the tail's next pointer
+  and RESTART for the rest, TOKEN1 counting them; the host subtracts the buffers it has used). A
+  host write fills the current buffer, spills into the next, and closes the last with its length
+  and EOF when the packet's 0x1F800 - A bytes are in; the block padding is dropped. A packet may
+  span two CMD53s (a block, then the remainder at the incremented address). With no buffer the
+  bytes are lost and TX_OVF goes to both sides.
+- **When the C6 sees it.** The bytes cross the bus in the host's register write that runs the
+  transfer, but what the C6 sees of it, each descriptor handed back (owner, length, EOF) and its
+  RX_DONE, RX_EOF, TX_DONE and TX_SUC_EOF, waits for the data phase's end on the bus: with
+  `--sd-timing` its wire time after the command, and when the P4's IDMAC resumes a suspended
+  transfer (a read longer than IDF's four descriptors) the moment of the resume, which the C6,
+  behind the P4 then, has not reached. The slave queues the hand-back and the co-simulation stops
+  the C6 at that cycle to apply it. Until then the buffers are the hardware's, so moving the bytes
+  early is invisible to the driver. Untimed, at a command the C6 already stands at the command's
+  time, so nothing waits.
+- **Interrupts.** The slave raises the host's TOHOST bits through SLCINTVEC_TOHOST; DAT1 goes low
+  while SLC0HOST_INT_ST is not zero, IENM and IEN1 are set in the CCCR (§6.3) and HINF does not
+  mask it. The host's byte in CONF_W7 raises FRHOST_BIT0-7 on the slave, as ESP-Hosted's "open
+  data path" interrupt does.
+
+`--debug sdio` prints the slave's commands, the descriptors handed over and the I/O reset. The
+I/O reset (§4.4) leaves SLCHOST's counters (TOKEN1, PKT_LEN) to the C6's driver: Espressif's
+driver resets them itself and says the host has to ask it to (`sdio_slave.c`, header comment),
+which ESP-Hosted's slave does on the host's reset interrupt (`sdio_reset`, `sdio_slave_reset`).
+Guesses, each from the sources' silence:
+
+- the CCCR revision bytes as SDIO_VER's split (0x32, 0x02), the card capability (0x17), two
+  functions in R4, CMD5's C bit set at once, and the FN block sizes at 512 after a reset (the
+  protocol document's default; the specification says 0);
+- PKT_LEN's LEN_CHECK as 0, INT_ST under FUNC1_INT_ENA rather than SLC0HOST_INT_ENA, the 0x400
+  split between the register window and the FIFO;
+- RX_DONE at a link START on an owned descriptor, and the host's RX_NEW_PACKET at the length write
+  that follows it;
+- a read past the send link: zeros, RX_UDF, and a CMD53 that succeeds; silicon may stall the bus
+  and retry instead (SLCHOST's SLC0_HOST_RD_RETRY_INT, SLC's SLC0_RD_RETRY_THRESHOLD);
+- a write with no receive buffer: the bytes dropped, TX_OVF to both sides, and a CMD53 that
+  succeeds (a host is expected to wait for TOKEN1 and never get there);
+- the I/O reset: what it does to SLCHOST's INT_RAW and CONF_W registers is not documented; they are
+  left as they are, like the counters;
+- the card answers from power-up whatever the C6's IO MUX, its PCR clock gate or its ROM is doing:
+  a host that sends CMD5 while the C6's ROM boots is answered here, which silicon may not do.
+
+Not modelled: the card's busy and read wait, its
+CRC (it never answers with a CRC error or a malformed response), suspend and resume, function 2,
+the second SLC (SLC1), the host's token registers (TOKEN_WDATA, TOKEN_CON), the PCR reset of the
+block (`PCR_SDIO_SLAVE_CONF.RST_EN`, which the driver pulses before it configures a block already
+at its reset values) and the pins (the card answers however the C6's IO MUX is set).
+
+### The host side
+
+An `SdDevice` says whether it is an SDIO function (`io`). After each command the P4 samples the
+function's DAT1: the slot's D1 pin (15) reads low while the function interrupts, which is what
+IDF's `sdmmc_host_io_int_wait` looks at first, and RINTSTS's SDIO bit for the slot (16 + slot)
+is set when DAT1 goes low, edge triggered as that function's comment describes it
+(`esp_driver_sdmmc/src/sdmmc_host.c`). The ISR masks it and wakes the waiting task. The `card_int`
+and card-detect inputs IDF ties high are not consulted. Nothing of this runs while only a memory
+card is on the bus. The C6's EN follows GPIO 54 (`GpioP4::drive`; ESP-Hosted's
+`ESP_HOSTED_SDIO_GPIO_RESET_SLAVE`, 54 on the P4, active high: low resets), read from OUT1 and
+ENABLE1, which the W1TS and W1TC registers reach for every pin to 56; the IO MUX function of pins
+49-56 is not checked.
+
+### Lock-step
+
+`cli/src/cosim.rs` runs a P4 machine and a C6 machine on one clock, nanoseconds from power-up
+(the P4 at 9 cycles per 25 ns, the C6 at 4). Slices of 10 µs (`slice-us`) end on a fixed grid:
+
+1. the P4 runs to the slice's end (`max_cycles`, both cores);
+2. the C6 runs to the same instant (`run_until_cycle`);
+3. the lines between the chips are exchanged: the slave's DAT1 into the P4 (D1 and RINTSTS), the
+   P4's EN line into the C6.
+
+The SDIO bus is host-driven, so the transactions are where the chips meet exactly: when the P4's
+host starts a command, the C6 first runs to that nanosecond, then the command and its data are
+carried out against the slave as it stands, the descriptors read and written in the C6's SRAM;
+the C6 goes on from there in its next run. The C6 is never ahead of the P4. What the P4 senses
+without a command, the slave's interrupt, is sampled after every command and at every slice end,
+so it reaches the P4 at most one slice late, as a frame reaches csim's medium at the end of the
+slice it started in (`--cooja`). EN is read at slice ends only, so it takes effect up to a slice
+late: driven low, the C6 runs to that instant and stops; released after at least the C6's t_RST
+(50 µs, ESP32-C6 Series Datasheet, "Chip Power-up and Reset"), the C6 powers up from its ROM (a
+chip reset with cause POWERON; its LP domain and SRAM are kept, which a real power-up would not
+keep), and its clock goes on from that instant. A shorter pulse is ridden out: the C6 runs on
+from where it stopped. The restarted P4 makes GPIO 54 an output a moment before it writes the
+level, and a slice end can catch that as a one-slice pulse; the report counts such pulses. At
+power-up EN is the pull-up's: the C6 boots with the P4, as on the board, until ESP-Hosted resets
+it. A chip that resets itself comes back through its ROM; a P4 reset keeps the SD bus's time
+(the device clock starts again at a chip reset, `Peripherals::cycle_base` carries the cycles
+before it), so the C6 still meets every command at its nanosecond, and the report counts
+commands that ever find the C6 ahead (none should). The co-simulation reads no host clock and no
+host randomness and the order of every step is fixed, so a run is the same to the instruction
+every time, and the same however `run_until` is called
+(`the_pair_runs_the_same_whichever_way_it_is_driven` runs the pair for 2 s whole and in uneven
+pieces). The virtual network's SNTP server answers its own clock plus emulated time; `--net
+none,epoch=S` fixes that clock, and without it the host's clock at the first answer sets it
+([networking-howto.md](networking-howto.md)), so a firmware that asks for the time is
+reproducible only with an epoch. The goldens and tests pass one. Both consoles are
+collected a line at a time and printed in the order the slices produced them. The co-processor
+is native only: the browser build has none.
+
+**Cost.** Without `--coproc` nothing of this runs: the C6's slave is an optional device-table
+entry and one address compare after a peripheral write, the P4's SDIO path one flag tested where
+the SDMMC host runs (`has_sdio`), the fault hooks and the deferred hand-back live in the
+co-simulation, and the rest is in cold functions.
+
+### Throughput
+
+ESP-Hosted's own transport test (RawTP) moves 1460-byte packets as fast as the link takes them
+and reports the rate every second on both consoles. Its images are committed beside the pair's
+(`p4-hosted-rawtp-rx.bin`, `p4-hosted-rawtp-tx.bin`, `c6-hosted-rawtp-slave.bin`; the Kconfig
+recipe is in `examples/esp-hosted-p4/README.md`), and the goldens `hosted_rawtp_rx` and
+`hosted_rawtp_tx` pin 10 s of each with the bus timed. Both sides wait 5 s after the data path
+opens, so traffic starts near 7.7 s. The steady per-second reports, 12 s runs:
+
+| direction | SDIO bus | emulator | Espressif, P4 + C6, 4 bits at 40 MHz |
+| --- | --- | --- | --- |
+| C6 to P4 (host receive) | at once | 427-474 Mbit/s | 80 Mbit/s |
+| C6 to P4 | `--sd-timing`, 4 bits at 40 MHz | 139.5 Mbit/s | |
+| P4 to C6 (host transmit) | at once | 428-430 Mbit/s | 72 Mbit/s |
+| P4 to C6 | `--sd-timing` | 106.3 Mbit/s | |
+
+Deferring the slave's hand-back to the end of the data phase on the bus ("When the C6 sees it") does
+not move these rates: the C6 is busy elsewhere for longer than a block's wire time. The board
+numbers are Espressif's (esp_hosted 2.12.13 `docs/performance_optimization.md`, "ESP32-C6 as
+Co-Processor", over the air; iperf there gives 30-32 Mbit/s TCP and 49-50 UDP). Without timing a
+transfer takes no time on the bus, so the rate is what the two CPUs' drivers sustain at one
+instruction a cycle: the P4's ESP-Hosted tasks and memcpy, the C6's ISR and the SLC hand-overs.
+`--sd-timing` gives the link the card's wire-time model ("The host"): a 512-byte block in 4 bits at
+40 MHz is 1044 card clocks, 157 Mbit/s on the data lines, and each command adds 106 clocks and each
+packet its register reads (the interrupt status, the length), which leaves the 139 Mbit/s measured;
+transmit pays the TOKEN1 reads and the padding of each packet to whole blocks. What is still missing
+against Espressif's 72-80: the slave's busy and FIFO latency (it answers at once), the CPUs' caches
+and PSRAM stalls, and the time the data takes through the C6's DMA.
+
+The WiFi side is not part of these numbers, and through the air it is the first ceiling. The
+virtual access point's receive pacing (`esp-soc/src/wifi.rs`, `StationLink::next_rx`) delivers
+one frame per 400 µs of airtime (`RX_GAP_US`) and none while the last descriptor it filled is
+still unrecycled, for up to 50 ms (`RX_STALL_US`), as an 802.11b/g link without A-MPDU would:
+about 30 Mbit/s of 1500-byte frames at best.
+
+### Faults
+
+`--coproc c6:...,fault=KIND@WHEN` (repeatable; [cli.md](cli.md)) injects faults at points the run
+itself fixes, the Nth command or transfer of a kind or a shared time, so a faulted run is as
+reproducible as a clean one, and nothing of it runs without `--coproc`. `cli/tests/cosim.rs` runs
+each against the hosted pair and pins ESP-Hosted 2.12.13's reaction:
+
+| fault | what happens on the link | ESP-Hosted's reaction |
+| --- | --- | --- |
+| `read-crc@N[:K]`, `read-timeout@N` | the Nth FIFO read fails (0x109, 0x107) after the slave gave its data, or at the block holding byte K | `Failed to read data`; the packet is lost; the lost one was an RPC response, which times out after 5 s, and the station example aborts and restarts the P4, which resets the C6 and starts again |
+| `reg-read-crc@N` | the Nth register-window read fails | `failed to read registers`, a transport failure and an immediate host restart (`H_TRANSPORT_RESTART_ON_FAILURE`); the pair takes its lease again |
+| `write-crc@N`, `write-nostatus@N` | the Nth FIFO write: the card drops the block (CRC status error) or takes it without a status | `Failed to send data`, retried (`MAX_SDIO_WRITE_RETRY`); the lease on time |
+| `cmd-timeout@N`, `resp-crc@N` | the Nth command never arrives, or is carried out with a bad response CRC | one error; the link goes on |
+| `wedge@T` | the C6's CPU stops, its SDIO hardware answers on, TOKEN and PKT_LEN frozen | silence: no error, no restart, no lease |
+| `dead-bus@T` | nothing answers | silence |
+| `drop-irq@T` | one DAT1 edge goes unlatched (`SdDevice::edge_lost`), D1 stays low | silence: the receive task already waits on the edge, and checks D1's level only when it starts to wait |
+| `spurious-irq@T+D` | D1 low with nothing pending | the host reads the registers, finds nothing; harmless |
+| `token-stall@T+D` | TOKEN1 shows no free receive buffer | the host polls TOKEN1 at growing intervals (`sdio_is_write_buffer_available`) and its traffic waits: the lease 0.5 s late |
+
+A C6 reset in the middle of the traffic (`a_c6_reset_mid_traffic_ends_in_a_host_restart`) loses
+the RPC in flight and ends in a host restart too. The three silent stalls are the finding: in
+this configuration ESP-Hosted's receive task waits for the slave's interrupt with no timeout and
+the station example waits for its connect event the same way, so a wedged co-processor, a dead
+bus or a single lost DAT1 edge stop the WiFi for good without a log line.
+
 ## Compared with a board
 
 An ESP-IDF v5.5.3 application for the reference board (not in this repository, nor is the
@@ -616,13 +897,15 @@ bytes later on the board). The other blocks that differ:
 
 - the board's flash held a core dump, the emulator's coredump partition is blank: one line
   where the board prints three;
-- the application's free heap at start is 108 bytes lower than the board's (open; ESP-Hosted's
-  SDIO link, which has no slave on slot 1, is the first place to look);
+- the application's free heap at start is 108 bytes lower than the board's (open; it is the same
+  108 bytes with the C6 on slot 1);
 - the card's FAT geometry, label and root directory: the image's, not the board card's;
 - what the board's NVS held from earlier boots, which the emulator's blank flash does not;
-- the die temperature: the temperature sensor is register RAM.
+- the die temperature: the temperature sensor is register RAM ("Not there yet").
 
-The board's later lines come through the C6 (WiFi and the clock): the plan's milestone 4.
+The board's later lines come through the C6 (WiFi and the clock). With the C6 on slot 1
+(`--coproc`, "The co-processor") the WiFi initialisation and the SNTP lines are reached too, and
+80 lines match.
 
 ## What the bring-up found
 
@@ -637,6 +920,25 @@ The board's later lines come through the C6 (WiFi and the clock): the plan's mil
   bootloader's random-number loop never ends.
 - **A CLIC control word is four registers.** The ROM and IDF write IE, the attributes and the
   level one byte at a time; a read-modify-write of the whole word would write IP back.
+- **The SDIO slave's send link must answer at the register write that starts it.** The driver
+  starts a one-byte descriptor and spins on RX_DONE before it does anything else, so the DMA reads
+  the descriptor in the write's own bus call (`sdio_slc_write`), not later.
+- **IDF reads the D1 pin, not only the host's interrupt bit.** `sdmmc_host_io_int_wait` returns at
+  once if D1 is low, so DAT1 is a GPIO input level as well as RINTSTS's edge.
+- **Slices must end on a fixed grid.** Cutting a slice where a caller happened to stop moved where
+  EN was seen and where the P4's scheduling rounds fell, and the C6's `Saved PC` after its reset
+  differed between two drivings of the same run; the lock-step test caught it.
+- **A P4 reset restarted the SD bus's clock.** The device clock starts again with the new
+  peripheral set, and the SDMMC host took its time from it, so after a P4 software reset every
+  command reached the C6 with a time the C6 had passed and it answered up to a slice stale; a
+  slot-0 card's busy period was measured on the wrong clock too. Found in review; the SD bus now
+  counts from power-on.
+- **The host's packet announcement must wait for the length.** Raising RX_NEW_PACKET at the rx
+  link's START left a few instructions in which ESP-Hosted's combined register read could see a
+  packet with its old length and wait for ever. Found in review, not seen in a run.
+- **A restarted P4 glitches EN.** ESP-Hosted makes GPIO 54 an output (its output latch still 0
+  after the reset) before it writes the level (`transport_gpio_reset`), so EN is low for a few
+  instructions; a slice end can see that, so EN needs the C6's t_RST before it resets the chip.
 
 ## What is modelled
 
@@ -645,7 +947,7 @@ The board's later lines come through the C6 (WiFi and the clock): the plan's mil
 | CPU | two RV32IMAFC cores (`Cpu::new_esp32p4`, `misa` 0x40001125): F with the lazy FPU traps, EXT_ILL, Zicntr, CLIC mode, `mhartid`; core 1 held in reset until HP_SYS_CLKRST releases it. Xesppie and the hardware loops decode as illegal |
 | Memory | 128 KB mask ROM at 0x4FC00000 (reset vector), 768 KB L2MEM at 0x4FF00000 and its uncached alias at 0x8FF00000, 8 KB TCM at 0x30100000, LP ROM (empty) and 32 KB LP RAM; flash (0x40000000) and PSRAM (0x48000000) windows behind two 1024-entry MMUs of 64 KB pages, reached through SPI_MEM_C / SPI_MEM_S item registers, with their uncached aliases |
 | Interrupts | both interrupt matrices (128 sources, rev < 3) and both CLIC register blocks, delivered through the cores' CLIC mode |
-| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`); everything else is register RAM, listed by `--log-periph` |
+| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`), an SDIO function on slot 1 with its interrupt on DAT1 (`--coproc`: an ESP32-C6 running ESP-Hosted's slave, "The co-processor"); everything else is register RAM, listed by `--log-periph` |
 | Time base | 360 MHz, the rev < 3 application clock; one instruction is one cycle |
 
 The revision is a type parameter (`esp32p4::Revision`, `RevLt3`): rev >= 3 (its own ROM, the
@@ -655,8 +957,16 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 
 ## Not there yet
 
-- **ESP-Hosted, AXI-DMA, the LP core**: ESP-Hosted is milestone 4 of the plan, the others are
-  out of scope. Xesppie's save and restore, which FreeRTOS runs only for a task that uses PIE.
+- **AXI-DMA, the LP core**: out of scope. Xesppie's save and restore, which FreeRTOS runs only for
+  a task that uses PIE. mbedTLS's SHA and AES in DMA mode run through the AXI GDMA on the P4 (IDF
+  v5.5.3 `mbedtls/port/crypto_shared_gdma`, `SOC_AXI_GDMA_SUPPORTED`), so SHA_BUSY (0x50091018)
+  never clears and the caller spins on it.
+- **The co-processor**: native only; the SDIO link without timing by default and the slave
+  without busy or read wait, CRC or suspend ("The co-processor"); faults are injected on the link
+  rather than arising from a model of the bus. `--usb-host` does not run with `--coproc` yet.
+- **The temperature sensor** (LP_TSENS) is register RAM: IDF's driver reads OUT as 0, which it
+  turns into −48 °C and ESP_FAIL. A model would give a fixed die temperature from OUT and the DAC
+  range the driver writes over regi2c; it is a `device_set!` entry and needs a CPU-time receipt.
 - **USB**: the full-speed OTG core (0x50040000) and USB_WRAP, host mode, the core's slave mode
   (the data FIFOs), descriptor DMA, isochronous and interrupt endpoints, LPM, the
   per-endpoint interrupt source (94), and the time a transaction takes inside the core: it
