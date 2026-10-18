@@ -281,3 +281,27 @@ fn reset_keeps_the_p4_configuration() {
     c3.reset();
     assert_eq!((c3.misa, c3.has_ext_ill), (0x4000_1104, false));
 }
+
+/// The P4 core's `cycle`/`instret` (and their high halves) read the same counters as
+/// mcycle/minstret, including a guest write to mcycle; on the C3/C6 they stay unmodelled CSRs.
+#[test]
+fn p4_user_counters_shadow_the_machine_counters() {
+    // csrr a0,cycle; csrr a1,instret; csrr a2,cycleh; csrr a3,instreth; csrr a4,mcycle
+    let prog = asm("c0002573 c02025f3 c8002673 c82026f3 b0002773");
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &prog, "rdcycle a0");
+    cpu.advance_cycles(100);
+    cpu.write_csr(csr::MCYCLEH, 7);
+    for _ in 0..5 { step(&mut cpu, &mut ram).unwrap(); }
+    // an instruction counts its own cycle before it reads the counter
+    assert_eq!((cpu.x[10], cpu.x[11], cpu.x[12], cpu.x[13]), (101, 1, 7, 0));
+    assert_eq!(cpu.x[14], 105);
+    cpu.write_csr(csr::CYCLE, 0);                               // read-only: ignored
+    assert_eq!(cpu.read_csr(csr::CYCLE), 105);
+    cpu.reset();
+    assert!(cpu.user_counters);
+    let mut c6 = Cpu::new_rv32imac();
+    c6.advance_cycles(100);
+    assert_eq!(c6.read_csr(csr::CYCLE), 0);
+    c6.write_csr(csr::CYCLE, 5);
+    assert_eq!(c6.read_csr(csr::CYCLE), 5, "an unmodelled CSR reads back what was written");
+}
