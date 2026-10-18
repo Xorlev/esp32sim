@@ -9,6 +9,7 @@
 use emu_core::{ClockDomain, ClockTree};
 use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Misc, RegRam, WriteEffect};
 use esp_periph::{Efuse, Gpio, Rng, Sha, SpiMem, Systimer, TimerGroup, Uart, UartLayout, UsbSerialJtag};
+use esp_periph::sdmmc::{Sdmmc, SdmmcLayout, SLOTS};
 use esp_periph::{RST_POWERON, RST_SW_CPU, RST_SW_SYS};
 
 /// The emulator's time base: the rev < 3 application clock, CPLL 360 MHz
@@ -20,6 +21,8 @@ pub const CPU_HZ: u64 = 360_000_000;
 /// (register/hw_ver1/soc/interrupt_core0_reg.h). rev < 3 has 128 sources.
 pub mod src {
     pub const USB_SERIAL_JTAG: usize = 22;
+    /// ETS_SDIO_HOST_INTR_SOURCE: the SDMMC host
+    pub const SDIO_HOST: usize = 23;
     pub const UART0: usize = 31; pub const UART1: usize = 32;
     pub const TG0_T0: usize = 46; pub const TG0_T1: usize = 47;
     pub const TG1_T0: usize = 49; pub const TG1_T1: usize = 50;
@@ -31,7 +34,7 @@ pub mod src {
     /// The name IDF gives a source, for diagnostics.
     pub fn name(s: usize) -> &'static str {
         match s {
-            USB_SERIAL_JTAG => "USB_SERIAL_JTAG", UART0 => "UART0", UART1 => "UART1", TG0_T0 => "TG0_T0", TG0_T1 => "TG0_T1",
+            USB_SERIAL_JTAG => "USB_SERIAL_JTAG", SDIO_HOST => "SDIO_HOST", UART0 => "UART0", UART1 => "UART1", TG0_T0 => "TG0_T0", TG0_T1 => "TG0_T1",
             TG1_T0 => "TG1_T0", TG1_T1 => "TG1_T1", 53 => "SYSTIMER_TARGET0", 54 => "SYSTIMER_TARGET1", 55 => "SYSTIMER_TARGET2",
             GPIO_INTR0 => "GPIO_INTR0", 79 => "FROM_CPU_INTR0", 80 => "FROM_CPU_INTR1", 81 => "FROM_CPU_INTR2", 82 => "FROM_CPU_INTR3",
             _ => "?",
@@ -320,6 +323,9 @@ impl Device for LpAon {
         match (blk, o) {
             (0, 0x08) => { if v & (1 << 1) != 0 { self.request_reset(RST_SW_SYS); } self.ram[0].write(o, v & !(1 << 1)); }
             (1, 0x14) => { if v & (1 << 13) != 0 { self.request_reset(RST_SW_CPU); } self.ram[1].write(o, v & !(1 << 13 | 1 << 29)); }
+            // HP_SDMMC_EMAC_RST_CTRL.RST_EN_SDMMC (bit 28) resets the SDMMC host
+            // (lp_clkrst_reg.h:989-1005; sdmmc_ll_reset_register pulses it)
+            (1, 0x4c) => { self.ram[1].write(o, v); if v & (1 << 28) != 0 { return WriteEffect::PERIPH_RESET; } }
             (2, 0x10) => { if v & (1 << 28) != 0 { self.time_latch = self.slow_ticks; } self.ram[2].write(o, v); }
             (b, o) if b < 3 => self.ram[b].write(o, v),
             _ => {}
@@ -425,13 +431,73 @@ fn psram_controller() -> SpiMem {
     s
 }
 
+/// The P4's GPIO matrix on the shared model, which has the C6's layout and 49 pins. The P4's 57
+/// PIN registers from 0x74 put FUNCn_IN_SEL_CFG at 0x158 and FUNCn_OUT_SEL_CFG at 0x558, four
+/// bytes above the C6's, so both arrays move down four bytes into the model; PIN49-56 and
+/// OUT_SEL49-56 are register RAM. FUNCn_IN_SEL resets to 0x3F (constant high), or to 0x3E
+/// (constant low) for the signals in `IN_SEL_LOW`.
+/// IDF v5.5.3 register/hw_ver1/soc/gpio_reg.h, include/soc/gpio_pins.h.
+pub struct GpioP4 { pub g: Gpio, ram: RegRam }
+const IN_SEL_LOW: [(usize, usize); 10] = [(10, 45), (47, 66), (74, 78), (89, 114), (117, 118), (126, 127), (130, 133), (138, 156), (158, 203), (214, 255)];
+impl Default for GpioP4 { fn default() -> Self { Self::new() } }
+impl GpioP4 {
+    pub fn new() -> Self {
+        let mut g = Gpio::new();
+        g.strap = 0x30f;
+        g.func_in_sel = [0x3f; 256];
+        for (lo, hi) in IN_SEL_LOW { for s in lo..=hi { g.func_in_sel[s] = 0x3e; } }
+        GpioP4 { g, ram: RegRam::new() }
+    }
+    /// The level an input signal sees: FUNCn_IN_SEL bits 5:0 pick a pin or a constant (0x3F
+    /// high, 0x3E low), bit 6 inverts.
+    pub fn in_signal(&self, sig: usize) -> bool {
+        let v = self.g.func_in_sel[sig];
+        let level = match v & 0x3f { 0x3f => true, 0x3e => false, p => self.g.level(p as u8) };
+        level ^ (v & 0x40 != 0)
+    }
+    /// FUNCn_OUT_SEL bits 8:0 of a pin: the output signal on it, 256 for GPIO_OUT.
+    pub fn out_signal(&self, pin: u8) -> u32 { self.g.func_out_sel.get(pin as usize).map_or(0x100, |v| v & 0x1ff) }
+}
+impl Device for GpioP4 {
+    fn read(&mut self, off: u32) -> u32 {
+        match off { 0x138..=0x154 | 0x61c..=0x63c => self.ram.read(off), 0x158..=0x618 => self.g.read(off - 4), _ => self.g.read(off) }
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        match off { 0x138..=0x154 | 0x61c..=0x63c => self.ram.write(off, v), 0x158..=0x618 => self.g.write(off - 4, v), _ => self.g.write(off, v) }
+        WriteEffect::NONE
+    }
+    fn irq_sources(&self) -> u64 { self.g.irq() as u64 }
+}
+
+/// The pins an SD bus device hangs on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SdPins { pub clk: u8, pub cmd: u8, pub data: [u8; 4] }
+impl SdPins {
+    /// The SD socket of the reference board (Waveshare ESP32-P4-WIFI6), on slot 0's IO MUX
+    /// pins: SDMMC_SLOT0_IOMUX_PIN_NUM_CLK 43, CMD 44, D0-D3 39-42
+    /// (IDF v5.5.3 components/soc/esp32p4/include/soc/sdmmc_pins.h).
+    pub const SOCKET: SdPins = SdPins { clk: 43, cmd: 44, data: [39, 40, 41, 42] };
+}
+
+/// GPIO matrix signals of the SDMMC host (IDF v5.5.3 include/soc/gpio_sig_map.h): slot 1's
+/// clock output, and per slot the card-detect and write-protect inputs.
+pub const SIG_SD_CCLK_2: u32 = 0;
+pub const SIG_SD_CARD_DETECT_N: [usize; SLOTS] = [126, 127];
+pub const SIG_SD_WRITE_PRT: [usize; SLOTS] = [130, 131];
+/// IO_MUX pad register of a pin (0x500E1000 + 4 + 4n), MCU_SEL in bits 14:12; function 0 of
+/// slot 0's clock pad is SD1_CCLK_PAD, function 1 is the GPIO (register/hw_ver1/soc/io_mux_reg.h).
+fn pad_function(io_mux: &RegRam, pin: u8) -> u32 { io_mux.read(4 + 4 * pin as u32) >> 12 & 7 }
+
 pub struct Peripherals {
     pub uart: [Uart; 2],
     pub usb: UsbSerialJtag,
     pub systimer: SystimerP4,
     pub timg: [TimerGroup; 2],
-    pub gpio: Gpio,
+    pub gpio: GpioP4,
     pub io_mux: RegRam,
+    /// the SD/MMC host (0x50083000) and the pins of each device on its bus
+    pub sdmmc: Sdmmc,
+    pub sd_pins: Vec<SdPins>,
     pub efuse: Efuse,
     /// SPI_MEM_C: the flash controller's cache side (the MMU registers are the bus's)
     pub spi0: MspiCache<SpiMem>,
@@ -472,6 +538,7 @@ device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Xtal, 9), (Cloc
     0x20811 "CLIC_OTHER_CTRL" alias (clic) delta 0x11000 => [];
     0x3ff06 "ASSIST_DEBUG" (assist_debug) => [];
     0x3ff10 "CACHE" (cache) => [];
+    0x50083 "SDMMC" (sdmmc) => [src::SDIO_HOST];
     0x5008c "FLASH_SPI0" (spi0) => [];
     0x5008d "FLASH_SPI1" (spi1) => [];
     0x5008e "PSRAM_MSPI0" (psram0) => [];
@@ -505,6 +572,13 @@ impl DeviceSet for Peripherals {
         // INTR_STATUS_0..3 read the source state.
         if block == 0x500d6 && !write && (0x200..=0x20c).contains(&(off & 0x7ff)) { self.intmtx.status = self.source_status(); }
         if block == 0x50110 && off == 0x1a4 && !write { self.rng.now = self.clock.cycles() as u32; }
+        if block == 0x50083 { self.sdmmc.now_ns = self.now_ns(); }
+        // CDETECT and WRTPRT read the card-detect and write-protect signals of the GPIO matrix.
+        if block == 0x50083 && (off == 0x50 || off == 0x54) && !write {
+            let (cd, wp) = (0..SLOTS).fold((0, 0), |(cd, wp), s| (cd | (self.gpio.in_signal(SIG_SD_CARD_DETECT_N[s]) as u32) << s, wp | (self.gpio.in_signal(SIG_SD_WRITE_PRT[s]) as u32) << s));
+            self.sdmmc.card_detect_n = cd;
+            self.sdmmc.write_protect = wp;
+        }
     }
 }
 
@@ -515,7 +589,8 @@ impl Peripherals {
     pub fn new(mac: [u8; 6], wafer: (u32, u32)) -> Self {
         Peripherals {
             uart: [Uart::new(UartLayout::C6), Uart::new(UartLayout::C6)], usb: UsbSerialJtag::new(CPU_HZ), systimer: SystimerP4::default(),
-            timg: [TimerGroup::new(), TimerGroup::new()], gpio: { let mut g = Gpio::new(); g.strap = 0x30f; g }, io_mux: RegRam::new(),
+            timg: [TimerGroup::new(), TimerGroup::new()], gpio: GpioP4::new(), io_mux: RegRam::new(),
+            sdmmc: Sdmmc::new(SdmmcLayout::Esp32p4), sd_pins: Vec::new(),
             efuse: efuse_p4(mac, wafer, (0, 3)),
             spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true), psram1: psram_controller(),
             sha: Sha::new(), intmtx: IntMatrix::new(), clic: Clic::default(), cache: Cache::new(), hp_sys: HpSys::default(), hp_clkrst: HpClkRst::new(),
@@ -556,8 +631,39 @@ impl Peripherals {
 
     pub fn write32(&mut self, addr: u32, v: u32) {
         let fx = mmio::write32(self, addr, v);
-        if fx.contains(WriteEffect::SPI_EXEC) { if addr >> 12 == 0x5008f { self.psram_exec = true; } else { self.spi_exec = true; } }
+        if fx.contains(WriteEffect::SPI_EXEC | WriteEffect::PERIPH_RESET) {
+            if fx.contains(WriteEffect::PERIPH_RESET) { self.sdmmc.reset_registers(); }
+            if fx.contains(WriteEffect::SPI_EXEC) { if addr >> 12 == 0x5008f { self.psram_exec = true; } else { self.spi_exec = true; } }
+        }
     }
+
+    /// Which device each SDMMC slot reaches. Slot 0 is wired to its IO MUX pins: a device on
+    /// them is on slot 0 while the clock pad selects function 0. Slot 1 goes through the GPIO
+    /// matrix: a device is on it when its clock pad is a GPIO (function 1) driving slot 1's
+    /// SD_CARD_CCLK_2 signal.
+    pub fn sd_routes(&self) -> [Option<usize>; SLOTS] {
+        let mut r = [None; SLOTS];
+        for (i, p) in self.sd_pins.iter().enumerate() {
+            match pad_function(&self.io_mux, p.clk) {
+                0 if *p == SdPins::SOCKET => r[0] = Some(i),
+                1 if self.gpio.out_signal(p.clk) == SIG_SD_CCLK_2 => r[1] = Some(i),
+                _ => {}
+            }
+        }
+        r
+    }
+
+    /// Put a device on the SD bus at `pins`, in place of one already there.
+    pub fn attach_sd(&mut self, pins: SdPins, mut dev: Box<dyn esp_periph::sdmmc::SdDevice>) {
+        dev.set_log(self.sdmmc.logging());
+        match self.sd_pins.iter().position(|&p| p == pins) {
+            Some(i) => self.sdmmc.devices[i] = dev,
+            None => { self.sdmmc.attach(dev); self.sd_pins.push(pins); }
+        }
+    }
+
+    /// Emulated time in nanoseconds, from the device clock.
+    pub fn now_ns(&self) -> u64 { (self.clock.cycles() as u128 * 1_000_000_000 / CPU_HZ as u128) as u64 }
 
     /// Advance every clocked device by `cycles` CPU cycles.
     pub fn tick(&mut self, cycles: u64) { Dispatch::tick(self, cycles); }
@@ -696,6 +802,71 @@ mod tests {
         assert!(!p.hp_clkrst.core1_released());
         p.write32(0x500e_60c0, 0);
         assert!(p.hp_clkrst.core1_released());
+    }
+
+    fn card() -> Box<esp_periph::sdmmc::SdCard> { Box::new(esp_periph::sdmmc::SdCard::new(Box::new(esp_periph::sdmmc::MemStore(vec![0; 1 << 20]))).unwrap()) }
+
+    #[test]
+    fn gpio_selects_sit_four_bytes_above_the_c6s() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        assert_eq!(p.read32(0x500e_0158 + 4 * 126), 0x3e, "SD_CARD_DETECT_N_1 resets to constant low");
+        assert_eq!(p.read32(0x500e_0158 + 4 * 2), 0x3f, "most inputs to constant high");
+        p.write32(0x500e_0158 + 4 * 2, 0x80 | 40);
+        assert_eq!(p.gpio.g.func_in_sel[2], 0x80 | 40, "FUNC2_IN_SEL is the model's entry 2");
+        p.write32(0x500e_0558 + 4 * 43, SIG_SD_CCLK_2);
+        assert_eq!((p.gpio.out_signal(43), p.read32(0x500e_0558 + 4 * 43)), (0, 0));
+        assert_eq!(p.gpio.out_signal(42), 0x100, "the others still drive GPIO_OUT");
+        p.write32(0x500e_0154, 0x1234);
+        assert_eq!(p.read32(0x500e_0154), 0x1234, "PIN56 is register RAM");
+        assert_eq!(p.gpio.g.func_in_sel[0], 0x3f, "and not FUNC0_IN_SEL");
+    }
+
+    /// Slot 0 takes the socket on its IO MUX pins, slot 1 through the GPIO matrix; card detect
+    /// and write protect come from the matrix inputs.
+    #[test]
+    fn sd_slots_follow_the_pad_and_matrix_routing() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        p.attach_sd(SdPins::SOCKET, card());
+        assert_eq!(p.sd_routes(), [Some(0), None], "at reset the clock pad is SD1_CCLK");
+        p.write32(0x500e_1000 + 4 + 4 * 43, 1 << 12);
+        assert_eq!(p.sd_routes(), [None, None], "a GPIO driving GPIO_OUT");
+        p.write32(0x500e_0558 + 4 * 43, SIG_SD_CCLK_2);
+        assert_eq!(p.sd_routes(), [None, Some(0)], "a GPIO driving slot 1's clock");
+        assert_eq!(p.read32(0x5008_3050), 0, "card detect resets to constant low on both slots: present");
+        p.write32(0x500e_0158 + 4 * 127, 0x80 | 0x3f);
+        assert_eq!(p.read32(0x5008_3050), 2);
+        p.write32(0x500e_0158 + 4 * 131, 0x80 | 0x40 | 0x3f);
+        assert_eq!(p.read32(0x5008_3054), 0, "constant high inverted: not write protected");
+        p.gpio.g.set_input(5, true);
+        p.write32(0x500e_0158 + 4 * 130, 0x80 | 5);
+        assert_eq!(p.read32(0x5008_3054), 1, "a pin's level");
+    }
+
+    /// A card put in an occupied socket replaces the one there; one on other pins is another device.
+    #[test]
+    fn attaching_twice_replaces_the_card() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        p.attach_sd(SdPins::SOCKET, card());
+        p.attach_sd(SdPins::SOCKET, card());
+        assert_eq!((p.sdmmc.devices.len(), p.sd_pins.len()), (1, 1));
+        p.attach_sd(SdPins { clk: 18, cmd: 19, data: [14, 15, 16, 17] }, card());
+        assert_eq!(p.sdmmc.devices.len(), 2);
+        p.write32(0x500e_1000 + 4 + 4 * 18, 1 << 12);
+        p.write32(0x500e_0558 + 4 * 18, SIG_SD_CCLK_2);
+        assert_eq!(p.sd_routes(), [Some(0), Some(1)], "the socket on slot 0, the other device on slot 1");
+    }
+
+    #[test]
+    fn lp_clkrst_resets_the_sdmmc_host() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        p.attach_sd(SdPins::SOCKET, card());
+        p.write32(0x5008_3024, 0xffff);
+        assert_eq!(p.read32(0x5008_3024), 0xffff);
+        p.write32(0x5011_104c, 1 << 28);
+        p.write32(0x5011_104c, 0);
+        assert_eq!(p.read32(0x5008_3024), 0, "INTMASK back to its reset value");
+        assert_eq!(p.sdmmc.devices.len(), 1, "the card stays in its socket");
+        assert_eq!(p.read32(0x5011_104c), 0);
     }
 
     #[test]

@@ -47,6 +47,50 @@ pub const CLIC_HIGH: u32 = 0x2082_0000;
 #[derive(Clone, Copy)]
 enum Mmu { Flash, Psram }
 
+/// What the SDMMC host's IDMAC reaches: L2MEM and PSRAM (SOC_SDMMC_PSRAM_DMA_CAPABLE, IDF
+/// v5.5.3 include/soc/soc_caps.h), at their cached or uncached addresses. Caches are not
+/// modelled, so a DMA access sees what the cores wrote.
+struct SdmmcDma<'a> { l2mem: &'a mut [u8], psram: &'a mut [u8], mmu: &'a [u32; MMU_ENTRIES] }
+impl SdmmcDma<'_> {
+    /// The memory at `addr` and how many bytes of it are contiguous there.
+    fn span(&mut self, addr: u32) -> Result<&mut [u8], Fault> {
+        let a = if (0x8000_0000..0x9000_0000).contains(&addr) { addr - UNCACHED_OFFSET } else { addr };
+        match a {
+            L2MEM_LOW..=0x4FFB_FFFF => Ok(&mut self.l2mem[(a - L2MEM_LOW) as usize..]),
+            PSRAM_LOW..=0x4BFF_FFFF => {
+                let entry = self.mmu[((a - PSRAM_LOW) >> MMU_PAGE_SHIFT) as usize];
+                if entry & MMU_PSRAM_VALID == 0 { return Err(Fault::Unmapped); }
+                let off = (((entry & MMU_PSRAM_PAGE_MASK) as usize) << MMU_PAGE_SHIFT) | (a & 0xffff) as usize;
+                let page_end = (off | 0xffff) + 1;
+                self.psram.get_mut(off..page_end.min(self.psram.len())).filter(|s| !s.is_empty()).ok_or(Fault::Unmapped)
+            }
+            _ => Err(Fault::Unmapped),
+        }
+    }
+}
+impl esp_periph::sdmmc::SdmmcMemory for SdmmcDma<'_> {
+    fn read(&mut self, mut addr: u32, mut buf: &mut [u8]) -> Result<(), Fault> {
+        while !buf.is_empty() {
+            let s = self.span(addr)?;
+            let n = s.len().min(buf.len());
+            buf[..n].copy_from_slice(&s[..n]);
+            buf = &mut buf[n..];
+            addr = addr.wrapping_add(n as u32);
+        }
+        Ok(())
+    }
+    fn write(&mut self, mut addr: u32, mut data: &[u8]) -> Result<(), Fault> {
+        while !data.is_empty() {
+            let s = self.span(addr)?;
+            let n = s.len().min(data.len());
+            s[..n].copy_from_slice(&data[..n]);
+            data = &data[n..];
+            addr = addr.wrapping_add(n as u32);
+        }
+        Ok(())
+    }
+}
+
 pub struct SocBus {
     pub rom: Vec<u8>,
     pub l2mem: Vec<u8>,
@@ -156,6 +200,8 @@ impl SocBus {
     fn periph_read(&mut self, addr: u32, size: u32) -> u32 {
         let a = self.clic_view(addr & !3);
         let w = match Self::mmu_reg(a) { Some((m, o)) => self.mmu_read(m, o), None => self.periph.read32(a) };
+        // A STATUS read can raise the SDMMC's busy-clear interrupt.
+        if a >> 12 == 0x50083 && self.periph.sdmmc.take_read_irq() { self.irq_dirty = true; }
         match size { 1 => (w >> ((addr & 3) * 8)) & 0xff, 2 => (w >> ((addr & 2) * 8)) & 0xffff, _ => w }
     }
 
@@ -178,7 +224,16 @@ impl SocBus {
         self.periph.write32(a, v);
         if self.periph.spi_exec { self.run_spi(); }
         if self.periph.psram_exec { self.run_psram(); }
+        if self.periph.sdmmc.pending() { self.run_sdmmc(); }
         self.irq_dirty = true;
+    }
+
+    /// Carry out the SDMMC command or IDMAC resume the last write started, on the slots'
+    /// current pin routing.
+    fn run_sdmmc(&mut self) {
+        self.periph.sdmmc.route = self.periph.sd_routes();
+        let mut dma = SdmmcDma { l2mem: &mut self.l2mem, psram: &mut self.psram, mmu: &self.mmu_psram };
+        self.periph.sdmmc.run(&mut dma);
     }
 
     /// Execute a pending SPI1 command against the flash image.
@@ -417,6 +472,42 @@ mod tests {
         assert!(!b.reservation_held(data), "core 0 holds no reservation of its own");
         b.cur_core = 1;
         assert!(b.reservation_held(data));
+    }
+
+    /// The IDMAC reaches L2MEM at both addresses and PSRAM through its MMU, page by page.
+    #[test]
+    fn the_sdmmc_dma_reaches_l2mem_and_psram() {
+        use esp_periph::sdmmc::SdmmcMemory;
+        let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
+        b.psram = vec![0; 0x20000];
+        b.mmu_psram[0] = MMU_PSRAM_VALID | 1 << 10 | 1;
+        b.mmu_psram[1] = MMU_PSRAM_VALID | 1 << 10;
+        let mut d = SdmmcDma { l2mem: &mut b.l2mem, psram: &mut b.psram, mmu: &b.mmu_psram };
+        d.write(0x8FF4_0000, &[1, 2, 3, 4]).unwrap();
+        let mut r = [0u8; 4];
+        d.read(0x4FF4_0000, &mut r).unwrap();
+        assert_eq!(r, [1, 2, 3, 4]);
+        d.write(0x4800_fffe, &[5, 6, 7, 8]).unwrap();
+        assert_eq!((&b.psram[0x1_fffe..], &b.psram[..2]), (&[5u8, 6][..], &[7u8, 8][..]), "split across the page boundary as mapped");
+        let mut d = SdmmcDma { l2mem: &mut b.l2mem, psram: &mut b.psram, mmu: &b.mmu_psram };
+        assert!(d.read(0x4802_0000, &mut r).is_err(), "an unmapped PSRAM page");
+        assert!(d.read(0x4FFB_FFFE, &mut r).is_err(), "past the end of L2MEM");
+        assert!(d.write(0x3010_0000, &r).is_err(), "TCM is out of its reach");
+    }
+
+    /// A command through the bus: the CMD write is carried out before the next access.
+    #[test]
+    fn an_sdmmc_command_completes_within_its_register_write() {
+        let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
+        esp_soc::SocBus::attach_sd_card(&mut b, Box::new(esp_periph::sdmmc::MemStore(vec![0; 1 << 20])), Default::default()).unwrap();
+        b.write32(0x5008_3028, 0x1aa).unwrap();
+        b.write32(0x5008_302c, 1 << 31 | 1 << 6 | 8).unwrap();
+        assert_eq!(b.read32(0x5008_302c).unwrap() >> 31, 0, "taken");
+        assert_eq!((b.read32(0x5008_3030).unwrap(), b.read32(0x5008_3044).unwrap()), (0x1aa, 1 << 2), "R7 and CMD_DONE");
+        b.write32(0x5008_3024, 1 << 2).unwrap();
+        b.write32(0x5008_3000, 1 << 4).unwrap();
+        b.periph.refresh_lines();
+        assert_eq!(b.periph.source_status()[0] >> crate::periph::src::SDIO_HOST & 1, 1, "source 23 asserted");
     }
 
     /// Core 1 sees its own CLIC block at 0x20800000 and core 0's at 0x20810000.
