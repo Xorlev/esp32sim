@@ -3,8 +3,8 @@
 //! with the OWN hand-back, suspend and resume; the card's identification sequence, R1 status,
 //! data transfers, stop and errors (SD Physical Layer Simplified Specification v9.10).
 use emu_core::Fault;
-use esp_periph::sdmmc::card::{crc7, status, CardState, FileStore, MemStore, SdCard, SdStore};
-use esp_periph::sdmmc::{des0, idsts, int, reg, SdDataError, SdDevice, SdResponse, Sdmmc, SdmmcLayout, SdmmcMemory, BMOD_DE, CMD_AUTO_STOP, CMD_DATA, CMD_RESP, CMD_RESP_LONG, CMD_START, CMD_UPDATE_CLK, CMD_WRITE, CTRL_INT_ENABLE, CTRL_USE_INTERNAL_DMA};
+use esp_periph::sdmmc::card::{crc7, status, CardState, FileStore, MemStore, SdCard, SdCardConfig, SdStore};
+use esp_periph::sdmmc::{des0, idsts, int, reg, SdCmdError, SdDataError, SdDevice, SdResponse, Sdmmc, SdmmcLayout, SdmmcMemory, BMOD_DE, CMD_AUTO_STOP, CMD_DATA, CMD_RESP, CMD_RESP_CRC, CMD_RESP_LONG, CMD_START, CMD_UPDATE_CLK, CMD_WRITE, CTRL_INT_ENABLE, CTRL_USE_INTERNAL_DMA};
 use esp_periph::Device;
 
 const RCA_ARG: u32 = 0xe624 << 16;
@@ -12,20 +12,20 @@ const RCA_ARG: u32 = 0xe624 << 16;
 /// A 4 MiB image whose bytes count up, block by block.
 fn image() -> Vec<u8> { (0..4 << 20).map(|i: u32| (i / 512 + i % 251) as u8).collect() }
 fn card() -> SdCard { SdCard::new(Box::new(MemStore(image()))).unwrap() }
-fn short(r: Option<SdResponse>) -> u32 { match r { Some(SdResponse::Short(v)) => v, other => panic!("expected a short response, got {other:?}") } }
+fn short(r: Result<SdResponse, SdCmdError>) -> u32 { match r { Ok(SdResponse::Short(v)) => v, other => panic!("expected a short response, got {other:?}") } }
 fn state(r1: u32) -> u32 { r1 >> 9 & 0xf }
 
 /// CMD0, CMD8, ACMD41 until ready, CMD2, CMD3, CMD7: the card in transfer state.
 fn to_tran(c: &mut SdCard) {
-    assert_eq!(c.command(0, 0), None);
-    assert_eq!(short(c.command(8, 0x1aa)), 0x1aa);
+    assert_eq!(c.command(0, 0, 0), Err(SdCmdError::NoResponse));
+    assert_eq!(short(c.command(0, 8, 0x1aa)), 0x1aa);
     loop {
-        short(c.command(55, 0));
-        if short(c.command(41, 0x40ff_8000)) & 1 << 31 != 0 { break; }
+        short(c.command(0, 55, 0));
+        if short(c.command(0, 41, 0x40ff_8000)) & 1 << 31 != 0 { break; }
     }
-    assert!(matches!(c.command(2, 0), Some(SdResponse::Long(_))));
-    short(c.command(3, 0));
-    short(c.command(7, RCA_ARG));
+    assert!(matches!(c.command(0, 2, 0), Ok(SdResponse::Long(_))));
+    short(c.command(0, 3, 0));
+    short(c.command(0, 7, RCA_ARG));
 }
 
 // ------------------------------------------------------------------ card
@@ -40,56 +40,56 @@ fn crc7_matches_the_specification_examples() {
 #[test]
 fn identification_takes_the_card_from_idle_to_transfer() {
     let mut c = card();
-    assert_eq!(c.command(0, 0), None, "CMD0 has no response");
-    assert_eq!(short(c.command(8, 0x1aa)), 0x1aa, "CMD8 echoes the voltage and the check pattern (R7)");
-    let r1 = short(c.command(55, 0));
+    assert_eq!(c.command(0, 0, 0), Err(SdCmdError::NoResponse), "CMD0 has no response");
+    assert_eq!(short(c.command(0, 8, 0x1aa)), 0x1aa, "CMD8 echoes the voltage and the check pattern (R7)");
+    let r1 = short(c.command(0, 55, 0));
     assert_eq!((state(r1), r1 & status::APP_CMD), (0, status::APP_CMD), "CMD55 in idle expects an ACMD");
-    let ocr = short(c.command(41, 0x40ff_8000));
+    let ocr = short(c.command(0, 41, 0x40ff_8000));
     assert_eq!(ocr & 1 << 31, 0, "the first ACMD41 finds the card still powering up");
-    short(c.command(55, 0));
-    let ocr = short(c.command(41, 0x40ff_8000));
+    short(c.command(0, 55, 0));
+    let ocr = short(c.command(0, 41, 0x40ff_8000));
     assert_eq!(ocr, 0xc0ff_8000, "ready, high capacity (CCS), 2.7-3.6 V");
     assert_eq!(c.state(), CardState::Ready);
-    let Some(SdResponse::Long(cid)) = c.command(2, 0) else { panic!("CMD2 answers R2") };
+    let Ok(SdResponse::Long(cid)) = c.command(0, 2, 0) else { panic!("CMD2 answers R2") };
     let name: Vec<u8> = (0..5).map(|i| { let p = 96 - 8 * i; (cid[p / 32] >> (p % 32)) as u8 }).collect();
     assert_eq!(&name, b"SIMSD", "CID product name");
     assert_eq!(cid[0] & 0xff, (crc7(&c.cid().to_be_bytes()[..15]) << 1 | 1) as u32, "CID ends with its CRC7 and a 1");
-    let r6 = short(c.command(3, 0));
+    let r6 = short(c.command(0, 3, 0));
     assert_eq!((r6 >> 16, r6 >> 9 & 0xf), (0xe624, CardState::Ident as u32), "R6: the new RCA, the state CMD3 found");
-    let Some(SdResponse::Long(csd)) = c.command(9, RCA_ARG) else { panic!("CMD9 answers R2") };
+    let Ok(SdResponse::Long(csd)) = c.command(0, 9, RCA_ARG) else { panic!("CMD9 answers R2") };
     assert_eq!(csd[3] >> 30, 1, "CSD version 2.0");
     let c_size = (csd[1] >> 16) | (csd[2] & 0x3f) << 16;
     assert_eq!((c_size as u64 + 1) * 1024, c.blocks(), "capacity from C_SIZE");
     assert_eq!(c.blocks(), 8192, "4 MiB");
-    assert_eq!(c.command(9, 0x1234 << 16), None, "a card that is not addressed stays silent");
-    let r1 = short(c.command(7, RCA_ARG));
+    assert_eq!(c.command(0, 9, 0x1234 << 16), Err(SdCmdError::NoResponse), "a card that is not addressed stays silent");
+    let r1 = short(c.command(0, 7, RCA_ARG));
     assert_eq!(state(r1), CardState::Stby as u32, "CMD7's R1b shows standby, the state it found");
-    let r1 = short(c.command(13, RCA_ARG));
+    let r1 = short(c.command(0, 13, RCA_ARG));
     assert_eq!((state(r1), r1 & status::READY_FOR_DATA), (CardState::Tran as u32, status::READY_FOR_DATA));
 }
 
 #[test]
 fn the_card_needs_a_compatible_host() {
     let mut c = card();
-    c.command(0, 0);
-    assert_eq!(c.command(8, 0x2aa), None, "CMD8 with a voltage the card cannot take is not answered");
-    for _ in 0..3 { short(c.command(55, 0)); assert_eq!(short(c.command(41, 0x40ff_8000)) & 1 << 31, 0, "without CMD8 a high capacity card stays busy"); }
-    c.command(0, 0);
-    short(c.command(8, 0x1aa));
-    for _ in 0..3 { short(c.command(55, 0)); assert_eq!(short(c.command(41, 0x00ff_8000)) & 1 << 31, 0, "nor without HCS"); }
-    short(c.command(55, 0));
-    assert_eq!(short(c.command(41, 0)), 0x00ff_8000, "an empty voltage window only asks for the OCR");
+    assert_eq!(c.command(0, 0, 0), Err(SdCmdError::NoResponse));
+    assert_eq!(c.command(0, 8, 0x2aa), Err(SdCmdError::NoResponse), "CMD8 with a voltage the card cannot take is not answered");
+    for _ in 0..3 { short(c.command(0, 55, 0)); assert_eq!(short(c.command(0, 41, 0x40ff_8000)) & 1 << 31, 0, "without CMD8 a high capacity card stays busy"); }
+    assert_eq!(c.command(0, 0, 0), Err(SdCmdError::NoResponse));
+    short(c.command(0, 8, 0x1aa));
+    for _ in 0..3 { short(c.command(0, 55, 0)); assert_eq!(short(c.command(0, 41, 0x00ff_8000)) & 1 << 31, 0, "nor without HCS"); }
+    short(c.command(0, 55, 0));
+    assert_eq!(short(c.command(0, 41, 0)), 0x00ff_8000, "an empty voltage window only asks for the OCR");
 }
 
 #[test]
 fn an_illegal_command_is_unanswered_and_reported_once() {
     let mut c = card();
     to_tran(&mut c);
-    assert_eq!(c.command(2, 0), None, "CMD2 is not legal in transfer state");
-    assert_eq!(c.command(52, 0x8000_0c08), None, "nor are the SDIO commands on a memory card");
-    let r1 = short(c.command(13, RCA_ARG));
+    assert_eq!(c.command(0, 2, 0), Err(SdCmdError::NoResponse), "CMD2 is not legal in transfer state");
+    assert_eq!(c.command(0, 52, 0x8000_0c08), Err(SdCmdError::NoResponse), "nor are the SDIO commands on a memory card");
+    let r1 = short(c.command(0, 13, RCA_ARG));
     assert_eq!(r1 & status::ILLEGAL_COMMAND, status::ILLEGAL_COMMAND, "the next response reports it");
-    assert_eq!(short(c.command(13, RCA_ARG)) & status::ILLEGAL_COMMAND, 0, "and that clears it");
+    assert_eq!(short(c.command(0, 13, RCA_ARG)) & status::ILLEGAL_COMMAND, 0, "and that clears it");
     assert_eq!(c.state(), CardState::Tran, "an illegal command changes no state");
 }
 
@@ -98,7 +98,7 @@ fn single_and_multi_block_transfers_and_stop() {
     let mut c = card();
     to_tran(&mut c);
     let img = image();
-    let r1 = short(c.command(17, 3));
+    let r1 = short(c.command(0, 17, 3));
     assert_eq!(state(r1), CardState::Tran as u32);
     assert_eq!(c.state(), CardState::Data);
     let mut b = [0u8; 512];
@@ -108,21 +108,21 @@ fn single_and_multi_block_transfers_and_stop() {
     assert_eq!(c.read_data(&mut b), Err(SdDataError::Timeout), "nothing more to send");
 
     let data: Vec<u8> = (0..3 * 512).map(|i| (i * 7) as u8).collect();
-    short(c.command(25, 100));
+    short(c.command(0, 25, 100));
     assert_eq!(c.state(), CardState::Rcv);
-    c.write_data(&data[..700]).unwrap();
-    c.write_data(&data[700..]).unwrap();
-    let r1 = short(c.command(12, 0));
+    c.write_data(0, &data[..700]).unwrap();
+    c.write_data(0, &data[700..]).unwrap();
+    let r1 = short(c.command(0, 12, 0));
     assert_eq!(state(r1), CardState::Rcv as u32, "CMD12 found the card receiving");
     assert_eq!(c.state(), CardState::Tran, "programming is instant");
     assert_eq!(c.blocks_written, 3);
-    short(c.command(55, RCA_ARG));
-    short(c.command(22, 0));
+    short(c.command(0, 55, RCA_ARG));
+    short(c.command(0, 22, 0));
     let mut n = [0u8; 4];
     c.read_data(&mut n).unwrap();
     assert_eq!(u32::from_be_bytes(n), 3, "ACMD22 counts the blocks written");
 
-    short(c.command(18, 99));
+    short(c.command(0, 18, 99));
     let mut out = vec![0u8; 5 * 512];
     c.read_data(&mut out[..1000]).unwrap();
     c.read_data(&mut out[1000..]).unwrap();
@@ -130,12 +130,12 @@ fn single_and_multi_block_transfers_and_stop() {
     assert_eq!(&out[512..4 * 512], &data[..]);
     assert_eq!(&out[4 * 512..], &img[103 * 512..104 * 512]);
     assert_eq!(c.state(), CardState::Data, "a multi-block read runs until CMD12");
-    assert_eq!(state(short(c.command(12, 0))), CardState::Data as u32);
+    assert_eq!(state(short(c.command(0, 12, 0))), CardState::Data as u32);
     assert_eq!(c.state(), CardState::Tran);
-    assert_eq!(c.command(12, 0), None, "CMD12 with nothing to stop is illegal");
+    assert_eq!(c.command(0, 12, 0), Err(SdCmdError::NoResponse), "CMD12 with nothing to stop is illegal");
 
-    short(c.command(23, 2));
-    short(c.command(18, 10));
+    short(c.command(0, 23, 2));
+    short(c.command(0, 18, 10));
     let mut two = vec![0u8; 1024];
     c.read_data(&mut two).unwrap();
     assert_eq!(c.state(), CardState::Tran, "CMD23 ends the read after its count");
@@ -146,81 +146,114 @@ fn addresses_beyond_the_card_are_out_of_range() {
     let mut c = card();
     to_tran(&mut c);
     let end = c.blocks() as u32;
-    let r1 = short(c.command(17, end));
+    let r1 = short(c.command(0, 17, end));
     assert_eq!(r1 & status::OUT_OF_RANGE, status::OUT_OF_RANGE);
     assert_eq!(c.state(), CardState::Tran, "and no data phase starts");
     let mut b = [0u8; 512];
     assert_eq!(c.read_data(&mut b), Err(SdDataError::Timeout));
-    assert_eq!(short(c.command(13, RCA_ARG)) & status::OUT_OF_RANGE, 0, "cleared by the response that reported it");
-    short(c.command(18, end - 1));
+    assert_eq!(short(c.command(0, 13, RCA_ARG)) & status::OUT_OF_RANGE, 0, "cleared by the response that reported it");
+    short(c.command(0, 18, end - 1));
     let mut two = [0u8; 1024];
     assert_eq!(c.read_data(&mut two), Err(SdDataError::Timeout), "a multi-block read stops at the end");
-    short(c.command(12, 0));
-    let r1 = short(c.command(24, end));
+    short(c.command(0, 12, 0));
+    let r1 = short(c.command(0, 24, end));
     assert_eq!(r1 & status::OUT_OF_RANGE, status::OUT_OF_RANGE);
-    assert_eq!(c.write_data(&[0; 512]), Err(SdDataError::NoCrcStatus), "the card does not take the block");
+    assert_eq!(c.write_data(0, &[0; 512]), Err(SdDataError::NoCrcStatus), "the card does not take the block");
 }
 
 #[test]
 fn registers_bus_width_and_high_speed() {
     let mut c = card();
     to_tran(&mut c);
-    short(c.command(55, RCA_ARG));
-    let r1 = short(c.command(51, 0));
+    short(c.command(0, 55, RCA_ARG));
+    let r1 = short(c.command(0, 51, 0));
     assert_eq!(r1 & status::APP_CMD, status::APP_CMD, "an ACMD's R1 says it was taken as one");
     let mut scr = [0u8; 8];
     c.read_data(&mut scr).unwrap();
     assert_eq!(scr[..4], [0x02, 0x35, 0x80, 0x02], "SCR: SD 3.0x, security 2.00, 1- and 4-bit, CMD23");
     assert_eq!(c.bus_width(), Some(1));
-    short(c.command(55, RCA_ARG));
-    short(c.command(6, 2));
+    short(c.command(0, 55, RCA_ARG));
+    short(c.command(0, 6, 2));
     assert_eq!(c.bus_width(), Some(4), "ACMD6 selects four lines");
-    short(c.command(55, RCA_ARG));
-    short(c.command(13, 0));
+    short(c.command(0, 55, RCA_ARG));
+    short(c.command(0, 13, 0));
     let mut ssr = [0u8; 64];
     c.read_data(&mut ssr).unwrap();
     assert_eq!(ssr[0] >> 6, 2, "SD status: four lines");
-    short(c.command(6, 0x00ff_fff1));
+    short(c.command(0, 6, 0x00ff_fff1));
     let mut sw = [0u8; 64];
     c.read_data(&mut sw).unwrap();
     assert_eq!((sw[12], sw[13]), (0x80, 0x03), "group 1 offers default and high speed");
     assert_eq!(sw[16] & 0xf, 1, "a check of function 1 reports it would be selected");
     assert_eq!(sw[17], 1, "data structure version 1");
     assert_eq!(c.csd() >> 96 & 0xff, 0x32, "a check switches nothing");
-    short(c.command(6, 0x80ff_fff1));
+    short(c.command(0, 6, 0x80ff_fff1));
     c.read_data(&mut sw).unwrap();
     assert_eq!(c.csd() >> 96 & 0xff, 0x5a, "TRAN_SPEED 50 MHz after the switch");
-    short(c.command(6, 0x80ff_ff2f));
+    short(c.command(0, 6, 0x80ff_ff2f));
     c.read_data(&mut sw).unwrap();
     assert_eq!(sw[16] >> 4, 0xf, "an unsupported function reads 0xF");
     assert_eq!(c.csd() >> 96 & 0xff, 0x5a, "and nothing switches");
 }
 
 #[test]
-fn erase_and_the_programming_time_hook() {
+fn erase_zeroes_blocks() {
     let mut c = card();
     to_tran(&mut c);
-    short(c.command(32, 5));
-    short(c.command(33, 6));
-    short(c.command(38, 0));
-    short(c.command(17, 6));
+    short(c.command(0, 32, 5));
+    short(c.command(0, 33, 6));
+    short(c.command(0, 38, 0));
+    short(c.command(0, 17, 6));
     let mut b = [0xffu8; 512];
     c.read_data(&mut b).unwrap();
     assert!(b.iter().all(|&x| x == 0), "erased blocks read 0");
-    assert_eq!(short(c.command(38, 0)) & status::ERASE_SEQ_ERROR, status::ERASE_SEQ_ERROR, "CMD38 needs CMD32 and CMD33");
+    assert_eq!(short(c.command(0, 38, 0)) & status::ERASE_SEQ_ERROR, status::ERASE_SEQ_ERROR, "CMD38 needs CMD32 and CMD33");
 
-    c.prg_polls = 3;
-    short(c.command(24, 7));
-    c.write_data(&[9; 512]).unwrap();
+}
+
+/// A card with a programming time: DAT0 stays busy for that long in emulated time after a
+/// write, looking does not shorten it, and a read sent meanwhile is illegal, the next CMD13
+/// reporting ILLEGAL_COMMAND in prg (0x400e00), as a card does while it programs.
+#[test]
+fn programming_takes_its_time_and_refuses_reads_meanwhile() {
+    let mut c = SdCard::with_config(Box::new(MemStore(image())), SdCardConfig { prg_ns: 1_000_000, ..Default::default() }).unwrap();
+    to_tran(&mut c);
+    short(c.command(0, 24, 7));
+    c.write_data(10_000, &[9; 512]).unwrap();
     assert_eq!(c.state(), CardState::Prg);
-    assert!(c.busy(), "DAT0 busy while programming, one poll");
-    for _ in 0..2 {
-        let r1 = short(c.command(13, RCA_ARG));
-        assert_eq!((state(r1), r1 & status::READY_FOR_DATA), (CardState::Prg as u32, 0));
-    }
-    let r1 = short(c.command(13, RCA_ARG));
-    assert_eq!((state(r1), r1 & status::READY_FOR_DATA), (CardState::Tran as u32, status::READY_FOR_DATA), "done after its polls");
-    assert!(!c.busy());
+    for t in [10_000, 500_000, 1_009_999] { assert!(c.busy(t), "DAT0 busy at {t} ns"); }
+    assert!(!c.busy(1_010_000), "released after 1 ms");
+    let r1 = short(c.command(400_000, 13, RCA_ARG));
+    assert_eq!((state(r1), r1 & status::READY_FOR_DATA), (CardState::Prg as u32, 0), "programming, not ready for data");
+    assert_eq!(c.command(600_000, 18, 0), Err(SdCmdError::NoResponse), "CMD18 is illegal in prg: no response");
+    assert_eq!(short(c.command(700_000, 13, RCA_ARG)), 0x0040_0e00, "ILLEGAL_COMMAND, CURRENT_STATE prg, not ready");
+    let r1 = short(c.command(1_010_000, 13, RCA_ARG));
+    assert_eq!((state(r1), r1 & status::READY_FOR_DATA), (CardState::Tran as u32, status::READY_FOR_DATA), "back in transfer state");
+    short(c.command(2_000_000, 25, 8));
+    c.write_data(2_000_000, &[1; 1024]).unwrap();
+    assert!(!c.busy(2_000_000), "a multi-block write programs after CMD12");
+    short(c.command(2_100_000, 12, 0));
+    assert!(c.busy(2_100_000) && !c.busy(3_100_000));
+}
+
+/// Deselected while programming (CMD7 to another RCA), a card goes to dis, then stby when
+/// programming ends; selected again it returns to prg only while still programming (SD spec
+/// §4.8).
+#[test]
+fn deselect_while_programming() {
+    let mut c = SdCard::with_config(Box::new(MemStore(image())), SdCardConfig { prg_ns: 1_000_000, ..Default::default() }).unwrap();
+    to_tran(&mut c);
+    short(c.command(0, 24, 7));
+    c.write_data(0, &[9; 512]).unwrap();
+    assert_eq!(c.command(100_000, 7, 0), Err(SdCmdError::NoResponse), "deselect: not addressed, no answer");
+    assert_eq!(c.state(), CardState::Dis);
+    let r1 = short(c.command(200_000, 7, RCA_ARG));
+    assert_eq!((state(r1), c.state()), (CardState::Dis as u32, CardState::Prg), "still programming: back to prg");
+    c.command(300_000, 7, 0).unwrap_err();
+    let r1 = short(c.command(2_000_000, 13, RCA_ARG));
+    assert_eq!(state(r1), CardState::Stby as u32, "programming ended while deselected: stby");
+    short(c.command(2_000_000, 7, RCA_ARG));
+    assert_eq!(c.state(), CardState::Tran, "and selecting it now gives tran");
 }
 
 #[test]
@@ -438,8 +471,7 @@ fn a_write_moves_memory_to_the_card() {
 #[test]
 fn busy_clear_follows_the_card_after_a_write() {
     let mut h = Sdmmc::new(SdmmcLayout::Esp32p4);
-    let mut c = card();
-    c.prg_polls = 1;
+    let c = SdCard::with_config(Box::new(MemStore(image())), SdCardConfig { prg_ns: 1000, ..Default::default() }).unwrap();
     let i = h.attach(Box::new(c));
     h.route[1] = Some(i);
     let mut m = Ram(vec![0; 64 << 10]);
@@ -447,10 +479,16 @@ fn busy_clear_follows_the_card_after_a_write() {
     h.write(reg::CARDTHRCTL, 1 << 1);
     m.desc(RAM, des0::OWN | des0::CH | des0::LD, 512, RAM + 0x1000, 0);
     arm(&mut h, 512, RAM);
+    h.now_ns = 5000;
     let r = send(&mut h, &mut m, 24, 9, CMD_RESP | CMD_DATA | CMD_WRITE);
     assert_eq!(r, int::CMD_DONE | int::DATA_OVER, "the card is still programming: no BCI yet");
-    assert_eq!(h.read(reg::STATUS) >> 9 & 1, 0, "it has released DAT0 at the next look");
+    assert_eq!(h.read(reg::STATUS) >> 9 & 1, 1, "DAT0 busy");
+    assert_eq!(h.read(reg::STATUS) >> 9 & 1, 1, "looking again changes nothing");
+    assert!(!h.take_read_irq());
+    h.now_ns = 6000;
+    assert_eq!(h.read(reg::STATUS) >> 9 & 1, 0, "released 1 us on");
     assert_eq!(h.read(reg::RINTSTS), int::BCI);
+    assert!(h.take_read_irq(), "the read raised the interrupt");
     h.write(reg::RINTSTS, int::BCI);
     h.write(reg::CARDTHRCTL, 0);
     m.desc(RAM, des0::OWN | des0::CH | des0::LD, 512, RAM + 0x1000, 0);
@@ -458,6 +496,7 @@ fn busy_clear_follows_the_card_after_a_write() {
     let r = send(&mut h, &mut m, 24, 10, CMD_RESP | CMD_DATA | CMD_WRITE);
     assert_eq!(r, int::CMD_DONE | int::DATA_OVER, "no BCI with the enable off");
     assert_eq!(h.read(reg::STATUS) >> 9 & 1, 1, "DAT0 busy while the card programs");
+    h.now_ns = 7000;
     assert_eq!(h.read(reg::STATUS) >> 9 & 1, 0);
     assert_eq!(h.read(reg::RINTSTS), 0);
 }
@@ -487,4 +526,169 @@ fn faults_widths_and_missing_data_end_the_transfer() {
     let r = send(&mut h, &mut m, 17, 0, CMD_RESP | CMD_DATA);
     assert_eq!(r, int::CMD_DONE | int::DRTO | int::DATA_OVER, "one block asked for two: the second times out");
     assert_eq!(h.read(reg::IDSTS) & idsts::CES, idsts::CES);
+}
+
+/// A device that answers every command with `resp` and ends every read with `read`.
+struct Faulty { resp: Result<SdResponse, SdCmdError>, read: Result<(), SdDataError> }
+impl SdDevice for Faulty {
+    fn command(&mut self, _now: u64, _cmd: u8, _arg: u32) -> Result<SdResponse, SdCmdError> { self.resp }
+    fn read_data(&mut self, buf: &mut [u8]) -> Result<(), SdDataError> { buf.fill(0x5a); self.read }
+    fn write_data(&mut self, _now: u64, _data: &[u8]) -> Result<(), SdDataError> { Ok(()) }
+    fn name(&self) -> &str { "faulty" }
+}
+
+fn faulty(resp: Result<SdResponse, SdCmdError>, read: Result<(), SdDataError>) -> (Sdmmc, Ram) {
+    let mut h = Sdmmc::new(SdmmcLayout::Esp32p4);
+    let i = h.attach(Box::new(Faulty { resp, read }));
+    h.route[1] = Some(i);
+    (h, Ram(vec![0; 64 << 10]))
+}
+
+/// A response CRC error is RCRC when the command asks for the check, a malformed response
+/// RESP_ERR; either keeps the data phase from starting. A read block with a bad CRC is DCRC.
+#[test]
+fn response_and_data_errors_map_to_their_bits() {
+    let (mut h, mut m) = faulty(Err(SdCmdError::Crc(SdResponse::Short(0x900))), Ok(()));
+    assert_eq!(send(&mut h, &mut m, 13, 0, CMD_RESP | CMD_RESP_CRC), int::CMD_DONE | int::RCRC);
+    assert_eq!(h.read(reg::RESP0), 0x900, "the response as received");
+    assert_eq!(send(&mut h, &mut m, 13, 0, CMD_RESP), int::CMD_DONE, "not checked: taken as it is");
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 512, RAM + 0x1000, 0);
+    arm(&mut h, 512, RAM);
+    assert_eq!(send(&mut h, &mut m, 17, 0, CMD_RESP | CMD_RESP_CRC | CMD_DATA), int::CMD_DONE | int::RCRC, "no data phase after a bad response");
+    let (mut h, mut m) = faulty(Err(SdCmdError::Malformed(SdResponse::Short(1))), Ok(()));
+    assert_eq!(send(&mut h, &mut m, 13, 0, CMD_RESP), int::CMD_DONE | int::RESP_ERR);
+    let (mut h, mut m) = faulty(Ok(SdResponse::Short(0x900)), Err(SdDataError::Crc));
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 512, RAM + 0x1000, 0);
+    arm(&mut h, 512, RAM);
+    assert_eq!(send(&mut h, &mut m, 17, 0, CMD_RESP | CMD_DATA), int::CMD_DONE | int::DCRC | int::DATA_OVER, "a read block's CRC error");
+    let (mut h, mut m) = host();
+    host_to_tran(&mut h, &mut m);
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 512, RAM + 0x1000, 0);
+    arm(&mut h, 512, RAM);
+    assert_eq!(send(&mut h, &mut m, 24, 1 << 20, CMD_RESP | CMD_DATA | CMD_WRITE), int::CMD_DONE | int::EBE | int::DATA_OVER, "a write past the end gets no CRC status");
+    assert_eq!(h.read(reg::RESP0) & status::OUT_OF_RANGE, status::OUT_OF_RANGE);
+}
+
+/// A DMA reset, or a command with STOP_ABORT, ends a transfer the IDMAC has suspended: a poll
+/// demand afterwards has nothing to resume.
+#[test]
+fn a_suspended_transfer_can_be_aborted() {
+    for abort in 0..2 {
+        let (mut h, mut m) = host();
+        host_to_tran(&mut h, &mut m);
+        m.desc(RAM, des0::OWN | des0::CH, 512, RAM + 0x1000, RAM + 0x40);
+        m.desc(RAM + 0x40, des0::CH | des0::LD, 512, RAM + 0x1200, 0);
+        arm(&mut h, 1024, RAM);
+        send(&mut h, &mut m, 18, 0, CMD_RESP | CMD_DATA | CMD_AUTO_STOP);
+        assert_eq!(h.read(reg::IDSTS) & idsts::DU, idsts::DU);
+        if abort == 0 { let ctrl = h.read(reg::CTRL); h.write(reg::CTRL, ctrl | 1 << 2); } else { send(&mut h, &mut m, 12, 0, CMD_RESP | 1 << 14); }
+        m.desc(RAM + 0x40, des0::OWN | des0::CH | des0::LD, 512, RAM + 0x1200, 0);
+        h.write(reg::PLDMND, 1);
+        assert!(!h.pending(), "{}: nothing to resume", if abort == 0 { "DMA reset" } else { "STOP_ABORT" });
+        assert_eq!(m.word(RAM + 0x40) & des0::OWN, des0::OWN, "the second descriptor was never used");
+        send(&mut h, &mut m, 13, RCA_ARG, CMD_RESP);
+        let state_after = h.read(reg::RESP0) >> 9 & 0xf;
+        assert_eq!(state_after, if abort == 0 { CardState::Data as u32 } else { CardState::Tran as u32 }, "the card stops only on CMD12");
+    }
+}
+
+/// Descriptors in a list rather than chained: each with two buffers, the next 16 bytes on (no
+/// skip), and back to DBADDR after the one marked end of ring.
+#[test]
+fn ring_descriptors_with_two_buffers() {
+    let (mut h, mut m) = host();
+    host_to_tran(&mut h, &mut m);
+    m.desc(RAM, des0::OWN | des0::FS, 512 | 512 << 13, RAM + 0x1000, RAM + 0x2000);
+    m.desc(RAM + 16, des0::OWN | des0::ER | des0::LD, 512, RAM + 0x3000, 0);
+    arm(&mut h, 3 * 512, RAM);
+    let r = send(&mut h, &mut m, 18, 50, CMD_RESP | CMD_DATA | CMD_AUTO_STOP);
+    assert_eq!(r, int::CMD_DONE | int::DATA_OVER | int::ACD);
+    let img = image();
+    assert_eq!(&m.0[0x1000..0x1200], &img[50 * 512..51 * 512], "buffer 1");
+    assert_eq!(&m.0[0x2000..0x2200], &img[51 * 512..52 * 512], "buffer 2 of the same descriptor");
+    assert_eq!(&m.0[0x3000..0x3200], &img[52 * 512..53 * 512], "the next descriptor in the list");
+    assert_eq!((m.word(RAM) & des0::OWN, m.word(RAM + 16) & des0::OWN), (0, 0));
+    assert_eq!(h.read(reg::DSCADDR), RAM + 16);
+}
+
+/// TI and RI interrupt only with IDINTEN's normal summary enable, FBE/DU/CES only with the
+/// abnormal one.
+#[test]
+fn idmac_interrupts_need_their_summary_enable() {
+    let (mut h, mut m) = host();
+    host_to_tran(&mut h, &mut m);
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 512, RAM + 0x1000, 0);
+    arm(&mut h, 512, RAM);
+    h.write(reg::INTMASK, 0);
+    h.write(reg::IDINTEN, idsts::RI);
+    send(&mut h, &mut m, 17, 0, CMD_RESP | CMD_DATA);
+    assert_eq!(h.read(reg::IDSTS) & idsts::RI, idsts::RI);
+    assert!(!h.irq(), "RI without NI");
+    h.write(reg::IDINTEN, idsts::RI | idsts::NIS);
+    assert!(h.irq());
+    h.write(reg::IDSTS, idsts::W1C);
+    m.desc(RAM, des0::CH | des0::LD, 512, RAM + 0x1000, 0);
+    arm(&mut h, 512, RAM);
+    h.write(reg::INTMASK, 0);
+    h.write(reg::IDINTEN, idsts::DU | idsts::NIS);
+    send(&mut h, &mut m, 17, 0, CMD_RESP | CMD_DATA);
+    assert!(!h.irq(), "DU without AI");
+    h.write(reg::IDINTEN, idsts::DU | idsts::AIS);
+    assert!(h.irq());
+}
+
+/// Write-through survives reopening the file; a copy-on-write erase is a range, not a block
+/// per address, and a later write within it reads back.
+#[test]
+fn file_store_write_through_and_ranged_erase() {
+    let path = std::env::temp_dir().join(format!("esp32sim-sd-erase-{}.img", std::process::id()));
+    std::fs::write(&path, vec![0x11u8; 1 << 20]).unwrap();
+    let p = path.to_str().unwrap();
+    FileStore::write_through(p).unwrap().write(5, &[0x44; 512]).unwrap();
+    let mut b = [0u8; 512];
+    FileStore::copy_on_write(p).unwrap().read(5, &mut b).unwrap();
+    assert_eq!(b[0], 0x44, "on the file after reopening");
+    let mut cow = FileStore::copy_on_write(p).unwrap();
+    cow.write(10, &[0x55; 512]).unwrap();
+    cow.erase(0, 2047).unwrap();
+    cow.read(5, &mut b).unwrap();
+    assert!(b.iter().all(|&x| x == 0), "erased");
+    cow.read(10, &mut b).unwrap();
+    assert!(b.iter().all(|&x| x == 0), "an earlier write is erased too");
+    cow.write(7, &[0x66; 512]).unwrap();
+    cow.read(7, &mut b).unwrap();
+    assert_eq!(b[0], 0x66, "a write after the erase wins");
+    assert_eq!(std::fs::read(&path).unwrap()[5 * 512], 0x44, "the file keeps what it had");
+    let mut wt = FileStore::write_through(p).unwrap();
+    wt.erase(4, 6).unwrap();
+    let f = std::fs::read(&path).unwrap();
+    assert!(f[4 * 512..7 * 512].iter().all(|&x| x == 0) && f[3 * 512] == 0x11 && f[7 * 512] == 0x11, "write-through erases just the range");
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// The board's failure, through the host: a write's DATA_OVER comes before the card has
+/// programmed it, so a CMD18 sent meanwhile times out (IDF: ESP_ERR_TIMEOUT) and the CMD13
+/// that follows reads 0x400e00, ILLEGAL_COMMAND in prg.
+#[test]
+fn a_read_during_programming_times_out() {
+    let mut h = Sdmmc::new(SdmmcLayout::Esp32p4);
+    let c = SdCard::with_config(Box::new(MemStore(image())), SdCardConfig { prg_ns: 2_000_000, ..Default::default() }).unwrap();
+    let i = h.attach(Box::new(c));
+    h.route[1] = Some(i);
+    let mut m = Ram(vec![0; 64 << 10]);
+    host_to_tran(&mut h, &mut m);
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 1024, RAM + 0x1000, 0);
+    arm(&mut h, 1024, RAM);
+    h.now_ns = 1_000_000;
+    assert_eq!(send(&mut h, &mut m, 25, 64, CMD_RESP | CMD_DATA | CMD_WRITE | CMD_AUTO_STOP), int::CMD_DONE | int::DATA_OVER | int::ACD);
+    assert_eq!(h.read(reg::STATUS) >> 9 & 1, 1, "DAT0 busy after the auto-stop");
+    h.now_ns = 1_500_000;
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 1024, RAM + 0x1000, 0);
+    arm(&mut h, 1024, RAM);
+    assert_eq!(send(&mut h, &mut m, 18, 64, CMD_RESP | CMD_DATA | CMD_AUTO_STOP), int::CMD_DONE | int::RTO, "no response, no data phase");
+    send(&mut h, &mut m, 13, RCA_ARG, CMD_RESP);
+    assert_eq!(h.read(reg::RESP0), 0x0040_0e00);
+    h.now_ns = 3_000_000;
+    send(&mut h, &mut m, 13, RCA_ARG, CMD_RESP);
+    assert_eq!(h.read(reg::RESP0), 0x900, "transfer state, ready for data");
 }

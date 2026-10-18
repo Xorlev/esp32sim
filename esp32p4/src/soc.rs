@@ -196,9 +196,10 @@ impl esp_soc::SocBus for SocBus {
     fn irq_sources_of(&self, core: usize, line: u32) -> Vec<usize> { self.periph.sources_of(core, line + CLIC_EXT_OFFSET) }
     /// The card goes in the reference board's socket, on slot 0's IO MUX pins; firmware reaches
     /// it through slot 0 or, routing those pins through the GPIO matrix, slot 1.
-    fn attach_sd_card(&mut self, image: Box<dyn esp_periph::sdmmc::SdStore>) -> Result<String, String> {
-        let card = esp_periph::sdmmc::SdCard::new(image)?;
-        let what = format!("{}, {} blocks, at CLK {} CMD {} D0-D3 {:?}", card.describe(), card.blocks(), periph::SdPins::SOCKET.clk, periph::SdPins::SOCKET.cmd, periph::SdPins::SOCKET.data);
+    fn attach_sd_card(&mut self, image: Box<dyn esp_periph::sdmmc::SdStore>, config: esp_periph::sdmmc::SdCardConfig) -> Result<String, String> {
+        let card = esp_periph::sdmmc::SdCard::with_config(image, config)?;
+        let what = format!("{}, {} blocks ({}), serial {:08x}, programming {} us, at CLK {} CMD {} D0-D3 {:?}", card.describe(), card.blocks(), if card.sdxc() { "SDXC" } else { "SDHC" },
+                           card.serial(), card.config.prg_ns / 1000, periph::SdPins::SOCKET.clk, periph::SdPins::SOCKET.cmd, periph::SdPins::SOCKET.data);
         self.periph.attach_sd(periph::SdPins::SOCKET, Box::new(card));
         Ok(what)
     }

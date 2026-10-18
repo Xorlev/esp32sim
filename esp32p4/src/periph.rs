@@ -572,6 +572,7 @@ impl DeviceSet for Peripherals {
         // INTR_STATUS_0..3 read the source state.
         if block == 0x500d6 && !write && (0x200..=0x20c).contains(&(off & 0x7ff)) { self.intmtx.status = self.source_status(); }
         if block == 0x50110 && off == 0x1a4 && !write { self.rng.now = self.clock.cycles() as u32; }
+        if block == 0x50083 { self.sdmmc.now_ns = self.now_ns(); }
         // CDETECT and WRTPRT read the card-detect and write-protect signals of the GPIO matrix.
         if block == 0x50083 && (off == 0x50 || off == 0x54) && !write {
             let (cd, wp) = (0..SLOTS).fold((0, 0), |(cd, wp), s| (cd | (self.gpio.in_signal(SIG_SD_CARD_DETECT_N[s]) as u32) << s, wp | (self.gpio.in_signal(SIG_SD_WRITE_PRT[s]) as u32) << s));
@@ -652,12 +653,17 @@ impl Peripherals {
         r
     }
 
-    /// Put a device on the SD bus at `pins`.
+    /// Put a device on the SD bus at `pins`, in place of one already there.
     pub fn attach_sd(&mut self, pins: SdPins, mut dev: Box<dyn esp_periph::sdmmc::SdDevice>) {
         dev.set_log(self.sdmmc.logging());
-        self.sdmmc.attach(dev);
-        self.sd_pins.push(pins);
+        match self.sd_pins.iter().position(|&p| p == pins) {
+            Some(i) => self.sdmmc.devices[i] = dev,
+            None => { self.sdmmc.attach(dev); self.sd_pins.push(pins); }
+        }
     }
+
+    /// Emulated time in nanoseconds, from the device clock.
+    pub fn now_ns(&self) -> u64 { (self.clock.cycles() as u128 * 1_000_000_000 / CPU_HZ as u128) as u64 }
 
     /// Advance every clocked device by `cycles` CPU cycles.
     pub fn tick(&mut self, cycles: u64) { Dispatch::tick(self, cycles); }
@@ -834,6 +840,20 @@ mod tests {
         p.gpio.g.set_input(5, true);
         p.write32(0x500e_0158 + 4 * 130, 0x80 | 5);
         assert_eq!(p.read32(0x5008_3054), 1, "a pin's level");
+    }
+
+    /// A card put in an occupied socket replaces the one there; one on other pins is another device.
+    #[test]
+    fn attaching_twice_replaces_the_card() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        p.attach_sd(SdPins::SOCKET, card());
+        p.attach_sd(SdPins::SOCKET, card());
+        assert_eq!((p.sdmmc.devices.len(), p.sd_pins.len()), (1, 1));
+        p.attach_sd(SdPins { clk: 18, cmd: 19, data: [14, 15, 16, 17] }, card());
+        assert_eq!(p.sdmmc.devices.len(), 2);
+        p.write32(0x500e_1000 + 4 + 4 * 18, 1 << 12);
+        p.write32(0x500e_0558 + 4 * 18, SIG_SD_CCLK_2);
+        assert_eq!(p.sd_routes(), [Some(0), Some(1)], "the socket on slot 0, the other device on slot 1");
     }
 
     #[test]

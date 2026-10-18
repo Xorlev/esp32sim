@@ -200,6 +200,8 @@ impl SocBus {
     fn periph_read(&mut self, addr: u32, size: u32) -> u32 {
         let a = self.clic_view(addr & !3);
         let w = match Self::mmu_reg(a) { Some((m, o)) => self.mmu_read(m, o), None => self.periph.read32(a) };
+        // A STATUS read can raise the SDMMC's busy-clear interrupt.
+        if a >> 12 == 0x50083 && self.periph.sdmmc.take_read_irq() { self.irq_dirty = true; }
         match size { 1 => (w >> ((addr & 3) * 8)) & 0xff, 2 => (w >> ((addr & 2) * 8)) & 0xffff, _ => w }
     }
 
@@ -497,7 +499,7 @@ mod tests {
     #[test]
     fn an_sdmmc_command_completes_within_its_register_write() {
         let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
-        esp_soc::SocBus::attach_sd_card(&mut b, Box::new(esp_periph::sdmmc::MemStore(vec![0; 1 << 20]))).unwrap();
+        esp_soc::SocBus::attach_sd_card(&mut b, Box::new(esp_periph::sdmmc::MemStore(vec![0; 1 << 20])), Default::default()).unwrap();
         b.write32(0x5008_3028, 0x1aa).unwrap();
         b.write32(0x5008_302c, 1 << 31 | 1 << 6 | 8).unwrap();
         assert_eq!(b.read32(0x5008_302c).unwrap() >> 31, 0, "taken");

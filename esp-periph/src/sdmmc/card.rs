@@ -3,7 +3,7 @@
 //! responses of §4.9, the card status of §4.10.1 and the registers of chapter 5. It is a high
 //! capacity card (CSD version 2.0, block addressing, 512-byte blocks) of the image's size, in
 //! default or high speed, 1- or 4-bit, without UHS-I, locking or write protection.
-use super::{SdDataError, SdDevice, SdResponse};
+use super::{SdCmdError, SdDataError, SdDevice, SdResponse};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -16,6 +16,11 @@ pub trait SdStore {
     fn is_empty(&self) -> bool { self.len() == 0 }
     fn read(&mut self, lba: u64, buf: &mut [u8; BLOCK]) -> std::io::Result<()>;
     fn write(&mut self, lba: u64, data: &[u8; BLOCK]) -> std::io::Result<()>;
+    /// Blocks `lo..=hi` read 0 from now on.
+    fn erase(&mut self, lo: u64, hi: u64) -> std::io::Result<()> {
+        for lba in lo..=hi { self.write(lba, &[0; BLOCK])?; }
+        Ok(())
+    }
     /// What the CLI prints about it.
     fn describe(&self) -> String { format!("{} MiB in memory", self.len() >> 20) }
 }
@@ -34,24 +39,29 @@ impl SdStore for MemStore {
         self.0.get_mut(at..at + BLOCK).ok_or(std::io::ErrorKind::UnexpectedEof)?.copy_from_slice(data);
         Ok(())
     }
+    fn erase(&mut self, lo: u64, hi: u64) -> std::io::Result<()> {
+        self.0.get_mut(lo as usize * BLOCK..(hi as usize + 1) * BLOCK).ok_or(std::io::ErrorKind::UnexpectedEof)?.fill(0);
+        Ok(())
+    }
 }
 
-/// An image file. Copy-on-write keeps written blocks in memory and never modifies the file;
-/// write-through writes them to it.
-pub struct FileStore { file: std::fs::File, len: u64, overlay: Option<HashMap<u64, Box<[u8; BLOCK]>>>, path: String }
+/// An image file. Copy-on-write keeps written blocks, and erased ranges, in memory and never
+/// modifies the file; write-through writes them to it.
+pub struct FileStore { file: std::fs::File, len: u64, overlay: Option<HashMap<u64, Box<[u8; BLOCK]>>>, erased: Vec<(u64, u64)>, path: String }
 impl FileStore {
     pub fn copy_on_write(path: &str) -> std::io::Result<Self> { Self::open(path, false) }
     pub fn write_through(path: &str) -> std::io::Result<Self> { Self::open(path, true) }
     fn open(path: &str, write: bool) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).write(write).open(path)?;
         let len = file.metadata()?.len();
-        Ok(FileStore { file, len, overlay: (!write).then(HashMap::new), path: path.to_string() })
+        Ok(FileStore { file, len, overlay: (!write).then(HashMap::new), erased: Vec::new(), path: path.to_string() })
     }
 }
 impl SdStore for FileStore {
     fn len(&self) -> u64 { self.len }
     fn read(&mut self, lba: u64, buf: &mut [u8; BLOCK]) -> std::io::Result<()> {
         if let Some(b) = self.overlay.as_ref().and_then(|o| o.get(&lba)) { buf.copy_from_slice(&b[..]); return Ok(()); }
+        if self.erased.iter().any(|&(lo, hi)| (lo..=hi).contains(&lba)) { buf.fill(0); return Ok(()); }
         self.file.seek(SeekFrom::Start(lba * BLOCK as u64))?;
         self.file.read_exact(buf)
     }
@@ -59,6 +69,18 @@ impl SdStore for FileStore {
         if let Some(o) = &mut self.overlay { o.insert(lba, Box::new(*data)); return Ok(()); }
         self.file.seek(SeekFrom::Start(lba * BLOCK as u64))?;
         self.file.write_all(data)
+    }
+    fn erase(&mut self, lo: u64, hi: u64) -> std::io::Result<()> {
+        if let Some(o) = &mut self.overlay {
+            o.retain(|lba, _| !(lo..=hi).contains(lba));
+            self.erased.push((lo, hi));
+            return Ok(());
+        }
+        let zeros = [0u8; 64 << 10];
+        self.file.seek(SeekFrom::Start(lo * BLOCK as u64))?;
+        let mut left = (hi - lo + 1) * BLOCK as u64;
+        while left > 0 { let n = left.min(zeros.len() as u64) as usize; self.file.write_all(&zeros[..n])?; left -= n as u64; }
+        Ok(())
     }
     fn describe(&self) -> String { format!("{} ({} MiB, {})", self.path, self.len >> 20, if self.overlay.is_some() { "copy-on-write" } else { "write-through" }) }
 }
@@ -108,8 +130,31 @@ enum Phase {
     Write { lba: u64, buf: Vec<u8>, multi: bool, left: Option<u32> },
 }
 
+/// What makes one card differ from another.
+#[derive(Clone, Debug)]
+pub struct SdCardConfig {
+    /// DAT0 busy after the last block of a write, after CMD12 ends a multi-block write, and
+    /// after an erase, in nanoseconds of emulated time. 0: programming is instant.
+    pub prg_ns: u64,
+    /// ACMD41s answered busy before power-up is done.
+    pub init_polls: u32,
+    /// CID (SD spec §5.2): manufacturer ID, OEM/application ID, product name, revision, serial
+    /// number (`None`: derived from the image size) and manufacturing year and month.
+    pub mid: u8,
+    pub oid: [u8; 2],
+    pub name: [u8; 5],
+    pub revision: u8,
+    pub serial: Option<u32>,
+    pub date: (u16, u8),
+}
+impl Default for SdCardConfig {
+    /// MID 0 (no manufacturer's), "ES", "SIMSD", revision 1.0, 2024-01.
+    fn default() -> Self { SdCardConfig { prg_ns: 0, init_polls: 1, mid: 0, oid: *b"ES", name: *b"SIMSD", revision: 0x10, serial: None, date: (2024, 1) } }
+}
+
 pub struct SdCard {
     store: Box<dyn SdStore>,
+    pub config: SdCardConfig,
     /// Addressable 512-byte blocks: the image rounded down to the 512 KiB unit of C_SIZE.
     blocks: u64,
     state: CardState,
@@ -118,8 +163,6 @@ pub struct SdCard {
     app_cmd: bool,
     /// a valid CMD8 since the last reset: the host speaks SD 2.00 and may set HCS
     if_cond: bool,
-    /// ACMD41s answered busy before the card reports power-up done.
-    pub init_polls: u32,
     init_left: u32,
     high_speed: bool,
     wide: bool,
@@ -127,10 +170,8 @@ pub struct SdCard {
     erase: (Option<u64>, Option<u64>),
     data: Phase,
     written: u32,
-    /// Status polls (CMD13 or the host's DAT0 busy check) the card spends programming after
-    /// a write or an erase. 0: programming is instant.
-    pub prg_polls: u32,
-    prg_left: u32,
+    /// end of the programming period in progress, in nanoseconds
+    busy_until: u64,
     serial: u32,
     pub log: bool,
     pub commands: u64,
@@ -140,29 +181,36 @@ pub struct SdCard {
 
 impl SdCard {
     /// A card for the image; it must hold at least one 512 KiB capacity unit.
-    pub fn new(store: Box<dyn SdStore>) -> Result<Self, String> {
+    pub fn new(store: Box<dyn SdStore>) -> Result<Self, String> { Self::with_config(store, SdCardConfig::default()) }
+
+    pub fn with_config(store: Box<dyn SdStore>, config: SdCardConfig) -> Result<Self, String> {
         let units = store.len() / (512 << 10);
         if units == 0 { return Err(format!("an SD card image needs at least 512 KiB, this one has {} bytes", store.len())); }
         if units > 1 << 22 { return Err("an SD card image is limited to 2 TiB (CSD C_SIZE)".into()); }
         let blocks = units * 1024;
-        // A serial number that follows the image, so two images read as two cards.
-        let serial = (blocks as u32).wrapping_mul(0x9e37_79b9) ^ 0x5d1c_0b17;
-        Ok(SdCard { store, blocks, state: CardState::Idle, rca: 0, status: 0, app_cmd: false, if_cond: false, init_polls: 1, init_left: 1, high_speed: false, wide: false,
-                    block_count: None, erase: (None, None), data: Phase::None, written: 0, prg_polls: 0, prg_left: 0, serial, log: false, commands: 0, blocks_read: 0, blocks_written: 0 })
+        // Without one configured, a serial number that follows the image, so two images read
+        // as two cards.
+        let serial = config.serial.unwrap_or((blocks as u32).wrapping_mul(0x9e37_79b9) ^ 0x5d1c_0b17);
+        let init_left = config.init_polls;
+        Ok(SdCard { store, config, blocks, state: CardState::Idle, rca: 0, status: 0, app_cmd: false, if_cond: false, init_left, high_speed: false, wide: false,
+                    block_count: None, erase: (None, None), data: Phase::None, written: 0, busy_until: 0, serial, log: false, commands: 0, blocks_read: 0, blocks_written: 0 })
     }
     pub fn state(&self) -> CardState { self.state }
     pub fn blocks(&self) -> u64 { self.blocks }
     pub fn rca(&self) -> u16 { self.rca }
     pub fn store(&mut self) -> &mut dyn SdStore { &mut *self.store }
     pub fn describe(&self) -> String { self.store.describe() }
-    fn sdxc(&self) -> bool { self.blocks > 32 << 21 }
+    pub fn serial(&self) -> u32 { self.serial }
+    /// Above 32 GiB the card is SDXC, below it SDHC; there is no SDSC (byte-addressed) card.
+    pub fn sdxc(&self) -> bool { self.blocks > 32 << 21 }
 
-    /// CID (SD spec §5.2): MID 0 (no manufacturer's), OID "ES", PNM "SIMSD", PRV 1.0, PSN,
-    /// MDT 2024-01.
+    /// CID (SD spec §5.2), from the configuration.
     pub fn cid(&self) -> u128 {
-        let mut v = (u16::from_be_bytes(*b"ES") as u128) << 104;
-        for (i, &c) in b"SIMSD".iter().enumerate() { v |= (c as u128) << (96 - 8 * i); }
-        v |= 0x10 << 56 | (self.serial as u128) << 24 | (24 << 4 | 1) << 8;
+        let c = &self.config;
+        let mut v = (c.mid as u128) << 120 | (u16::from_be_bytes(c.oid) as u128) << 104;
+        for (i, &ch) in c.name.iter().enumerate() { v |= (ch as u128) << (96 - 8 * i); }
+        let date = ((c.date.0.saturating_sub(2000) as u128 & 0xff) << 4) | (c.date.1 as u128 & 0xf);
+        v |= (c.revision as u128) << 56 | (self.serial as u128) << 24 | date << 8;
         with_crc7(v)
     }
 
@@ -219,13 +267,13 @@ impl SdCard {
         self.status = 0;
         self.app_cmd = false;
         self.if_cond = false;
-        self.init_left = self.init_polls;
+        self.init_left = self.config.init_polls;
         self.high_speed = false;
         self.wide = false;
         self.block_count = None;
         self.erase = (None, None);
         self.data = Phase::None;
-        self.prg_left = 0;
+        self.busy_until = 0;
     }
 
     /// The card status word of an R1 response: CURRENT_STATE is the state the command found
@@ -235,18 +283,17 @@ impl SdCard {
         self.status | (at as u32 & 0xf) << 9 | ready
     }
 
-    /// Go to `Prg` for the configured programming time, or straight on to `next`.
-    fn program(&mut self, next: CardState) {
-        self.prg_left = self.prg_polls;
-        self.state = if self.prg_left > 0 { CardState::Prg } else { next };
+    /// Programming from `now` for the configured time (SD spec §4.3.4): prg, then tran.
+    fn program(&mut self, now: u64) {
+        self.busy_until = now.saturating_add(self.config.prg_ns);
+        self.state = if self.config.prg_ns > 0 { CardState::Prg } else { CardState::Tran };
     }
 
-    /// A status poll while programming: the card finishes when the polls run out.
-    fn poll_busy(&mut self) -> bool {
-        if self.prg_left == 0 { return false; }
-        self.prg_left -= 1;
-        if self.prg_left == 0 && self.state == CardState::Prg { self.state = CardState::Tran; }
-        true
+    /// When programming has ended: prg goes to tran, dis (deselected while programming) to
+    /// stby (SD spec §4.8).
+    fn settle(&mut self, now: u64) {
+        if now < self.busy_until { return; }
+        match self.state { CardState::Prg => self.state = CardState::Tran, CardState::Dis => self.state = CardState::Stby, _ => {} }
     }
 
     fn load(&mut self, lba: u64) -> Option<Vec<u8>> {
@@ -258,7 +305,7 @@ impl SdCard {
     }
 
     /// SD spec §4.8 (the card state transitions) and §4.7.4 (the commands).
-    fn exec(&mut self, cmd: u8, arg: u32, app: bool) -> Result<Reply, ()> {
+    fn exec(&mut self, now: u64, cmd: u8, arg: u32, app: bool) -> Result<Reply, ()> {
         use CardState::*;
         let st = self.state;
         let mine = arg >> 16 == self.rca as u32;
@@ -299,7 +346,8 @@ impl SdCard {
             4 if st == Stby => Ok(Reply::Silent),
             // CMD6 SWITCH_FUNC
             6 if tran => { let s = self.switch_status(arg); self.data = Phase::Read { buf: s, pos: 0, next: None, left: None }; self.state = Data; Ok(Reply::R1) }
-            // CMD7 SELECT/DESELECT_CARD: a card not addressed deselects without answering
+            // CMD7 SELECT/DESELECT_CARD: a card not addressed deselects without answering; dis
+            // is only left for prg while the card still programs (`settle` ends it at stby)
             7 => match (mine, st) {
                 (true, Stby) => { self.state = Tran; Ok(Reply::R1b) }
                 (true, Dis) => { self.state = Prg; Ok(Reply::R1b) }
@@ -319,13 +367,9 @@ impl SdCard {
             10 if st == Stby => Ok(if mine { Reply::R2(self.cid()) } else { Reply::Silent }),
             // CMD12 STOP_TRANSMISSION
             12 if st == Data => { self.data = Phase::None; self.state = Tran; Ok(Reply::R1b) }
-            12 if st == Rcv => { self.data = Phase::None; self.program(Tran); Ok(Reply::R1b) }
+            12 if st == Rcv => { self.data = Phase::None; self.program(now); Ok(Reply::R1b) }
             // CMD13 SEND_STATUS
-            13 if matches!(st, Stby | Tran | Data | Rcv | Prg | Dis) => {
-                if !mine { return Ok(Reply::Silent); }
-                self.poll_busy();
-                Ok(Reply::R1)
-            }
+            13 if matches!(st, Stby | Tran | Data | Rcv | Prg | Dis) => Ok(if mine { Reply::R1 } else { Reply::Silent }),
             // CMD15 GO_INACTIVE_STATE
             15 if mine && st != Idle && st != Ready && st != Ident => { self.state = Ina; Ok(Reply::Silent) }
             // CMD16 SET_BLOCKLEN: read and write blocks are 512 bytes on this card regardless
@@ -334,9 +378,10 @@ impl SdCard {
             // answers OUT_OF_RANGE and sends nothing
             17 | 18 if tran => {
                 let lba = arg as u64;
-                if lba >= self.blocks { self.status |= OUT_OF_RANGE; self.block_count = None; return Ok(Reply::R1); }
+                let count = self.block_count.take();
+                if lba >= self.blocks { self.status |= OUT_OF_RANGE; return Ok(Reply::R1); }
                 let Some(buf) = self.load(lba) else { return Ok(Reply::R1) };
-                let (next, left) = if cmd == 18 { (Some(lba + 1), self.block_count.take().map(|n| n.saturating_sub(1))) } else { (None, None) };
+                let (next, left) = if cmd == 18 { (Some(lba + 1), count.map(|n| n.saturating_sub(1))) } else { (None, None) };
                 self.data = Phase::Read { buf, pos: 0, next, left };
                 self.state = Data;
                 Ok(Reply::R1)
@@ -346,8 +391,9 @@ impl SdCard {
             // CMD24 WRITE_BLOCK, CMD25 WRITE_MULTIPLE_BLOCK
             24 | 25 if tran => {
                 let lba = arg as u64;
-                if lba >= self.blocks { self.status |= OUT_OF_RANGE; self.block_count = None; return Ok(Reply::R1); }
-                let left = if cmd == 25 { self.block_count.take() } else { None };
+                let count = self.block_count.take();
+                if lba >= self.blocks { self.status |= OUT_OF_RANGE; return Ok(Reply::R1); }
+                let left = if cmd == 25 { count } else { None };
                 self.written = 0;
                 self.data = Phase::Write { lba, buf: Vec::with_capacity(BLOCK), multi: cmd == 25, left };
                 self.state = Rcv;
@@ -363,8 +409,8 @@ impl SdCard {
             38 if tran => {
                 let (Some(lo), Some(hi)) = std::mem::take(&mut self.erase) else { self.status |= ERASE_SEQ_ERROR; return Ok(Reply::R1b) };
                 if hi < lo { self.status |= ERASE_PARAM; return Ok(Reply::R1b); }
-                for lba in lo..=hi { if self.store.write(lba, &[0; BLOCK]).is_err() { self.status |= CC_ERROR | ERROR; break; } }
-                self.program(Tran);
+                if self.store.erase(lo, hi).is_err() { self.status |= CC_ERROR | ERROR; }
+                self.program(now);
                 Ok(Reply::R1b)
             }
             // CMD55 APP_CMD: the next command is an application command
@@ -398,16 +444,17 @@ impl SdCard {
 }
 
 impl SdDevice for SdCard {
-    fn command(&mut self, cmd: u8, arg: u32) -> Option<SdResponse> {
+    fn command(&mut self, now: u64, cmd: u8, arg: u32) -> Result<SdResponse, SdCmdError> {
         self.commands += 1;
-        if self.state == CardState::Ina { return None; }
+        self.settle(now);
+        if self.state == CardState::Ina { return Err(SdCmdError::NoResponse); }
         let at = self.state;
         let app = std::mem::take(&mut self.app_cmd);
         if !app { self.status &= !APP_CMD; }
-        let r = match self.exec(cmd, arg, app) {
-            Ok(reply) => self.respond(at, reply),
+        let r = match self.exec(now, cmd, arg, app) {
+            Ok(reply) => self.respond(at, reply).ok_or(SdCmdError::NoResponse),
             // SD spec §4.6.1: an illegal command is not answered and shows in the next response.
-            Err(()) => { self.status |= ILLEGAL_COMMAND; None }
+            Err(()) => { self.status |= ILLEGAL_COMMAND; Err(SdCmdError::NoResponse) }
         };
         if self.log { eprintln!("[sd] {}CMD{} arg {:#010x} in {:?} -> {:?}, now {:?}", if app { "A" } else { "" }, cmd, arg, at, r, self.state); }
         r
@@ -437,7 +484,7 @@ impl SdDevice for SdCard {
         Ok(())
     }
 
-    fn write_data(&mut self, data: &[u8]) -> Result<(), SdDataError> {
+    fn write_data(&mut self, now: u64, data: &[u8]) -> Result<(), SdDataError> {
         let mut rest = data;
         while !rest.is_empty() {
             let Phase::Write { lba, buf, multi, left } = &mut self.data else { return Err(SdDataError::NoCrcStatus) };
@@ -454,12 +501,12 @@ impl SdDevice for SdCard {
             if self.store.write(at, &block).is_err() { self.status |= CC_ERROR | ERROR; self.data = Phase::None; self.state = CardState::Tran; return Err(SdDataError::Crc); }
             self.blocks_written += 1;
             self.written += 1;
-            if last { self.data = Phase::None; self.program(CardState::Tran); }
+            if last { self.data = Phase::None; self.program(now); }
         }
         Ok(())
     }
 
-    fn busy(&mut self) -> bool { self.poll_busy() }
+    fn busy(&self, now: u64) -> bool { self.state == CardState::Prg && now < self.busy_until }
     fn bus_width(&self) -> Option<u8> { Some(if self.wide { 4 } else { 1 }) }
     fn name(&self) -> &str { "SD card" }
     fn set_log(&mut self, on: bool) { self.log = on; }

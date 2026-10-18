@@ -10,9 +10,11 @@
 //!
 //! A command runs to completion when the chip calls `run` after the CMD write that starts it:
 //! the response, CMD_DONE, the data phase through the IDMAC, DATA_OVER and the auto-stop. The
-//! IDMAC suspends on a descriptor the CPU still owns (DU) and resumes on a PLDMND write.
+//! IDMAC suspends on a descriptor the CPU still owns (DU) and resumes on a PLDMND write. Devices
+//! see emulated time (`Sdmmc::now_ns`, set by the chip before each access) for their own busy
+//! periods; the bus itself takes none.
 pub mod card;
-pub use card::{FileStore, MemStore, SdCard, SdStore};
+pub use card::{FileStore, MemStore, SdCard, SdCardConfig, SdStore};
 use crate::device::{Device, WriteEffect};
 use crate::regram::RegRam;
 use emu_core::Fault;
@@ -24,29 +26,41 @@ pub const SLOTS: usize = 2;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SdResponse { Short(u32), Long([u32; 4]) }
 
+/// A command that did not get a good response.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SdCmdError {
+    /// the device did not answer: the host's response timeout (RTO)
+    NoResponse,
+    /// a response with a bad CRC7 (RCRC when the command asks for the check)
+    Crc(SdResponse),
+    /// a response with a wrong index or end bit (RESP_ERR)
+    Malformed(SdResponse),
+}
+
 /// Why a data block did not complete.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SdDataError {
-    /// the device sent no data: the host's data read timeout
+    /// the device sent no data (a read) or no CRC status (a write): DRTO or EBE
     Timeout,
-    /// a write block was refused with a CRC status error
+    /// a read block with a bad CRC16, or a write block refused with a CRC status error: DCRC
     Crc,
-    /// a write block got no CRC status (the device was not receiving)
+    /// a write block got no CRC status, the device not receiving: EBE
     NoCrcStatus,
 }
 
 /// Something on an SD bus: a memory card now, an SDIO function later (slot 1 of the P4 is the
 /// ESP-Hosted link). The host sends commands and moves data; the device answers in the SD
-/// protocol's terms and knows nothing about registers or DMA.
+/// protocol's terms and knows nothing about registers or DMA. `now` is emulated time in
+/// nanoseconds.
 pub trait SdDevice {
-    /// A command on CMD. `None`: the device does not answer and the host times out.
-    fn command(&mut self, cmd: u8, arg: u32) -> Option<SdResponse>;
+    /// A command on CMD and the device's answer.
+    fn command(&mut self, now: u64, cmd: u8, arg: u32) -> Result<SdResponse, SdCmdError>;
     /// The next `buf.len()` bytes of the data phase the last command started (card to host).
     fn read_data(&mut self, buf: &mut [u8]) -> Result<(), SdDataError>;
     /// The next bytes of a write data phase (host to card).
-    fn write_data(&mut self, data: &[u8]) -> Result<(), SdDataError>;
-    /// DAT0 held low (programming, an R1b busy period), asked whenever the host looks.
-    fn busy(&mut self) -> bool { false }
+    fn write_data(&mut self, now: u64, data: &[u8]) -> Result<(), SdDataError>;
+    /// DAT0 held low (programming, an R1b busy period). Looking does not change the device.
+    fn busy(&self, _now: u64) -> bool { false }
     /// How many data lines the device drives now, checked against the host's CTYPE.
     fn bus_width(&self) -> Option<u8> { None }
     /// The SDIO interrupt (DAT1 low).
@@ -100,6 +114,7 @@ pub const CMD_STOP_ABORT: u32 = 1 << 14;
 pub const CMD_AUTO_STOP: u32 = 1 << 12;
 pub const CMD_WRITE: u32 = 1 << 10;
 pub const CMD_DATA: u32 = 1 << 9;
+pub const CMD_RESP_CRC: u32 = 1 << 8;
 pub const CMD_RESP_LONG: u32 = 1 << 7;
 pub const CMD_RESP: u32 = 1 << 6;
 /// RINTSTS / INTMASK / MINTSTS bits (hal/esp32p4/include/hal/sdmmc_ll.h SDMMC_LL_EVENT_*).
@@ -175,10 +190,14 @@ pub struct Sdmmc {
     /// What is on the bus, and which of it each slot reaches (set by the chip before `run`).
     pub devices: Vec<Box<dyn SdDevice>>,
     pub route: [Option<usize>; SLOTS],
+    /// Emulated time in nanoseconds, set by the chip before every access.
+    pub now_ns: u64,
     xfer: Option<Transfer>,
     pending: Pending,
     /// slot of a finished write whose busy-clear interrupt is still to come
     bci_slot: Option<usize>,
+    /// a register read raised an interrupt (BCI on a STATUS read)
+    read_irq: bool,
     pub stats: SdmmcStats,
     log: bool,
 }
@@ -187,8 +206,8 @@ impl Sdmmc {
     pub fn new(layout: SdmmcLayout) -> Self {
         let mut s = Sdmmc { layout, ctrl: 0, cmd: 0, cmdarg: 0, resp: [0; 4], rintsts: 0, intmask: 0, ctype: 0, blksiz: 0, bytcnt: 0,
             bmod: 0, dbaddr: 0, idsts: 0, idinten: 0, dscaddr: 0, bufaddr: 0, tcbcnt: 0, tbbcnt: 0, resp_index: 0, cursor: 0,
-            ram: RegRam::new(), card_detect_n: 0, write_protect: 0, devices: Vec::new(), route: [None; SLOTS], xfer: None,
-            pending: Pending::None, bci_slot: None, stats: SdmmcStats::default(), log: false };
+            ram: RegRam::new(), card_detect_n: 0, write_protect: 0, devices: Vec::new(), route: [None; SLOTS], now_ns: 0, xfer: None,
+            pending: Pending::None, bci_slot: None, read_irq: false, stats: SdmmcStats::default(), log: false };
         s.reset_registers();
         s
     }
@@ -219,8 +238,16 @@ impl Sdmmc {
     /// `--debug sdmmc` is on.
     pub fn logging(&self) -> bool { self.log }
 
+    /// A register read changed the interrupt line since the last call.
+    pub fn take_read_irq(&mut self) -> bool { std::mem::take(&mut self.read_irq) }
+
+    /// The controller's interrupt under CTRL.INT_ENABLE, and the IDMAC's: TI and RI under
+    /// IDINTEN.NI, FBE, DU and CES under IDINTEN.AI.
     pub fn irq(&self) -> bool {
-        (self.ctrl & CTRL_INT_ENABLE != 0 && self.rintsts & self.intmask & int::ALL != 0) || self.idsts & self.idinten & idsts::W1C != 0
+        let pending = self.idsts & self.idinten;
+        (self.ctrl & CTRL_INT_ENABLE != 0 && self.rintsts & self.intmask & int::ALL != 0)
+            || (pending & (idsts::TI | idsts::RI) != 0 && self.idinten & idsts::NIS != 0)
+            || (pending & (idsts::FBE | idsts::DU | idsts::CES) != 0 && self.idinten & idsts::AIS != 0)
     }
 
     fn idmac_on(&self) -> bool { self.bmod & BMOD_DE != 0 && self.ctrl & CTRL_USE_INTERNAL_DMA != 0 }
@@ -242,6 +269,11 @@ impl Sdmmc {
         }
     }
 
+    fn send(&mut self, slot: usize, index: u8, arg: u32) -> Result<SdResponse, SdCmdError> {
+        let now = self.now_ns;
+        self.device(slot).map_or(Err(SdCmdError::NoResponse), |d| d.command(now, index, arg))
+    }
+
     fn command(&mut self, mem: &mut dyn SdmmcMemory) {
         let c = self.cmd;
         self.cmd &= !CMD_START;
@@ -249,18 +281,21 @@ impl Sdmmc {
         if c & CMD_STOP_ABORT != 0 { self.xfer = None; }
         self.stats.commands += 1;
         let arg = self.cmdarg;
-        let resp = self.device(slot).and_then(|d| d.command(index, arg));
+        let resp = self.send(slot, index, arg);
         if self.log { eprintln!("[sdmmc] slot {} CMD{} arg {:#010x} -> {:?}", slot, index, arg, resp); }
+        let mut error = 0;
         if c & CMD_RESP != 0 {
-            match resp {
-                None => { self.stats.timeouts += 1; self.rintsts |= int::RTO | int::CMD_DONE; return; }
-                Some(SdResponse::Short(v)) => self.resp[0] = v,
-                Some(SdResponse::Long(v)) => self.resp = v,
-            }
+            let r = match resp {
+                Err(SdCmdError::NoResponse) => { self.stats.timeouts += 1; self.rintsts |= int::RTO | int::CMD_DONE; return; }
+                Ok(r) => r,
+                Err(SdCmdError::Crc(r)) => { if c & CMD_RESP_CRC != 0 { error = int::RCRC; } r }
+                Err(SdCmdError::Malformed(r)) => { error = int::RESP_ERR; r }
+            };
+            match r { SdResponse::Short(v) => self.resp[0] = v, SdResponse::Long(v) => self.resp = v }
             self.resp_index = index as u32;
         }
-        self.rintsts |= int::CMD_DONE;
-        if c & CMD_DATA != 0 { self.start_transfer(slot, c, mem); }
+        self.rintsts |= int::CMD_DONE | error;
+        if c & CMD_DATA != 0 && error == 0 { self.start_transfer(slot, c, mem); }
     }
 
     fn start_transfer(&mut self, slot: usize, c: u32, mem: &mut dyn SdmmcMemory) {
@@ -295,24 +330,27 @@ impl Sdmmc {
         self.finish(false);
     }
 
+    /// The end of the data phase. The auto-stop goes out after an error as well: an
+    /// assumption, which the IDF driver relies on to get the card out of its data state.
     fn finish(&mut self, ok: bool) {
         let Some(x) = self.xfer.take() else { return };
         if ok { self.rintsts |= int::DATA_OVER; }
         self.tcbcnt = x.total - x.card_left;
         self.tbbcnt = x.moved;
         if x.auto_stop {
-            let r = self.device(x.slot).and_then(|d| d.command(12, 0));
-            if let Some(SdResponse::Short(v)) = r { self.resp[1] = v; self.resp_index = 12; }
+            if let Ok(SdResponse::Short(v)) = self.send(x.slot, 12, 0) { self.resp[1] = v; self.resp_index = 12; }
             self.rintsts |= int::ACD;
         }
         if x.write && self.ram.read(reg::CARDTHRCTL) & CARDTHRCTL_BUSY_CLR_INT_EN != 0 { self.bci_slot = Some(x.slot); self.busy_clear(); }
     }
 
-    /// BCI once the card that took the last write releases DAT0.
+    /// BCI at the first look after the card that took the last write releases DAT0 (the
+    /// host has no clock of its own to raise it at that moment).
     fn busy_clear(&mut self) -> bool {
         let Some(slot) = self.bci_slot else { return false };
-        let busy = self.device(slot).is_some_and(|d| d.busy());
-        if !busy { self.bci_slot = None; self.rintsts |= int::BCI; }
+        let now = self.now_ns;
+        let busy = self.device(slot).is_some_and(|d| d.busy(now));
+        if !busy { self.bci_slot = None; self.rintsts |= int::BCI; self.read_irq = true; }
         busy
     }
 
@@ -356,10 +394,10 @@ impl Sdmmc {
                 let mut chunk = vec![0u8; n as usize];
                 if mem.read(at, &mut chunk).is_err() { self.xfer = Some(x); self.fault(true); return; }
                 x.fifo.extend_from_slice(&chunk);
-                let slot = x.slot;
+                let (slot, now) = (x.slot, self.now_ns);
                 while x.card_left > 0 && (x.fifo.len() as u32 >= x.block.min(x.card_left)) {
                     let k = x.block.min(x.card_left) as usize;
-                    let r = match self.device(slot) { Some(dev) => dev.write_data(&x.fifo[..k]), None => Err(SdDataError::NoCrcStatus) };
+                    let r = match self.device(slot) { Some(dev) => dev.write_data(now, &x.fifo[..k]), None => Err(SdDataError::NoCrcStatus) };
                     if let Err(e) = r { self.xfer = Some(x); self.data_error(if e == SdDataError::Crc { int::DCRC } else { int::EBE }); return; }
                     x.fifo.drain(..k);
                     x.card_left -= k as u32;
@@ -371,7 +409,7 @@ impl Sdmmc {
                     let mut b = vec![0u8; k];
                     let slot = x.slot;
                     let r = match self.device(slot) { Some(dev) => dev.read_data(&mut b), None => Err(SdDataError::Timeout) };
-                    if r.is_err() { self.xfer = Some(x); self.data_error(int::DRTO); return; }
+                    if let Err(e) = r { self.xfer = Some(x); self.data_error(if e == SdDataError::Crc { int::DCRC } else { int::DRTO }); return; }
                     x.fifo.extend_from_slice(&b);
                     x.card_left -= k as u32;
                     self.stats.bytes_read += k as u64;
@@ -396,9 +434,9 @@ impl Sdmmc {
         if d.des0 & des0::DIC == 0 { self.idsts |= if x.write { idsts::TI } else { idsts::RI } | idsts::NIS; }
         let mut next = [0u8; 4];
         self.cursor = if d.des0 & des0::CH != 0 {
-            if mem.read(d.addr + 12, &mut next).is_err() { self.fault(x.write); return false; }
+            if mem.read(d.addr.wrapping_add(12), &mut next).is_err() { self.fault(x.write); return false; }
             u32::from_le_bytes(next)
-        } else if d.des0 & des0::ER != 0 { self.dbaddr } else { d.addr + 16 + 4 * (self.bmod >> 2 & 0x1f) };
+        } else if d.des0 & des0::ER != 0 { self.dbaddr } else { d.addr.wrapping_add(16 + 4 * (self.bmod >> 2 & 0x1f)) };
         if d.des0 & des0::LD != 0 { x.chain_end = true; }
         true
     }
@@ -407,8 +445,9 @@ impl Sdmmc {
         // FIFO empty (2) and below the transmit watermark (1): the model keeps no FIFO between
         // register accesses. Command FSM idle; DAT3 high with a device on the active slot.
         let slot = (self.cmd >> 16 & 0x1f) as usize;
+        let now = self.now_ns;
         let (present, busy) = if self.bci_slot == Some(slot) { (true, self.busy_clear()) } else {
-            match self.device(slot) { Some(d) => (true, d.busy()), None => (false, false) }
+            match self.device(slot) { Some(d) => (true, d.busy(now)), None => (false, false) }
         };
         1 << 1 | 1 << 2 | (present as u32) << 8 | (busy as u32) << 9 | (self.resp_index & 0x3f) << 11
     }

@@ -68,7 +68,7 @@ impl<S: Soc> Machine<S> {
                 self.bus.board().set_camera_picture(picture).map_err(str::to_owned)?;
                 Ok(())
             }
-            LoadKind::SdCard => self.bus.attach_sd_card(Box::new(esp_periph::sdmmc::MemStore(data.to_vec()))).map(|_| ()),
+            LoadKind::SdCard => self.bus.attach_sd_card(Box::new(esp_periph::sdmmc::MemStore(data.to_vec())), Default::default()).map(|_| ()),
         }
     }
 

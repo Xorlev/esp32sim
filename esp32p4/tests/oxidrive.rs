@@ -32,6 +32,16 @@ fn board_mac(log: &str) -> [u8; 6] {
     match suffix { Some([d, e, f]) => [0x30, 0xed, 0xa0, d, e, f], None => [0x30, 0xed, 0xa0, 0x00, 0x11, 0x22] }
 }
 
+/// The board card's size and serial number from the firmware's probe line in the capture
+/// (`sd: <size> MiB, serial <hex>, ...`), so the image presents as that card; neither value is
+/// in this repository. Without the line: 128 GB and the model's own serial.
+fn board_card(log: &str) -> (u64, Option<u32>) {
+    let probe = log.lines().find_map(|l| l.split_once(" sd: ").map(|(_, r)| r.to_string()));
+    let mib = probe.as_deref().and_then(|r| r.split_once(" MiB")).and_then(|(n, _)| n.trim().parse::<u64>().ok());
+    let serial = probe.as_deref().and_then(|r| r.split_once("serial ")).and_then(|(_, t)| u32::from_str_radix(t.get(..8)?, 16).ok());
+    (mib.map_or(128_000_000_000, |n| n << 20), serial)
+}
+
 /// Lines that differ because the ECO0 ROM stands in for the board's ECO2 one: the banner, and
 /// the heap region below the ROM's own data, which IDF sizes from the ROM's `ets_rom_layout`
 /// (`_dram0_rtos_reserved_start` is 0x4FF3FBA4 in the ECO0 ELF; the board's ROM ends it 12 bytes
@@ -43,10 +53,11 @@ fn known_rom_difference(line: usize, emu: &str, board: &str) -> bool {
 /// The owner's oxidrive firmware (not in this repository), booted from the same bootloader,
 /// partition table and app as the board whose console is `board-boot.log`, with a FAT32 card in
 /// the SD socket, and compared line for line with timestamps stripped and the ROM's known
-/// differences set aside. The card is a 4 GiB image laid out as a card formatter lays out an
-/// SDHC card (MBR, FAT32 from LBA 2048, 32 KiB clusters), so the firmware's card lines report
-/// its size, not the board card's. Not expected to pass yet: it reports how far the console
-/// matches, the first line that does not, what followed, and where the run stopped.
+/// differences set aside. The card is a sparse image of the board card's size and serial
+/// number (`board_card`), an SDXC card like the board's, laid out as a card formatter lays one
+/// out (MBR, FAT32 from LBA 2048, 32 KiB clusters); its FAT geometry and contents are the
+/// image's, not the board card's. Not expected to pass yet: it reports how far the console
+/// matches, every block that does not, and where the run stopped.
 #[test]
 #[ignore = "needs the oxidrive images under ~/Code/dlp/sim-fixtures"]
 fn external_oxidrive_console_matches_the_board() {
@@ -64,8 +75,10 @@ fn external_oxidrive_console_matches_the_board() {
     m.load_rom(&std::fs::read(rom("esp32p4_rev0")).unwrap()).unwrap();
     for (off, data) in [(0x2000, bootloader), (0x8000, file("partition-table.bin")), (0x30000, file("app.bin"))] { m.write_flash(off, &data).unwrap(); }
     let card = tmp("oxidrive-card.img");
-    sd_image::fat32(&card, 4 << 30, 32 << 10, "ESP32SIM").unwrap();
-    let what = esp_soc::SocBus::attach_sd_card(&mut m.bus, Box::new(esp_periph::sdmmc::FileStore::copy_on_write(card.to_str().unwrap()).unwrap())).unwrap();
+    let (size, serial) = board_card(&board_log);
+    sd_image::fat32(&card, size, 32 << 10, "ESP32SIM").unwrap();
+    let config = esp_periph::sdmmc::SdCardConfig { serial, ..Default::default() };
+    let what = esp_soc::SocBus::attach_sd_card(&mut m.bus, Box::new(esp_periph::sdmmc::FileStore::copy_on_write(card.to_str().unwrap()).unwrap()), config).unwrap();
     eprintln!("[oxidrive] SD card: {what}");
     m.boot_rom();
     m.console.capture = true;
