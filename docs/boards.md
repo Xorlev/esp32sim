@@ -126,7 +126,7 @@ The energy-scan firmware and the run recipe: `examples/waveshare-c6-lcd147/`, [e
 | BOOT button | GPIO 9 | `press boot 150` |
 | 802.15.4 radio | the C6's MAC | the firmware is a Zigbee sleepy end device; `--zigbee` gives it a coordinator |
 
-The firmware is the [Evan Alarm](https://github.com/xorlev/Smoke-Alarm) Rust port; `sim/` there has the run script and scenarios.
+The firmware is the Evan Alarm toy's Rust port (not published); its repository's `sim/` has the run script and scenarios.
 
 ## `ttgo-tdisplay` — LilyGO TTGO T-Display (classic ESP32)
 
