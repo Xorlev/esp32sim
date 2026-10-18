@@ -26,8 +26,9 @@ PSRAM and register presets.
 | `--flash-mb N`, `--psram-mb N` | flash size (JEDEC follows it) and octal PSRAM size (default 8 / 2) |
 | `--sd IMAGE`, `--sd-rw IMAGE` | (P4) an SD card in the reference board's socket (CLK 43, CMD 44, D0-D3 39-42), holding the image: a high capacity card of the image's size, rounded down to 512 KiB. `--sd` is copy-on-write: what the firmware writes stays in memory and the file is never modified. `--sd-rw` writes through to the file. See [esp32p4.md](esp32p4.md), "SD card" |
 | `--sd-prg-us N`, `--sd-serial HEX` | (P4) the card's programming time after a write or an erase, in microseconds of emulated time (default 0: instant), and its CID serial number (default: derived from the image size) |
-| `--sd-timing` | (P4) commands and data take their time on the SD bus at the slot's card clock and width: CMD_DONE, DATA_OVER and the auto-stop come when the bits are through (default: at once). See [esp32p4.md](esp32p4.md), "The host" |
+| `--sd-timing` | (P4) commands and data take their time on the SD bus at the slot's card clock and width: CMD_DONE, DATA_OVER and the auto-stop come when the bits are through (default: at once); with `--coproc` the SDIO link's too. See [esp32p4.md](esp32p4.md), "The host" |
 | `--usb-host F` | (P4) a USB host on the high-speed USB-OTG port, running the commands in F (below) from power-up; the run then goes on to `--max-seconds`. See [esp32p4.md](esp32p4.md), "USB" |
+| `--coproc c6:KEY=VALUE,...` | (P4) an ESP32-C6 co-processor on SDIO slot 1, run in lock-step with the P4 (below); `--wifi` and `--net` then go to the C6's radio |
 | `--board atech14\|waveshare-cam\|waveshare-lcd4b\|waveshare-amoled18-v2\|none` | board model (default atech14); on the C6: `waveshare-c6-lcd147` or `none`; on the classic ESP32: `ttgo-tdisplay` (alias `tdisplay`), `esp32dev-loopback` or `none`/`esp32dev` |
 | `--strap HEX`, `--reset-cause HEX`, `--efuse-regs F`, `--regs-init F` | reproduce a real chip's boot state (used by the differential tests) |
 | `--no-reboot` | stop at the first chip reset instead of rebooting from ROM |
@@ -180,6 +181,38 @@ adds a `[usb]` line with the core's and the host's counts.
 example's application owns the card (MEDIUM NOT PRESENT) and takes it again.
 `examples/usb_msc-p4/faults.txt` is a car meeting faults: a command that times out mid-transfer,
 a port reset after an eject, and VBUS lost while a clip is being written.
+
+## Co-processor (P4)
+
+`--coproc c6:KEY=VALUE,...` puts an ESP32-C6 on the P4's SDIO slot 1, wired as ESP-Hosted wires it
+on the reference board (CLK 18, CMD 19, D0-D3 14-17, the C6's EN on GPIO 54), and runs the two
+chips in lock-step on one clock ([esp32p4.md](esp32p4.md), "The co-processor"). The C6 boots
+from its mask ROM at power-up; `--wifi` attaches the virtual access point to its radio and `--net`
+the network behind it. Native only: the browser build has no co-processor.
+
+```sh
+esp32sim-p4 --flash-mb 2 --bootloader p4-bootloader.bin --ptable p4-ptable.bin --app wifi_station.bin \
+    --coproc c6:bootloader=c6-bootloader.bin,ptable=c6-ptable.bin,app=network_adapter.bin,otadata=ota_data_initial.bin,stub=bb_init=0,elf=network_adapter.elf \
+    --wifi ssid=esp32sim,psk=esp32sim-pass --max-seconds 6
+```
+
+| Key | Meaning |
+| --- | --- |
+| `bootloader=F`, `ptable=F`, `app=F` | the C6's images, at 0x0, 0x8000 and 0x10000 (`app` is required) |
+| `otadata=F[@OFFSET]` | the OTA data partition's image, at 0xD000 unless an offset follows (hex) |
+| `elf=F` (repeatable), `stub=SYMBOL[=value]` (repeatable) | the C6's symbols and function stubs, as `--elf` and `--stub` for a C6 run (a C6 radio run needs `stub=bb_init=0`) |
+| `rom=F` | the C6's mask ROM ELF (default: `esp32c6_rev0_rom.elf` found as for `--rom`) |
+| `flash-mb=N`, `mac=xx:..` | the C6's flash size (4) and efuse MAC (40:4c:ca:00:11:22) |
+| `en=N`, `en=!N` | the P4 GPIO the C6's EN follows (54): driven low holds the C6 in reset, driven high or not driven (the pull-up) lets it run; `!` inverts the line |
+| `slice-us=N` | the lock-step slice (10): how late, at most, the slave's SDIO interrupt reaches the P4 |
+| `console=F` | write the C6's console to F instead of stdout |
+
+Both consoles go to stdout a line at a time, in the order the slices produced them: the P4's as
+they are (`[p4] ` in front with `--console-prefix`), the C6's UART0 with `[c6] ` in front. The
+end-of-run report adds the C6's lines (`[c6] stop:`, its SDIO counts, its WiFi and network counts)
+and `[cosim]` (slices, EN changes). `--debug sdio` prints the C6 slave's commands and DMA,
+`--debug sdmmc` the P4 host's commands. `--max-seconds` is rounded up to a whole slice;
+`--max-insns` does not apply.
 
 ## Virtual BLE
 

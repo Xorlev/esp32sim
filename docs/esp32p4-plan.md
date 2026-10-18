@@ -1,12 +1,14 @@
 # ESP32-P4 — plan
 
-Status: milestone 3 done, milestone 4 next. hello_world boots to `app_main` on one and on both
+Status: milestone 4a done, 4b next. hello_world boots to `app_main` on one and on both
 cores and reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr counters,
 CLIC mode and two harts. The SDMMC host and an SD card carry IDF's sdmmc example through a FAT32
 mount. The high-speed USB-OTG core presents the card to a host written in Rust, which records a
-clip on it like a car; oxidrive enumerates to that car and the clip lands intact, then its WiFi
-bring-up stops at ESP-Hosted's SDIO link ([esp32p4.md](esp32p4.md), which lists where its console
-still differs from the board's). Tracks [#215](https://github.com/mikroverk/esp32sim/issues/215).
+clip on it like a car; oxidrive enumerates to that car and the clip lands intact. An emulated C6
+on SDIO runs unmodified ESP-Hosted slave firmware in lock-step with the P4: IDF's WiFi station
+example takes a lease through it, and oxidrive brings its WiFi up and stops at its services, MQTT
+and SMB ([esp32p4.md](esp32p4.md), "The co-processor", which also lists where its console still
+differs from the board's). Tracks [#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:
 the real mask ROM, the real 2nd-stage bootloader and an unmodified ESP-IDF image, checked
@@ -120,6 +122,13 @@ the host's network through the existing NAT.
 Done when an oxidrive archive window takes the card from the car (which sees MEDIUM NOT
 PRESENT meanwhile), uploads a clip to an SMB server on the host, and gives the card back with the
 car's next writes landing intact.
+
+- **4a, done**: the C6's SDIO slave model (`esp32c6/src/sdio.rs`), SDIO functions and DAT1 on the
+  P4's SDMMC host, the lock-step pair with EN on GPIO 54 (`cli/src/cosim.rs`, `--coproc`), golden
+  `hosted-p4`: IDF's station example takes a lease through ESP-Hosted 2.12.13; oxidrive's WiFi
+  comes up (esp32p4.md, "The co-processor").
+- **4b**: an MQTT broker and an SMB2 server behind the NAT, oxidrive provisioned for them, then
+  the archive window (esp32p4.md, "Handoff: where milestone 4b starts").
 
 BLE is not modelled (see the roadmap); firmware that uses it must tolerate a controller that
 never answers.

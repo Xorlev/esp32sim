@@ -17,6 +17,8 @@ licensed, and contains no third-party emulator code (QEMU was consulted for inst
 ```
 cli/          esp32sim binary, all three chips: argument parsing, image loading, run loop, reports
               (`--chip s3|c3|c6`; the setup that is chip-specific is one function per chip)
+  cosim.rs    the ESP32-P4 and an ESP32-C6 co-processor on SDIO, two machines in lock-step
+              (`--coproc`, docs/esp32p4.md "The co-processor")
 esp-soc/      Machine<S: Soc>, written once for every chip: the scheduler (256-instruction quanta
               on wasm32, 64 natively; idle skipping, per-core reset state), lazy device time,
               console capture, action scripts, function stubs/probes, tracing and watchpoints,

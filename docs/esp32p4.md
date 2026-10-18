@@ -4,8 +4,10 @@ The fourth chip, and the first with two RISC-V cores: silicon **rev < 3** (v0.x,
 Waveshare ESP32-P4-WIFI6 (v1.0) the plan targets ([esp32p4-plan.md](esp32p4-plan.md), milestone 1).
 Unmodified ESP-IDF firmware boots from the real mask ROM, through the real 2nd-stage bootloader,
 into FreeRTOS on one or both cores, reaches an SD card in the board's socket through the SDMMC
-host (milestone 2, "SD card" below), and presents it as a USB mass-storage device to a host on
-the high-speed USB-OTG port, a car written in Rust (milestone 3, "USB" below).
+host (milestone 2, "SD card" below), presents it as a USB mass-storage device to a host on
+the high-speed USB-OTG port, a car written in Rust (milestone 3, "USB" below), and reaches WiFi
+through an emulated ESP32-C6 on SDIO running unmodified ESP-Hosted slave firmware, the two chips
+in lock-step in one process (milestone 4a, "The co-processor" below).
 
 ```sh
 cargo build --release
@@ -644,6 +646,246 @@ class (`mscd_reset`). A 5 ms timeout cuts a live transfer, which is what opens t
 - The NAK retry at the next microframe is one controller's policy, not the specification's; a
   controller that retries within the microframe would see a NAKing device sooner.
 
+## The co-processor
+
+The P4 has no radio. On the reference board an ESP32-C6 sits on SDIO slot 1 and runs ESP-Hosted's
+slave firmware; the P4's application calls `esp_wifi_*` as usual, and esp_wifi_remote and
+ESP-Hosted's host driver carry the calls and the packets over SDIO. `--coproc` puts an emulated C6
+there, running the unmodified slave, and runs both chips in one process ([cli.md](cli.md),
+"Co-processor (P4)"). IDF v5.5.3's WiFi station example with esp_hosted 2.12.13 and ESP-Hosted
+2.12.13's slave (`examples/esp-hosted-p4`, golden `hosted-p4`) join the virtual access point
+through the C6's radio:
+
+```sh
+./target/release/esp32sim-p4 --flash-mb 2 --bootloader $FW/p4-hosted-bootloader.bin \
+    --ptable $FW/p4-hosted-ptable.bin --app $FW/p4-hosted-station.bin \
+    --coproc c6:bootloader=$FW/c6-hosted-bootloader.bin,ptable=$FW/c6-hosted-ptable.bin,app=$FW/c6-hosted-slave.bin,otadata=$FW/c6-hosted-otadata.bin,stub=0x420bac5c=0 \
+    --wifi ssid=esp32sim,psk=esp32sim-pass --net none --max-seconds 4
+```
+
+```
+W (81) H_SDIO_DRV: Reset slave using GPIO[54]
+[c6] ESP-ROM:esp32c6-20220919
+[c6] I (115) co-pro-main:                 ESP-Hosted-MCU Slave FW version :: 2.12.13
+[c6] I (115) SDIO_SLAVE: sdio_init: sending mode: SDIO_SLAVE_SEND_STREAM
+I (1601) sdio_wrapper: SDIO master: Slot 1, Data-Lines: 4-bit Freq(KHz)[40000 KHz]
+I (1621) sdio_wrapper: Function 1 Blocksize: 512
+I (1721) H_SDIO_DRV: Card init success, TRANSPORT_RX_ACTIVE
+I (1771) transport: Identified slave [esp32c6]
+I (1771) transport: capabilities: 0xd
+[c6] W (2728) slave_wifi_std: Sta mode connected
+I (2771) RPC_WRAP: ESP Event: Station mode: Connected
+I (3771) wifi station: got ip:10.0.2.15
+```
+
+The P4 holds the C6's EN low for 10 ms on GPIO 54 and waits 1.5 s
+(CONFIG_ESP_HOSTED_SDIO_RESET_DELAY_MS) while the C6 boots again; the card comes up (CMD52 I/O
+reset, CMD0, CMD8, CMD5 twice, CMD3, CMD7, then CMD52 for the function, its interrupt enables,
+four lines, high speed and both block sizes), the host opens the data path with a slave
+interrupt, and the slave answers with its INIT event: the chip, the capabilities and its firmware
+version. The host compares that with its own and prints `Version mismatch` only when the
+major.minor differ (transport_drv.c, `compare_fw_version`); it prints nothing here, 2.12 against
+2.12. The station's RPCs follow, the C6 joins the access point, and the P4's lwIP takes a lease
+through the link 3.77 s after power-up. The golden pins both consoles in the order the slices
+produced them, the P4's instruction count, the C6's run and its SDIO, WiFi and network counts.
+The C6's WiFi model drops 19 frames for want of a free descriptor in those 4 s; the station gets
+through regardless. Co-simulating costs about a second of CPU per emulated second while the
+station idles: the golden's 4 s take 3.6 s, 8 s take 7.7 s (both chips, one host thread).
+
+### The slave
+
+`esp32c6/src/sdio.rs` models the three blocks IDF v5.5.3's sdio_slave driver programs
+(`esp_driver_sdio/src/sdio_slave.c`, `hal/sdio_slave_hal.c`, `hal/esp32c6/include/hal/sdio_slave_ll.h`;
+registers: `soc/esp32c6/register/soc/sdio_hinf_reg.h`, `sdio_slc_reg.h`, `sdio_slc_host_reg.h`),
+HINF at 0x60016000, SLC at 0x60017000 and SLCHOST at 0x60018000 (`reg_base.h:35-37`), as one
+optional device: the SLC entry raises source 64, `ETS_SLC0_INTR_SOURCE` (`interrupts.h:86`), and
+HINF and SLCHOST are aliases of it. SLC's "rx" link carries slave-to-host data, its "tx" link
+host-to-slave data, the driver's sending and receiving. A C6 run without a host costs the table
+entries and one address compare after a peripheral write.
+
+| block, register | modelled |
+| --- | --- |
+| HINF CFG_DATA0 0x00 | DEVICE_ID_FN1 0x6666, USER_ID_FN1 0x0092 at reset; the CIS's MANFID |
+| HINF CFG_DATA1 0x04 | SDIO_ENABLE (the card answers nothing without it), IOREADY1/2 (CCCR I/O Ready), HIGHSPEED_ENABLE (CCCR SHS), SDIO_INT_MASK, SDIO_VER 0x232 at reset; the read-only HIGHSPEED_MODE, IOENABLE1/2 and CD_DISABLE show the host's CCCR |
+| SLC SLCCONF0 0x00 | TX_RST and RX_RST reset a link; RX_AUTO_WRBACK writes a sent descriptor back with the owner cleared |
+| SLC SLC0INT_RAW/ST/ENA/CLR 0x04-0x10 | FRHOST_BIT0-7 from the host, TX_OVF, TX_DONE, TX_SUC_EOF, RX_DONE, RX_EOF; ST is RAW & ENA, the SLC0 line |
+| SLC SLC0RX_LINK, SLC0RX_LINK_ADDR 0x3C, 0x40 | START reads the descriptor at once (the driver polls RX_DONE right after); STOP |
+| SLC SLC0TX_LINK, SLC0TX_LINK_ADDR 0x44, 0x48 | START, STOP; RESTART follows the next pointer of the last buffer closed |
+| SLC SLCINTVEC_TOHOST 0x5C | bits 7:0 raise SLCHOST's TOHOST_BIT0-7 |
+| SLC SLC0TOKEN0/1 0x60, 0x64 | WR, INC, INC_MORE; the count at 27:16 and at SLCHOST TOKEN_RDATA |
+| SLC SLC0_LEN_CONF, SLC0_LENGTH 0xF4, 0xF8 | LEN_WR, LEN_INC, LEN_INC_MORE set the packet length SLCHOST PKT_LEN shows |
+| SLCHOST TOKEN_RDATA 0x44 | TOKEN1 at 27:16, TOKEN0 at 11:0 |
+| SLCHOST SLC0HOST_INT_RAW/ST 0x50, 0x58 | TOHOST_BIT0-7, RX_UDF, TX_OVF, RX_NEW_PACKET; ST is RAW & FUNC1_INT_ENA |
+| SLCHOST PKT_LEN 0x60 | the length in 19:0; LEN_CHECK (31:20) reads 0 |
+| SLCHOST CONF_W0-W15 0x6C-0xB8 | shared scratch, both sides; CONF_W7's low byte is the host's interrupt to the slave (FRHOST_BIT0-7) and reads 0 |
+| SLCHOST SLC0HOST_INT_CLR, FUNC1_INT_ENA 0xD4, 0xDC | write 1 to clear; the interrupt enable |
+| the rest | register RAM (timing, check sums, the windows, SLC1, function 2) |
+
+The card the host sees follows the SDIO Simplified Specification v3.00 (SD Specifications Part
+E1, 2011):
+
+| command | the card |
+| --- | --- |
+| CMD5 | R4 (§3.3): C set, two I/O functions, no memory, I/O OCR 2.7-3.6 V; answered only before an RCA is assigned, and with argument 0 it does not start initialization (§3.1.2); nothing else is answered before a CMD5 since power-up or the I/O reset |
+| CMD3 | R6 (§4.3): RCA 0x0001, the SDIO-only status bits zero |
+| CMD7 | with the RCA: selected, R1b; with another: deselected, no answer (§6.14) |
+| CMD52 | R5 (§5.2.1): IO_CURRENT_STATE CMD, the data; read after write (RAW); FUNCTION_NUMBER for a function past two |
+| CMD53 | R5 with IO_CURRENT_STATE TRN (§5.3): bytes (count 0 is 512) or blocks of the function's block size, incrementing or fixed address; infinite block counts are not modelled |
+| CMD0, CMD8, ACMD41, CMD1 and the rest | no answer: an I/O-only card ignores memory commands (§4.4: CMD0 does not reset the I/O part) |
+
+Function 0 is the CCCR (§6.9 Table 6-1: revisions from SDIO_VER, I/O Enable, I/O Ready, Int
+Enable, Int Pending, I/O Abort with RES and the abort select, Bus Interface Control, Card
+Capability 0x17, the common CIS pointer, FN0 block size, Bus Speed Select with SHS and EHS), the
+FBR's block sizes (§6.10) and the common CIS at 0x1000: DEVICE, MANFID 0092/6666, FUNCID, FUNCE,
+CONFIG, CFTABLE_ENTRY and END, the tuples IDF's `sdmmc_io_print_cis_info` printed for an ESP32-C6
+slave (esp_hosted 2.12.13 `docs/esp32_p4_function_ev_board.md`). The I/O reset (§4.4) clears the
+function enables, interrupt enables, bus width, high speed and block sizes and takes the card
+back to needing CMD5; the SLC side is the C6's and stays as its driver left it. Function 1 is
+Espressif's protocol (IDF v5.5.3 `docs/en/api-reference/protocols/esp_sdio_slave_protocol.rst`):
+addresses below 0x400 reach SLCHOST's registers a byte at a time (ESP-Hosted and
+esp_serial_slave_link mask register addresses with 0x3FF), and above them is the FIFO, where a
+transfer to address A carries a packet of 0x1F800 - A bytes:
+
+- **Slave to host.** The driver's send link is a chain of descriptors with EOF on the last
+  (stream mode collects every queued packet). A host read takes the packet's bytes from the
+  descriptors in SRAM, zero-fills past the packet (ESP-Hosted reads whole 512-byte blocks), hands
+  each descriptor back with RX_DONE and the last with RX_EOF, which is when the driver returns
+  the buffers and starts the next chain. Reading more than the link holds is an underflow
+  (RX_UDF). Starting the link on a descriptor the hardware owns raises the host's
+  RX_NEW_PACKET and the slave's RX_DONE at once: the driver starts a one-byte descriptor, waits for
+  that RX_DONE and clears the host interrupt it raised (`send_isr_invoker_enable`), which is the
+  evidence for both.
+- **Host to slave.** The driver loads receive buffers (START for the first, the tail's next pointer
+  and RESTART for the rest, TOKEN1 counting them; the host subtracts the buffers it has used). A
+  host write fills the current buffer, spills into the next, and closes the last with its length
+  and EOF when the packet's 0x1F800 - A bytes are in; the block padding is dropped. A packet may
+  span two CMD53s (a block, then the remainder at the incremented address). With no buffer the
+  bytes are lost and TX_OVF goes to both sides.
+- **Interrupts.** The slave raises the host's TOHOST bits through SLCINTVEC_TOHOST; DAT1 goes low
+  while SLC0HOST_INT_ST is not zero, IENM and IEN1 are set in the CCCR (§6.3) and HINF does not
+  mask it. The host's byte in CONF_W7 raises FRHOST_BIT0-7 on the slave, as ESP-Hosted's "open
+  data path" interrupt does.
+
+`--debug sdio` prints the slave's commands, the descriptors handed over and the I/O reset.
+Guesses, each from the sources' silence: the CCCR revision bytes as SDIO_VER's split (0x32,
+0x02), the card capability, two functions in R4, CMD5's C bit set at once, PKT_LEN's LEN_CHECK as
+0, INT_ST under FUNC1_INT_ENA rather than SLC0HOST_INT_ENA, the 0x400 split between the register
+window and the FIFO, and RX_DONE at a link start. Not modelled: the card's busy and read wait, its
+CRC (it never answers with a CRC error or a malformed response), suspend and resume, function 2,
+the second SLC (SLC1), the host's token registers (TOKEN_WDATA, TOKEN_CON), the PCR reset of the
+block (`PCR_SDIO_SLAVE_CONF.RST_EN`, which the driver pulses before it configures a block already
+at its reset values) and the pins (the card answers however the C6's IO MUX is set).
+
+### The host side
+
+An `SdDevice` says whether it is an SDIO function (`io`). After each command the P4 samples the
+function's DAT1: the slot's D1 pin (15) reads low while the function interrupts, which is what
+IDF's `sdmmc_host_io_int_wait` looks at first, and RINTSTS's SDIO bit for the slot (16 + slot)
+is set when DAT1 goes low, edge triggered as that function's comment describes it
+(`esp_driver_sdmmc/src/sdmmc_host.c`). The ISR masks it and wakes the waiting task. The `card_int`
+and card-detect inputs IDF ties high are not consulted. Nothing of this runs while only a memory
+card is on the bus. The C6's EN follows GPIO 54 (`GpioP4::drive`; ESP-Hosted's
+`ESP_HOSTED_SDIO_GPIO_RESET_SLAVE`, 54 on the P4, active high: low resets), read from OUT1 and
+ENABLE1, which the W1TS and W1TC registers reach for every pin to 56; the IO MUX function of pins
+49-56 is not checked.
+
+### Lock-step
+
+`cli/src/cosim.rs` runs a P4 machine and a C6 machine on one clock, nanoseconds from power-up
+(the P4 at 9 cycles per 25 ns, the C6 at 4). Slices of 10 µs (`slice-us`) end on a fixed grid:
+
+1. the P4 runs to the slice's end (`max_cycles`, both cores);
+2. the C6 runs to the same instant (`run_until_cycle`);
+3. the lines between the chips are exchanged: the slave's DAT1 into the P4 (D1 and RINTSTS), the
+   P4's EN line into the C6.
+
+The SDIO bus is host-driven, so the transactions are where the chips meet exactly: when the P4's
+host starts a command, the C6 first runs to that nanosecond, then the command and its data are
+carried out against the slave as it stands, the descriptors read and written in the C6's SRAM;
+the C6 goes on from there in its next run. The C6 is never ahead of the P4. What the P4 senses
+without a command, the slave's interrupt, is sampled after every command and at every slice end,
+so it reaches the P4 at most one slice late, as a frame reaches csim's medium at the end of the
+slice it started in (`--cooja`). EN is read at slice ends too: driven low, the C6 runs to that
+instant and stops; released, the C6 powers up from its ROM (a chip reset with cause POWERON; its
+LP domain and SRAM are kept, which a real power-up would not keep), and its clock goes on from
+that instant. At power-up EN is the pull-up's: the C6 boots with the P4, as on the board, until
+ESP-Hosted resets it. A chip that resets itself comes back through its ROM. The co-simulation
+reads no host clock and no host randomness and the order of every step is fixed, so a run is the
+same to the instruction every time, and the same however `run_until` is called
+(`the_pair_runs_the_same_whichever_way_it_is_driven` runs the pair for 2 s whole and in uneven
+pieces). The virtual network's SNTP server is the exception: it answers from the host's clock
+([networking-howto.md](networking-howto.md)), so a firmware that asks for the time, as oxidrive
+does, can differ from one run to the next; the station example does not ask. Both consoles are
+collected a line at a time and printed in the order the slices produced them. The co-processor
+is native only: the browser build has none.
+
+**Cost.** Without `--coproc` nothing of this runs: the C6's slave is an optional device-table
+entry and one address compare after a peripheral write, the P4's SDIO path one flag tested where
+the SDMMC host runs (`has_sdio`), and the rest is in cold functions. Measured against 59c1d1cd with `cargo
+build --release --bins`, alternating runs, median `user` time, identical instruction counts:
+
+| demo | runs | 59c1d1cd | this branch | instructions |
+| --- | --- | --- | --- | --- |
+| S3 `hello` (30 s) | 7 | 0.39 s | 0.39 s | 11,990,488 + 6,798,360 |
+| `c3-hello` (30 s) | 7 | 3.94 s | 3.96 s | 4,800,000,000 |
+| `c6-hello` (30 s) | 7 | 5.72 s | 5.74 s | 4,800,000,000 |
+| `c6-wifi-station` (14 s, the golden's run) | 5 | 3.10 s | 3.11 s | 2,240,000,000 |
+| `p4-hello` (27 s) | 7 | 18.20 s | 18.15 s | 9,720,000,000 + 0 |
+| `p4-hello-smp` (27 s) | 7 | 18.71 s | 18.60 s | 9,720,000,000 + 9,713,148,105 |
+| pocket-tank (8 s) | 13 | 14.15 s | 14.29 s | 1,113,634,993 + 1,490,529,616 |
+
+The S3 and C3 run no code this branch changed, so their differences are layout: pocket-tank's
+13 runs are two sets, base first (14.14 s against 14.45 s, 5 runs) and this branch first (14.18
+s against 14.28 s, 8 runs).
+
+### Throughput
+
+ESP-Hosted's own transport test (RawTP: `CONFIG_ESP_HOSTED_RAW_THROUGHPUT_TRANSPORT` with
+`..._RX_FROM_SLAVE` or `..._TX_TO_SLAVE` on the host, `CONFIG_ESP_RAW_THROUGHPUT_TRANSPORT` on the
+slave, reports every second, both added to `examples/esp-hosted-p4`'s defaults and built locally,
+not committed) moves 1460-byte packets as fast as the link takes them. The steady per-second
+reports, 12 s runs:
+
+| direction | SDIO bus | emulator | Espressif, P4 + C6, 4 bits at 40 MHz |
+| --- | --- | --- | --- |
+| C6 to P4 (host receive) | at once | 427-474 Mbit/s | 80 Mbit/s |
+| C6 to P4 | `--sd-timing`, 4 bits at 40 MHz | 139.4 Mbit/s | |
+| P4 to C6 (host transmit) | at once | 428-430 Mbit/s | 72 Mbit/s |
+| P4 to C6 | `--sd-timing` | 106.3 Mbit/s | |
+
+The board numbers are Espressif's (esp_hosted 2.12.13 `docs/performance_optimization.md`, "ESP32-C6
+as Co-Processor", over the air; iperf there gives 30-32 Mbit/s TCP and 49-50 UDP); a P4-WIFI6
+measured about 36 Mbit/s receiving over WiFi (SDIO at 40 MHz, HT20), and oxidrive uploads over
+SMB at about 2 MB/s end to end. Without timing a transfer takes no time on the bus, so the rate
+is what the two CPUs' drivers sustain at one instruction a cycle: the P4's ESP-Hosted tasks and
+memcpy, the C6's ISR and the SLC hand-overs. `--sd-timing` gives the link the card's wire-time
+model ("The host"): a 512-byte block in 4 bits at 40 MHz is 1044 card clocks, 157 Mbit/s on the
+data lines, and each command adds 106 clocks and each packet its register reads (the interrupt
+status, the length), which leaves the 139 Mbit/s measured; transmit pays the TOKEN1 reads and
+the padding of each packet to whole blocks. What is still missing against the
+board's 72-80: the slave's busy and FIFO latency (it answers at once), the CPUs' caches and PSRAM
+stalls, and the time the data takes through the C6's DMA. The WiFi side is not part of these
+numbers; the virtual access point paces frames about 400 µs apart (`StationLink`), roughly 30
+Mbit/s of 1500-byte frames, so a test through the air would meet that first.
+
+### oxidrive
+
+`external_oxidrive_brings_up_wifi_through_the_c6` (cli/tests/cosim.rs) boots oxidrive as the
+USB test does, with ESP-Hosted 2.12.13's slave on the C6 as on its board, and the firmware's NVS
+partition made at test time with ESP-IDF's `nvs_partition_gen.py` from `nvs.csv` beside the
+images (`OXIDRIVE_DIR`): the virtual access point's SSID and password, and placeholders that
+reach nothing for the rest (`--net none`: every name resolves to 10.0.2.3 and every connection
+is refused). Neither the CSV nor the image is in this repository. In 20 s of emulated time (26 s
+on the host) the firmware gets past `esp_hosted_reconfigure`, where it stopped before: its WiFi is initialised at 3.25 s and up
+with the lease 10.0.2.15 at 6.81 s, its DNS lookup of the NTP pool is answered, SNTP starts, it
+reports the NAS unreachable, and its MQTT client starts and finds its session refused. That is
+the next point: the services. Against the board's capture, 80 of the board's 105 lines now
+match (76 before), the WiFi initialisation and the SNTP lines among them; the blocks that differ
+are the eight of "Compared with a board" (the core dump, the heap 108 bytes lower, the card's
+geometry, the journal and the configuration, the die temperature), the configuration's effects
+(no car paired, no syslog, the placeholder addresses), and the network: the SSID and address
+in the WiFi line, the NAS reachable on the board, MQTT's session up there and refused here.
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,
@@ -668,15 +910,16 @@ Eight blocks differ:
 - the board's flash held a core dump, the emulator's coredump partition is blank: one line
   where the board prints three;
 - the firmware's free heap at start, and its free internal RAM later, are 108 bytes lower than
-  the board's (open; ESP-Hosted's SDIO link, which has no slave on slot 1, is the first place to
-  look);
+  the board's (open; not the missing slave: with the C6 on slot 1 it is the same 108 bytes);
 - the card's FAT geometry, label and root directory: the image's, not the board card's;
 - the firmware's journal and configuration, which the board's NVS holds from earlier boots and
   the emulator's blank flash does not: it reports a first boot, seeds a default and runs
   unconfigured (four blocks);
 - the die temperature: the temperature sensor is register RAM here.
 
-The board's lines from 93 on come through the C6 (WiFi, the clock, MQTT): milestone 4.
+The board's lines from 93 on come through the C6 (WiFi, the clock, MQTT). With the C6 on slot 1
+(`--coproc`, "The co-processor", "oxidrive") the WiFi and clock lines are reached and 80 lines
+match.
 
 `external_oxidrive_presents_the_card_to_a_car` boots the same images with VBUS from power-up and
 the card image written through. The car enumerates oxidrive at 0.27 s at high speed, the drive is
@@ -690,7 +933,7 @@ link connected and mounted. It prints nothing about the car's writes in the 14 s
 looked at: what it counts feeds the archive windows, which need WiFi and the NAS. Its WiFi
 bring-up then fails in ESP-Hosted's `esp_hosted_reconfigure` (`transport_drv_reconfigure()`
 returns ESP_FAIL, no slave answering on slot 1) and retries every 30 s, serving the card to the
-car meanwhile.
+car meanwhile; with the co-processor it comes up ("The co-processor").
 
 ## What the bring-up found
 
@@ -705,6 +948,14 @@ car meanwhile.
   bootloader's random-number loop never ends.
 - **A CLIC control word is four registers.** The ROM and IDF write IE, the attributes and the
   level one byte at a time; a read-modify-write of the whole word would write IP back.
+- **The SDIO slave's send link must answer at the register write that starts it.** The driver
+  starts a one-byte descriptor and spins on RX_DONE before it does anything else, so the DMA reads
+  the descriptor in the write's own bus call (`sdio_slc_write`), not later.
+- **IDF reads the D1 pin, not only the host's interrupt bit.** `sdmmc_host_io_int_wait` returns at
+  once if D1 is low, so DAT1 is a GPIO input level as well as RINTSTS's edge.
+- **Slices must end on a fixed grid.** Cutting a slice where a caller happened to stop moved where
+  EN was seen and where the P4's scheduling rounds fell, and the C6's `Saved PC` after its reset
+  differed between two drivings of the same run; the lock-step test caught it.
 
 ## What is modelled
 
@@ -713,7 +964,7 @@ car meanwhile.
 | CPU | two RV32IMAFC cores (`Cpu::new_esp32p4`, `misa` 0x40001125): F with the lazy FPU traps, EXT_ILL, Zicntr, CLIC mode, `mhartid`; core 1 held in reset until HP_SYS_CLKRST releases it. Xesppie and the hardware loops decode as illegal |
 | Memory | 128 KB mask ROM at 0x4FC00000 (reset vector), 768 KB L2MEM at 0x4FF00000 and its uncached alias at 0x8FF00000, 8 KB TCM at 0x30100000, LP ROM (empty) and 32 KB LP RAM; flash (0x40000000) and PSRAM (0x48000000) windows behind two 1024-entry MMUs of 64 KB pages, reached through SPI_MEM_C / SPI_MEM_S item registers, with their uncached aliases |
 | Interrupts | both interrupt matrices (128 sources, rev < 3) and both CLIC register blocks, delivered through the cores' CLIC mode |
-| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`); everything else is register RAM, listed by `--log-periph` |
+| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`), an SDIO function on slot 1 with its interrupt on DAT1 (`--coproc`: an ESP32-C6 running ESP-Hosted's slave, "The co-processor"); everything else is register RAM, listed by `--log-periph` |
 | Time base | 360 MHz, the rev < 3 application clock; one instruction is one cycle |
 
 The revision is a type parameter (`esp32p4::Revision`, `RevLt3`): rev >= 3 (its own ROM, the
@@ -723,8 +974,11 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 
 ## Not there yet
 
-- **ESP-Hosted, AXI-DMA, the LP core**: ESP-Hosted is milestone 4 of the plan, the others are
-  out of scope. Xesppie's save and restore, which FreeRTOS runs only for a task that uses PIE.
+- **AXI-DMA, the LP core**: out of scope. Xesppie's save and restore, which FreeRTOS runs only for
+  a task that uses PIE.
+- **The co-processor**: native only; the SDIO link without timing by default and the slave
+  without busy or read wait ("The co-processor"); the services behind the NAT that oxidrive wants
+  (MQTT, SMB) are milestone 4b.
 - **USB**: the full-speed OTG core (0x50040000) and USB_WRAP, host mode, the core's slave mode
   (the data FIFOs), descriptor DMA, isochronous and interrupt endpoints, LPM, the
   per-endpoint interrupt source (94), and the time a transaction takes inside the core: it
@@ -754,48 +1008,38 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
   KEYMNG, UART2-4, TRACE0/1, LP_UART, LP_PERI, LP_GPIO and DSI, all configuration the firmware
   writes and reads back (`--log-periph` lists them). The watchdogs never fire.
 
-## Handoff: where milestone 4 starts
+## Handoff: where milestone 4b starts
 
-**Status.** Milestone 3 is done: the high-speed DWC2 core as a device with buffer DMA, a host on
-its port written in Rust (enumeration, SCSI over bulk-only transport with Linux usb-storage's
-recovery, FAT32 written in a vfat-like order, a car paced to its camera, a command file for the
-CLI), IDF's tusb_msc example presenting the card to it (goldens `usbmsc-p4` and
-`usbmsc-p4-faults`), and oxidrive enumerating to a car that records a clip which lands intact on
-the image ("Compared with a board"). Archive windows, in which oxidrive takes the card from the car
-and the car sees MEDIUM NOT PRESENT, need WiFi and the NAS and move to milestone 4; the car's side
-of them is what the golden's eject already shows.
+**Status.** Milestone 4a is done: the C6's SDIO slave (HINF, SLC, SLCHOST) and the I/O card a host
+sees, SDIO functions on the P4's SDMMC host with their interrupt on DAT1, the two machines in
+lock-step with the C6's EN on GPIO 54, `--coproc`, and IDF's station example reaching `got ip`
+through unmodified ESP-Hosted 2.12.13 on both chips (golden `hosted-p4`). oxidrive now brings its
+WiFi up through the C6, takes a lease, resolves the NTP pool and starts SNTP, then finds its
+services missing: the MQTT session is refused and the NAS is unreachable ("The co-processor",
+"oxidrive"). Milestones 1-3 are as described above.
 
-**Where oxidrive stops.** With the car attached (`external_oxidrive_presents_the_card_to_a_car`,
-`OXIDRIVE_DIR=<images>`), the firmware brings WiFi up through ESP-Hosted, whose host side talks
-SDIO to the C6 on slot 1 of the SDMMC host (CLK 18, CMD 19, D0-D3 14-17; `CONFIG_ESP_HOSTED_SDIO_SLOT=1`,
-4 bits, 40 MHz). Its card initialisation on slot 1 goes CMD52 (an I/O reset of CCCR 0x06),
-CMD0, CMD8, CMD5, then ACMD41 and CMD1, fifteen rounds of it in the first 14 s, every command
-unanswered, and `esp_hosted_reconfigure` fails (`transport_drv_reconfigure()`: ESP_FAIL); the
-firmware retries every 30 s and serves the card to the car meanwhile. `ESP_EMU_DEBUG=sdmmc` on
-the test prints each command.
+**What milestone 4b needs** ([esp32p4-plan.md](esp32p4-plan.md), "4. The co-processor"):
 
-**What milestone 4 needs** ([esp32p4-plan.md](esp32p4-plan.md), "4. The co-processor"):
-
-1. An SDIO function on slot 1: an `SdDevice` attached at slot 1's pins
-   (`Peripherals::attach_sd`, "Slots and the socket") that answers CMD5 with an R4 (OCR, one I/O
-   function), CMD3, CMD7, CMD52 on the CCCR and FBR (SD Specifications Part E1, SDIO Simplified
-   Specification) and CMD53 byte and block transfers, and raises the SDIO interrupt on DAT1 (the
-   trait carries it; the host's SDIO interrupt path in `sdmmc.rs` is not written yet). What sits
-   behind it is the C6's SDIO slave controller as ESP-Hosted's slave firmware programs it.
-2. The C6 co-processor: a second machine, `esp32c6`, running unmodified ESP-Hosted slave firmware
-   built for it (ESP-Hosted 2.12.13 is what oxidrive links on the host side), with an SDIO slave
-   model of the C6's HINF and SLC blocks (IDF v5.5.3 `soc/esp32c6/register/soc/sdio_hinf_reg.h`,
-   `sdio_slc_reg.h`, `sdio_slc_host_reg.h`), the slave's
-   reset on the host's GPIO 54, and the C6's WiFi joining the virtual access point as it already
-   does.
-3. Lock-step co-simulation: both machines stepped in emulated time the way `--cooja` steps
-   802.15.4 nodes (`cli/src/cooja.rs`), SDIO transactions handed across at the cycle they start.
-   The P4 is multi-core, so `Machine::run_until_cycle` (core 0 only) is not the tool; a run to an
-   exact cycle through `max_cycles`, as `usb_host::UsbPort` does for the USB host, works on both
-   cores.
-4. Then the archive window: the NAS as an SMB server on the host behind the NAT, oxidrive taking
-   the card from the car (TEST UNIT READY: MEDIUM NOT PRESENT), uploading a clip, giving it back,
-   and the car's next writes landing intact.
+1. **Test services behind the NAT.** An MQTT broker and an SMB2 server the P4 reaches through the
+   C6, the virtual network and the NAT. Two shapes, not exclusive: a minimal SMB2 server (and a
+   broker) in process, next to `esp-soc/src/nat.rs`, which the virtual network answers for at a
+   fixed address and name, deterministic and usable by goldens and CI; or a containerised samba
+   and mosquitto on the host, reached with `--net nat`, for `external_` tests against a real
+   server. An upload most likely needs NEGOTIATE, SESSION_SETUP (NTLMSSP), TREE_CONNECT,
+   CREATE, WRITE, CLOSE and QUERY_INFO; a trace of the firmware's SMB2 client and a capture
+   against a real samba say which, before a server is written. The address goes in the
+   provisioning, not in the repository.
+2. **oxidrive provisioning.** `oxidrive_board::nvs_image` already makes the firmware's NVS
+   partition at test time from `OXIDRIVE_DIR/nvs.csv`: point its SMB and MQTT entries at the
+   services, with test credentials the services accept. The CSV stays beside the images; nothing
+   derived from the firmware, its NVS or its capture is committed.
+3. **Then the archive window**, with the car of "The car, for archive windows" below (items 1-4):
+   oxidrive takes the card from the car (TEST UNIT READY: MEDIUM NOT PRESENT), uploads a clip to
+   the SMB server, gives the card back, and the car's next writes land intact; afterwards fsck the
+   image and compare every clip, and check the upload on the server byte for byte.
+4. **Throughput honesty.** An SMB upload through the C6 meets the virtual access point's frame
+   pacing (about 400 µs a frame) before it meets the SDIO link ("Throughput"); compare with the
+   board's 2 MB/s only once both are understood, as for the USB rate.
 
 **Timed SD transfers** are there (`--sd-timing`). oxidrive's 11.0 MB/s with them against its
 board's 10.9 MB/s is a coincidence, not a calibration ("USB", "Throughput"): the card's
