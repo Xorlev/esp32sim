@@ -146,10 +146,13 @@ pub struct SdCardConfig {
     pub revision: u8,
     pub serial: Option<u32>,
     pub date: (u16, u8),
+    /// the host's bus takes its time: commands and data at the card clock and width
+    /// (`Sdmmc::timed`)
+    pub timed_bus: bool,
 }
 impl Default for SdCardConfig {
     /// MID 0 (no manufacturer's), "ES", "SIMSD", revision 1.0, 2024-01.
-    fn default() -> Self { SdCardConfig { prg_ns: 0, init_polls: 1, mid: 0, oid: *b"ES", name: *b"SIMSD", revision: 0x10, serial: None, date: (2024, 1) } }
+    fn default() -> Self { SdCardConfig { prg_ns: 0, init_polls: 1, mid: 0, oid: *b"ES", name: *b"SIMSD", revision: 0x10, serial: None, date: (2024, 1), timed_bus: false } }
 }
 
 pub struct SdCard {
@@ -507,6 +510,7 @@ impl SdDevice for SdCard {
     }
 
     fn busy(&self, now: u64) -> bool { self.state == CardState::Prg && now < self.busy_until }
+    fn busy_until(&self) -> Option<u64> { (self.state == CardState::Prg).then_some(self.busy_until) }
     fn bus_width(&self) -> Option<u8> { Some(if self.wide { 4 } else { 1 }) }
     fn name(&self) -> &str { "SD card" }
     fn set_log(&mut self, on: bool) { self.log = on; }

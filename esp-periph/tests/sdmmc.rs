@@ -692,3 +692,63 @@ fn a_read_during_programming_times_out() {
     send(&mut h, &mut m, 13, RCA_ARG, CMD_RESP);
     assert_eq!(h.read(reg::RESP0), 0x900, "transfer state, ready for data");
 }
+
+/// With the bus timed, CMD_DONE comes when the command and its response are through at the card
+/// clock (here 160 MHz / (2 x 2) = 40 MHz on slot 1's divider), DATA_OVER when every block is
+/// through at the bus width, the auto-stop's ACD after its own command, and BCI when the card
+/// that took a write has programmed it; `advance` raises each at its time.
+#[test]
+fn a_timed_bus_raises_command_and_data_done_when_the_bits_are_through() {
+    let mut h = Sdmmc::new(SdmmcLayout::Esp32p4);
+    let c = SdCard::with_config(Box::new(MemStore(image())), SdCardConfig { prg_ns: 50_000, ..Default::default() }).unwrap();
+    let i = h.attach(Box::new(c));
+    h.route[1] = Some(i);
+    let mut m = Ram(vec![0; 64 << 10]);
+    host_to_tran(&mut h, &mut m);
+    h.timed = true;
+    h.ciu_hz = 160_000_000;
+    h.write(reg::CLKSRC, 1 << 2);
+    h.write(reg::CLKDIV, 2 << 8);
+    h.now_ns = 1_000_000;
+    h.write(reg::CMDARG, RCA_ARG);
+    h.write(reg::CMD, CMD_START | 1 << 16 | CMD_RESP | 13);
+    h.run(&mut m);
+    assert_eq!(h.read(reg::RINTSTS), 0, "the response is still on the line");
+    // 48 command bits, NCR 2, 48 response bits, NCC 8: 106 clocks of 25 ns
+    assert_eq!(h.next_event_ns(), Some(1_002_650));
+    assert!(!h.advance(1_002_649));
+    assert!(h.advance(1_002_650));
+    assert_eq!(h.read(reg::RINTSTS), int::CMD_DONE);
+    h.write(reg::RINTSTS, int::ALL);
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 3 * 512, RAM + 0x1000, 0);
+    arm(&mut h, 3 * 512, RAM);
+    h.write(reg::CMDARG, 20);
+    h.write(reg::CMD, CMD_START | 1 << 16 | CMD_RESP | CMD_DATA | CMD_AUTO_STOP | 18);
+    h.run(&mut m);
+    assert_eq!(&m.0[0x1000..0x1600], &image()[20 * 512..23 * 512], "the data is in memory at once");
+    let cmd_end = 1_002_650 + 2_650;
+    // one line: a start bit, 4096 data bits, CRC16, an end bit and NAC per block
+    let data_end = cmd_end + 3 * 4116 * 25;
+    for (t, want) in [(cmd_end, int::CMD_DONE), (data_end, int::CMD_DONE | int::DATA_OVER), (data_end + 2_650, int::CMD_DONE | int::DATA_OVER | int::ACD)] {
+        assert_eq!(h.next_event_ns(), Some(t));
+        h.advance(t);
+        assert_eq!(h.read(reg::RINTSTS), want);
+    }
+    assert_eq!(h.next_event_ns(), None);
+    h.write(reg::RINTSTS, int::ALL);
+    // a write: the card programs from the end of its data on, and BCI follows
+    h.write(reg::CARDTHRCTL, 1 << 1);
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 512, RAM + 0x1000, 0);
+    arm(&mut h, 512, RAM);
+    let t0 = data_end + 2_650;
+    h.now_ns = t0;
+    h.write(reg::CMDARG, 30);
+    h.write(reg::CMD, CMD_START | 1 << 16 | CMD_RESP | CMD_DATA | CMD_WRITE | 24);
+    h.run(&mut m);
+    let data_end = t0 + 2_650 + (4116 + 7) * 25;
+    h.advance(data_end);
+    assert_eq!(h.read(reg::RINTSTS), int::CMD_DONE | int::DATA_OVER, "programming: no BCI yet");
+    assert_eq!(h.next_event_ns(), Some(data_end + 50_000), "the card's busy end is the next event");
+    h.advance(data_end + 50_000);
+    assert_eq!(h.read(reg::RINTSTS), int::CMD_DONE | int::DATA_OVER | int::BCI);
+}
