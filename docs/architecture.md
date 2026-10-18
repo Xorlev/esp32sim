@@ -57,7 +57,8 @@ web/          index.html: the landing page; run.html: board drawing, console, We
               emu.js + wasm/worker.js: the same page driving the WebAssembly build (docs/wasm.md)
 wasm/         esp32sim-wasm: C ABI over Machine plus the guarded browser-JIT handoff
 wasm-jit/     receipt-priced wasm emitter; first SRAM opcode slice, shared-memory sidecars
-riscv-rv32/   RV32IMAC decoder (sampled objdump checks), interpreter, disassembler
+riscv-rv32/   RV32IMAC decoder (sampled objdump checks), interpreter, disassembler; RV32F
+              (soft-float) and its lazy-FPU traps for the ESP32-P4, behind misa.F
 esp32c3/      the C3 SoC: memory map, interrupt matrix, cache controller, RNG; peripheral models
               shared with esp32s3 where the IP is identical
 esp32c6/      the C6 SoC: unified memory map and MMU, interrupt matrix + PLIC/INTPRI, L1 cache,

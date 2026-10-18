@@ -7,8 +7,8 @@ checked-in oracle or is `#[ignore]`d with the reason in its name.
 
 | layer | where | what it pins |
 | --- | --- | --- |
-| decoders and encoder | `xtensa-lx7/tests/objdump_diff.rs`, `riscv-rv32/tests/objdump_diff.rs`, `emu-core/src/jit_a64.rs` | checked-in sampled objdump corpora (app + mask ROM, `tests/corpus/`) decode to objdump's text, with PIE comparisons excluded by the Xtensa test; every AArch64 encoding in the fixture matches what clang assembled (`emu-core/tests/fixtures`) |
-| core semantics | `xtensa-lx7/tests/semantics.rs`, `riscv-rv32/tests/semantics.rs` | on a flat RAM: register-window overflow at the instruction that touches the wrapped window, zero-overhead loops, a CCOMPARE interrupt landing on the same instruction through `step`, the block interpreter and the JIT, INTLEVEL masking, `waiti`; RV32 vectored interrupts, `mret`, `ecall`/`ebreak`; and the oracle property — the three execution paths leave identical state |
+| decoders and encoder | `xtensa-lx7/tests/objdump_diff.rs`, `riscv-rv32/tests/objdump_diff.rs`, `emu-core/src/jit_a64.rs` | checked-in sampled objdump corpora (app + mask ROM, `tests/corpus/`) decode to objdump's text, with PIE comparisons excluded by the Xtensa test; the RISC-V P4 corpora (mask ROM, ESP-IDF's P4 libraries, every F form from `rv32f.S`) decode as RV32IMAFC, objdump's `.insn` words decode as illegal, and the C3/C6 decoders reject every F instruction in them; every AArch64 encoding in the fixture matches what clang assembled (`emu-core/tests/fixtures`) |
+| core semantics | `xtensa-lx7/tests/semantics.rs`, `riscv-rv32/tests/semantics.rs` | on a flat RAM: register-window overflow at the instruction that touches the wrapped window, zero-overhead loops, a CCOMPARE interrupt landing on the same instruction through `step`, the block interpreter and the JIT, INTLEVEL masking, `waiti`; RV32 vectored interrupts, `mret`, `ecall`/`ebreak`; RV32F on the P4 core (rounding modes, flags, NaNs, conversions) and its lazy-FPU traps (`mstatus.FS`, `mtval`, EXT_ILL), F illegal on the C3/C6 cores; the binary32 soft-float (`riscv-rv32/tests/softfloat.rs`) against the host in round-to-nearest-even and a round-to-odd reference in every mode; and the oracle property — the three execution paths leave identical state |
 | peripherals | `esp-periph/tests/devices.rs` | systimer one-shot and periodic alarms and their deadlines, TIMG prescaler/alarm/autoreload, GPIO edge and level interrupts, USB SOF cadence per chip clock, the I2S rate from the clock registers; the `device_set!` table from outside: ranges, `delta`, `alias`, the generic fallback, source numbering, tick delivery per clock domain, the deadline minimum, `--debug` fan-out |
 | audio source clocks | `cli/tests/pcm_sources.rs`, `cli/tests/adc_stream.rs` | pin routing, independent source clocks, DMA stalls, resets and exact ADC raw counts at all attenuations; no local firmware required |
 | microphone input | `cli/tests/i2s_rx.rs`, `esp-periph/src/i2s/rx.rs` | three-chip MMIO to guest DMA, C3 interrupt layout, descriptor ownership/EOF, stereo packing, clocks, reset persistence and unsupported modes; no firmware or home-directory inputs |
@@ -57,7 +57,7 @@ tools/wasm-build.sh && node tools/wasm-test.mjs hello c3-hello c6-hello c6-energ
 ```
 
 Tests named `external_*` need inputs only a developer machine has (full objdump listings via
-`XTENSA_DIS_FILES`/`RISCV_DIS_FILES`, Apple's clang for the encoder fixture) and fail loudly
+`XTENSA_DIS_FILES`/`RISCV_DIS_FILES`/`RISCV_P4_DIS_FILES`, Apple's clang for the encoder fixture) and fail loudly
 without them; run them by name. Their hermetic counterparts (`decoder_matches_corpus`,
 `encodings_match_fixture`) run in the default suite against checked-in oracles.
 
