@@ -62,6 +62,21 @@ fn strip_timestamp(line: &str) -> String {
     t.to_string()
 }
 
+/// The board's efuse MAC, which is not committed: `OXIDRIVE_MAC` (aa:bb:cc:dd:ee:ff), else
+/// Espressif's OUI 30:ed:a0 and the three bytes the firmware's console prints as its MQTT topic
+/// (`oxidrive/<hex>/cmd`), else the synthetic default.
+fn board_mac(log: &str) -> [u8; 6] {
+    let hex = |s: &str| u8::from_str_radix(s, 16).ok();
+    if let Ok(v) = std::env::var("OXIDRIVE_MAC") {
+        let b: Vec<u8> = v.split(':').filter_map(hex).collect();
+        if let Ok(mac) = b.try_into() { return mac; }
+        panic!("OXIDRIVE_MAC={v}: expected aa:bb:cc:dd:ee:ff");
+    }
+    let suffix = log.split("oxidrive/").skip(1).filter_map(|t| t.get(..6).filter(|_| t[6..].starts_with("/cmd")))
+        .find_map(|h| Some([hex(&h[..2])?, hex(&h[2..4])?, hex(&h[4..])?]));
+    match suffix { Some([d, e, f]) => [0x30, 0xed, 0xa0, d, e, f], None => [0x30, 0xed, 0xa0, 0x00, 0x11, 0x22] }
+}
+
 /// The owner's oxidrive firmware (not in this repository), booted from the same bootloader,
 /// partition table and app as the board whose console is `board-boot.log`, and compared line
 /// for line with timestamps stripped. The first two lines differ by construction (the ECO0 ROM
@@ -77,8 +92,8 @@ fn external_oxidrive_console_matches_the_board() {
     let mut bootloader = file("bootloader.bin");
     bootloader[2] = 0;
     if bootloader[23] == 1 { let n = bootloader.len() - 32; let digest = sha256(&bootloader[..n]); bootloader[n..].copy_from_slice(&digest); }
-    // the board's efuse MAC, which its console prints as the MQTT topic suffix
-    let mut m = esp32p4::machine([0x30, 0xed, 0xa0, 0x00, 0x11, 0x22], 32 << 20);
+    let board_log = String::from_utf8_lossy(&file("board-boot.log")).to_string();
+    let mut m = esp32p4::machine(board_mac(&board_log), 32 << 20);
     esp_soc::SocBus::set_flash_size(&mut m.bus, 32 << 20);
     esp_soc::SocBus::set_psram_size(&mut m.bus, 32 << 20).unwrap();
     m.load_rom(&std::fs::read(rom("esp32p4_rev0")).unwrap()).unwrap();
@@ -87,8 +102,7 @@ fn external_oxidrive_console_matches_the_board() {
     m.console.capture = true;
     m.max_cycles = esp32p4::periph::CPU_HZ;
     let stop = run_with_cycle_csr_shim(&mut m);
-    let board = String::from_utf8_lossy(&file("board-boot.log")).to_string();
-    let board: Vec<String> = board.lines().skip_while(|l| !l.starts_with("ESP-ROM:")).map(strip_timestamp).collect();
+    let board: Vec<String> = board_log.lines().skip_while(|l| !l.starts_with("ESP-ROM:")).map(strip_timestamp).collect();
     let emu: Vec<String> = String::from_utf8_lossy(&m.console.uart0).lines().map(strip_timestamp).collect();
     assert!(board.len() > 2 && emu.len() > 2, "no console to compare: board {} lines, emulator {}", board.len(), emu.len());
     eprintln!("[oxidrive] banner (ECO0 ROM, not the board's ECO2): {:?} / {:?} vs the board's {:?} / {:?}", emu[0], emu[1], board[0], board[1]);
