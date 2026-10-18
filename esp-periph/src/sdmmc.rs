@@ -12,7 +12,9 @@
 //! the response, CMD_DONE, the data phase through the IDMAC, DATA_OVER and the auto-stop. The
 //! IDMAC suspends on a descriptor the CPU still owns (DU) and resumes on a PLDMND write. Devices
 //! see emulated time (`Sdmmc::now_ns`, set by the chip before each access) for their own busy
-//! periods; the bus itself takes none.
+//! periods; the bus itself takes none unless `timed` is set (`bus_ns`): then CMD_DONE, DATA_OVER
+//! and the auto-stop's ACD come when the bits are through at the slot's card clock and width,
+//! from `advance`, which the chip calls at `next_event_ns`.
 pub mod card;
 pub use card::{FileStore, MemStore, SdCard, SdCardConfig, SdStore};
 use crate::device::{Device, WriteEffect};
@@ -61,6 +63,8 @@ pub trait SdDevice {
     fn write_data(&mut self, now: u64, data: &[u8]) -> Result<(), SdDataError>;
     /// DAT0 held low (programming, an R1b busy period). Looking does not change the device.
     fn busy(&self, _now: u64) -> bool { false }
+    /// When a busy period in progress ends, if the device can say.
+    fn busy_until(&self) -> Option<u64> { None }
     /// How many data lines the device drives now, checked against the host's CTYPE.
     fn bus_width(&self) -> Option<u8> { None }
     /// The SDIO interrupt (DAT1 low).
@@ -198,6 +202,13 @@ pub struct Sdmmc {
     bci_slot: Option<usize>,
     /// a register read raised an interrupt (BCI on a STATUS read)
     read_irq: bool,
+    /// commands and data take their time on the bus; `ciu_hz` is the clock into the card-clock
+    /// dividers, set by the chip
+    pub timed: bool,
+    pub ciu_hz: u64,
+    /// RINTSTS bits raised at a time to come, and when the data phase in progress ends
+    deferred: Vec<(u64, u32)>,
+    data_due: u64,
     pub stats: SdmmcStats,
     log: bool,
 }
@@ -207,7 +218,8 @@ impl Sdmmc {
         let mut s = Sdmmc { layout, ctrl: 0, cmd: 0, cmdarg: 0, resp: [0; 4], rintsts: 0, intmask: 0, ctype: 0, blksiz: 0, bytcnt: 0,
             bmod: 0, dbaddr: 0, idsts: 0, idinten: 0, dscaddr: 0, bufaddr: 0, tcbcnt: 0, tbbcnt: 0, resp_index: 0, cursor: 0,
             ram: RegRam::new(), card_detect_n: 0, write_protect: 0, devices: Vec::new(), route: [None; SLOTS], now_ns: 0, xfer: None,
-            pending: Pending::None, bci_slot: None, read_irq: false, stats: SdmmcStats::default(), log: false };
+            pending: Pending::None, bci_slot: None, read_irq: false, timed: false, ciu_hz: 0, deferred: Vec::new(), data_due: 0,
+            stats: SdmmcStats::default(), log: false };
         s.reset_registers();
         s
     }
@@ -227,6 +239,56 @@ impl Sdmmc {
         self.xfer = None;
         self.pending = Pending::None;
         self.bci_slot = None;
+        self.deferred.clear();
+    }
+
+    /// The card clock of `slot`: CLKSRC picks one of the four CLKDIV dividers (0 divides by 1,
+    /// n by 2n), as sdmmc_ll_get_card_clock_div reads them (hal/esp32p4/include/hal/sdmmc_ll.h).
+    fn card_hz(&self, slot: usize) -> u64 {
+        let src = self.ram.read(reg::CLKSRC) >> (2 * slot) & 3;
+        let div = self.ram.read(reg::CLKDIV) >> (8 * src) & 0xff;
+        self.ciu_hz / if div == 0 { 1 } else { 2 * div as u64 }
+    }
+
+    /// Nanoseconds `clocks` card clocks of `slot` take.
+    fn bus_ns(&self, slot: usize, clocks: u64) -> u64 {
+        let hz = self.card_hz(slot).max(1);
+        (clocks as u128 * 1_000_000_000).div_ceil(hz as u128) as u64
+    }
+
+    /// The data phase on the wire (SD Physical Layer Simplified Specification v9.10 §3.6.1,
+    /// §4.12): each block a start bit, its bits over the bus width, CRC16 and an end bit on every
+    /// line, a write's CRC status token after it, and two clocks between blocks (NAC, NWR).
+    fn data_ns(&self, slot: usize, total: u32, block: u32, write: bool) -> u64 {
+        let width = self.width(slot) as u64;
+        let blocks = total.div_ceil(block.max(1)) as u64;
+        let per = 1 + (block as u64 * 8).div_ceil(width) + 16 + 1 + if write { 2 + 5 } else { 0 } + 2;
+        self.bus_ns(slot, blocks * per)
+    }
+
+    /// Raise RINTSTS `bits` at `at` (at once unless the bus is timed and `at` is to come).
+    fn raise(&mut self, at: u64, bits: u32) {
+        if self.timed && at > self.now_ns { self.deferred.push((at, bits)); } else { self.rintsts |= bits; }
+    }
+
+    /// When the next deferred interrupt, or the end of the busy period a BCI waits for, is due.
+    pub fn next_event_ns(&self) -> Option<u64> {
+        let bits = self.deferred.iter().map(|d| d.0).min();
+        let busy = self.bci_slot.and_then(|s| self.route[s]).and_then(|i| self.devices.get(i)).and_then(|d| d.busy_until());
+        match (bits, busy) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) }
+    }
+
+    /// Time has reached `now`: raise what is due. True when RINTSTS changed.
+    pub fn advance(&mut self, now: u64) -> bool {
+        self.now_ns = now;
+        let before = self.rintsts;
+        let mut i = 0;
+        while i < self.deferred.len() {
+            if self.deferred[i].0 <= now { let (_, b) = self.deferred.swap_remove(i); self.rintsts |= b; } else { i += 1; }
+        }
+        if self.bci_slot.is_some() { self.busy_clear(); }
+        self.read_irq = false;
+        self.rintsts != before
     }
 
     /// A command or an IDMAC resume is waiting for `run`.
@@ -284,9 +346,18 @@ impl Sdmmc {
         let resp = self.send(slot, index, arg);
         if self.log { eprintln!("[sdmmc] slot {} CMD{} arg {:#010x} -> {:?}", slot, index, arg, resp); }
         let mut error = 0;
+        // the command and its response on CMD: 48 bits, NCR, the 48- or 136-bit response, NCC
+        // (SD Physical Layer Simplified Specification v9.10 §4.12.1); no response: the 64-clock timeout
+        let resp_bits = if c & CMD_RESP == 0 { 0 } else if c & CMD_RESP_LONG != 0 { 136 } else { 48 };
+        let cmd_end = if self.timed { self.now_ns + self.bus_ns(slot, 48 + 2 + resp_bits + 8) } else { self.now_ns };
         if c & CMD_RESP != 0 {
             let r = match resp {
-                Err(SdCmdError::NoResponse) => { self.stats.timeouts += 1; self.rintsts |= int::RTO | int::CMD_DONE; return; }
+                Err(SdCmdError::NoResponse) => {
+                    self.stats.timeouts += 1;
+                    let at = if self.timed { self.now_ns + self.bus_ns(slot, 48 + 64) } else { self.now_ns };
+                    self.raise(at, int::RTO | int::CMD_DONE);
+                    return;
+                }
                 Ok(r) => r,
                 Err(SdCmdError::Crc(r)) => { if c & CMD_RESP_CRC != 0 { error = int::RCRC; } r }
                 Err(SdCmdError::Malformed(r)) => { error = int::RESP_ERR; r }
@@ -294,14 +365,15 @@ impl Sdmmc {
             match r { SdResponse::Short(v) => self.resp[0] = v, SdResponse::Long(v) => self.resp = v }
             self.resp_index = index as u32;
         }
-        self.rintsts |= int::CMD_DONE | error;
-        if c & CMD_DATA != 0 && error == 0 { self.start_transfer(slot, c, mem); }
+        self.raise(cmd_end, int::CMD_DONE | error);
+        if c & CMD_DATA != 0 && error == 0 { self.start_transfer(slot, c, cmd_end, mem); }
     }
 
-    fn start_transfer(&mut self, slot: usize, c: u32, mem: &mut dyn SdmmcMemory) {
+    fn start_transfer(&mut self, slot: usize, c: u32, cmd_end: u64, mem: &mut dyn SdmmcMemory) {
         let total = self.bytcnt;
         let block = (self.blksiz & 0xffff).max(1);
         let width = self.width(slot);
+        self.data_due = if self.timed { cmd_end + self.data_ns(slot, total, block, c & CMD_WRITE != 0) } else { self.now_ns };
         let mismatch = self.device(slot).and_then(|d| d.bus_width()).is_some_and(|w| w != width);
         let write = c & CMD_WRITE != 0;
         self.xfer = Some(Transfer { slot, write, total, moved: 0, card_left: total, block, fifo: Vec::new(), auto_stop: c & CMD_AUTO_STOP != 0, desc: None, chain_end: false, suspended: false });
@@ -325,7 +397,7 @@ impl Sdmmc {
     /// End the data phase with an error: the interrupt, DATA_OVER after it (the DesignWare
     /// core reports data-over after a data error too) and the IDMAC's card error summary.
     fn data_error(&mut self, bit: u32) {
-        self.rintsts |= bit | int::DATA_OVER;
+        self.raise(self.data_due, bit | int::DATA_OVER);
         self.idsts |= idsts::CES | idsts::AIS;
         self.finish(false);
     }
@@ -334,12 +406,13 @@ impl Sdmmc {
     /// assumption, which the IDF driver relies on to get the card out of its data state.
     fn finish(&mut self, ok: bool) {
         let Some(x) = self.xfer.take() else { return };
-        if ok { self.rintsts |= int::DATA_OVER; }
+        if ok { self.raise(self.data_due, int::DATA_OVER); }
         self.tcbcnt = x.total - x.card_left;
         self.tbbcnt = x.moved;
         if x.auto_stop {
             if let Ok(SdResponse::Short(v)) = self.send(x.slot, 12, 0) { self.resp[1] = v; self.resp_index = 12; }
-            self.rintsts |= int::ACD;
+            let at = if self.timed { self.data_due + self.bus_ns(x.slot, 48 + 2 + 48 + 8) } else { self.now_ns };
+            self.raise(at, int::ACD);
         }
         if x.write && self.ram.read(reg::CARDTHRCTL) & CARDTHRCTL_BUSY_CLR_INT_EN != 0 { self.bci_slot = Some(x.slot); self.busy_clear(); }
     }
@@ -394,7 +467,7 @@ impl Sdmmc {
                 let mut chunk = vec![0u8; n as usize];
                 if mem.read(at, &mut chunk).is_err() { self.xfer = Some(x); self.fault(true); return; }
                 x.fifo.extend_from_slice(&chunk);
-                let (slot, now) = (x.slot, self.now_ns);
+                let (slot, now) = (x.slot, if self.timed { self.data_due } else { self.now_ns });
                 while x.card_left > 0 && (x.fifo.len() as u32 >= x.block.min(x.card_left)) {
                     let k = x.block.min(x.card_left) as usize;
                     let r = match self.device(slot) { Some(dev) => dev.write_data(now, &x.fifo[..k]), None => Err(SdDataError::NoCrcStatus) };
@@ -495,7 +568,7 @@ impl Device for Sdmmc {
     fn write(&mut self, off: u32, v: u32) -> WriteEffect {
         match off {
             reg::CTRL => {
-                if v & (CTRL_CONTROLLER_RESET | CTRL_DMA_RESET) != 0 { self.xfer = None; self.pending = Pending::None; }
+                if v & (CTRL_CONTROLLER_RESET | CTRL_DMA_RESET) != 0 { self.xfer = None; self.pending = Pending::None; self.deferred.clear(); }
                 self.ctrl = v & !(CTRL_CONTROLLER_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET);
             }
             reg::CTYPE => self.ctype = v & 0x3_0003,

@@ -93,7 +93,11 @@ impl<R: Revision> Soc for Esp32p4<R> {
 
 impl esp_soc::SocBus for SocBus {
     fn cycles(&self) -> u64 { self.cycles }
-    fn next_deadline(&self) -> Option<u64> { match self.periph.cycles_until_timer() { u32::MAX => None, c => Some(c.max(1) as u64) } }
+    fn next_deadline(&self) -> Option<u64> {
+        let c = self.periph.cycles_until_timer();
+        if self.periph.sdmmc.timed { return self.timed_sd_deadline(c); }
+        match c { u32::MAX => None, c => Some(c.max(1) as u64) }
+    }
     fn irq_dirty(&mut self) -> &mut bool { &mut self.irq_dirty }
     fn refresh_irq(&mut self) -> bool { self.periph.refresh_lines(); true }
     fn misc(&mut self) -> &mut Misc { &mut self.periph.misc }
@@ -144,6 +148,7 @@ impl esp_soc::SocBus for SocBus {
         // The card in the socket keeps its power and its state; IDF's init resets it with CMD0.
         p.sdmmc.devices = old.sdmmc.devices;
         p.sdmmc.stats = old.sdmmc.stats;
+        p.sdmmc.timed = old.sdmmc.timed;
         p.sd_pins = old.sd_pins;
         // The USB cable stays plugged in; the host sees the reset core's pull-up go.
         if let Some(link) = old.usb_otg.link { p.usb_otg.stats = old.usb_otg.stats; p.usb_otg.reattach(old.usb_otg.now, link); }
@@ -200,11 +205,13 @@ impl esp_soc::SocBus for SocBus {
     /// The card goes in the reference board's socket, on slot 0's IO MUX pins; firmware reaches
     /// it through slot 0 or, routing those pins through the GPIO matrix, slot 1.
     fn attach_sd_card(&mut self, image: Box<dyn esp_periph::sdmmc::SdStore>, config: esp_periph::sdmmc::SdCardConfig) -> Result<String, String> {
+        let timed = config.timed_bus;
         let card = esp_periph::sdmmc::SdCard::with_config(image, config)?;
         let what = format!("{}, {} blocks ({}), serial {:08x}, programming {} us, at CLK {} CMD {} D0-D3 {:?}", card.describe(), card.blocks(), if card.sdxc() { "SDXC" } else { "SDHC" },
                            card.serial(), card.config.prg_ns / 1000, periph::SdPins::SOCKET.clk, periph::SdPins::SOCKET.cmd, periph::SdPins::SOCKET.data);
+        self.periph.sdmmc.timed = timed;
         self.periph.attach_sd(periph::SdPins::SOCKET, Box::new(card));
-        Ok(what)
+        Ok(format!("{what}{}", if timed { ", bus timed" } else { "" }))
     }
     fn report(&self) -> String {
         let s = &self.periph.sdmmc.stats;

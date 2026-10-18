@@ -260,6 +260,18 @@ impl SocBus {
         self.periph.psram1.dirty.clear();
     }
 
+    /// The device deadline `timer` (CPU cycles, `u32::MAX` for none) or a timed SD bus's next event.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn timed_sd_deadline(&self, timer: u32) -> Option<u64> {
+        let mut c = timer as u64;
+        if let Some(t) = self.periph.sdmmc.next_event_ns() {
+            let ns = t.saturating_sub(self.periph.now_ns());
+            c = c.min((ns as u128 * crate::periph::CPU_HZ as u128).div_ceil(1_000_000_000) as u64);
+        }
+        if c >= u32::MAX as u64 { None } else { Some(c.max(1)) }
+    }
+
     /// Write straight into flash (image loaders, not the guest).
     pub fn write_flash(&mut self, offset: usize, data: &[u8]) -> Result<(), String> {
         let target = self.flash.get_mut(offset..).and_then(|tail| tail.get_mut(..data.len())).ok_or("flash image too large")?;
@@ -285,6 +297,15 @@ impl SocBus {
         if self.periph.spi_exec { self.run_spi(); }
         self.periph.tick(cycles as u64);
         if self.periph.usb_otg.pending() { self.run_usb(); }
+        if self.periph.sdmmc.timed { self.sd_time(); }
+    }
+
+    /// A timed SD bus raises what has come due.
+    #[cold]
+    #[inline(never)]
+    fn sd_time(&mut self) {
+        let now = self.periph.now_ns();
+        if self.periph.sdmmc.next_event_ns().is_some_and(|t| t <= now) && self.periph.sdmmc.advance(now) { self.irq_dirty = true; }
     }
 }
 

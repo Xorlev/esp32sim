@@ -272,6 +272,16 @@ impl HpClkRst {
         ram.write(Self::HP_RST_EN0, 0x100);                            // RST_EN_CORE1_GLOBAL (bit 8) on
         HpClkRst { ram }
     }
+    /// The SDMMC host's clock into its card-clock dividers: PERI_CLK_CTRL01.REG_SDIO_LS_CLK_SRC_SEL
+    /// (bit 23) picks PLL_F160M (0) or the 200 MHz SDIO PLL (1), PERI_CLK_CTRL02's SDIO_LS edges
+    /// divide it by EDGE_L + 1, by 1 when all three are 0 (hp_sys_clkrst_reg.h:1150-1270;
+    /// sdmmc_ll_select_clk_source, sdmmc_ll_get_clock_div in hal/esp32p4/include/hal/sdmmc_ll.h).
+    pub fn sdio_ls_hz(&self) -> u64 {
+        let src = if self.ram.read(0x34) >> 23 & 1 != 0 { 200_000_000 } else { 160_000_000 };
+        let edges = self.ram.read(0x38);
+        let (l, h, n) = (edges >> 9 & 0xf, edges >> 13 & 0xf, edges >> 17 & 0xf);
+        src / if l == 0 && h == 0 && n == 0 { 1 } else { l as u64 + 1 }
+    }
     /// Core 1 runs once its clock is on and its global reset released (hal/esp32p4/include/hal/cpu_utility_ll.h).
     pub fn core1_released(&self) -> bool { self.ram.read(Self::SOC_CLK_CTRL0) & (1 << 4) != 0 && self.ram.read(Self::HP_RST_EN0) & (1 << 8) == 0 }
 }
@@ -585,7 +595,7 @@ impl DeviceSet for Peripherals {
         // INTR_STATUS_0..3 read the source state.
         if block == 0x500d6 && !write && (0x200..=0x20c).contains(&(off & 0x7ff)) { self.intmtx.status = self.source_status(); }
         if block == 0x50110 && off == 0x1a4 && !write { self.rng.now = self.clock.cycles() as u32; }
-        if block == 0x50083 { self.sdmmc.now_ns = self.now_ns(); }
+        if block == 0x50083 { self.sdmmc.now_ns = self.now_ns(); if self.sdmmc.timed { self.sdmmc.ciu_hz = self.hp_clkrst.sdio_ls_hz(); } }
         // CDETECT and WRTPRT read the card-detect and write-protect signals of the GPIO matrix.
         if block == 0x50083 && (off == 0x50 || off == 0x54) && !write {
             let (cd, wp) = (0..SLOTS).fold((0, 0), |(cd, wp), s| (cd | (self.gpio.in_signal(SIG_SD_CARD_DETECT_N[s]) as u32) << s, wp | (self.gpio.in_signal(SIG_SD_WRITE_PRT[s]) as u32) << s));

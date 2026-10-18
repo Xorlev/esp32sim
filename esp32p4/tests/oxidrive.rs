@@ -72,7 +72,8 @@ fn boot(card_name: &str, write_through: bool) -> (esp32p4::Machine, String, std:
     let card = tmp(card_name);
     let (size, serial) = board_card(&board_log);
     sd_image::fat32(&card, size, 32 << 10, "ESP32SIM").unwrap();
-    let config = esp_periph::sdmmc::SdCardConfig { serial, ..Default::default() };
+    let timed_bus = std::env::var("OXIDRIVE_SD_TIMING").is_ok_and(|v| v == "1");
+    let config = esp_periph::sdmmc::SdCardConfig { serial, timed_bus, ..Default::default() };
     let path = card.to_str().unwrap();
     let store = if write_through { esp_periph::sdmmc::FileStore::write_through(path) } else { esp_periph::sdmmc::FileStore::copy_on_write(path) };
     let what = esp_soc::SocBus::attach_sd_card(&mut m.bus, Box::new(store.unwrap()), config).unwrap();
@@ -133,7 +134,8 @@ fn external_oxidrive_console_matches_the_board() {
 /// idles polling the drive while oxidrive runs on. Afterwards the clip must be on the card image
 /// (written through) byte for byte. The firmware's console from the moment the car connected is
 /// printed: how it accounts for the car's writes. Archive windows, which take the card from the
-/// car, need WiFi and the NAS (milestone 4).
+/// car, need WiFi and the NAS (milestone 4). `OXIDRIVE_CAR_GAP_MS` sets the gap between chunks,
+/// `OXIDRIVE_SD_TIMING=1` times the SD bus (`--sd-timing`).
 #[test]
 #[ignore = "needs the oxidrive images under ~/Code/dlp/sim-fixtures"]
 fn external_oxidrive_presents_the_card_to_a_car() {
@@ -157,11 +159,12 @@ fn external_oxidrive_presents_the_card_to_a_car() {
     let mut fs = Fat32::mount(&mut msc).unwrap_or_else(|e| panic!("[oxidrive] the car could not mount the volume: {e}"));
     eprintln!("[oxidrive] car: FAT32 {:?}, {} clusters of {} bytes", fs.label, fs.clusters, fs.cluster_bytes());
     let clip = clip_bytes("CLIP0001.MP4", 4 << 20);
+    let gap_ns = std::env::var("OXIDRIVE_CAR_GAP_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(16) * 1_000_000;
     let t0 = msc.host.now_ns();
     let r = (|| {
         let mut f = fs.create(&mut msc, "CLIP0001.MP4")?;
         for (n, part) in clip.chunks(64 << 10).enumerate() {
-            if n > 0 { msc.pause_ns(16_000_000)?; }
+            if n > 0 && gap_ns > 0 { msc.pause_ns(gap_ns)?; }
             f.write(&mut fs, &mut msc, part)?;
         }
         f.close(&mut fs, &mut msc).map(|_| ())
