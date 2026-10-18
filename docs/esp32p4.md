@@ -1059,8 +1059,10 @@ announces its sensors and buttons.
 4.1 MB/s camera writes them: directories three deep under long names and a clip whose top-level
 MP4 boxes are `ftyp`, `mdat` and `moov` (`fat32::mkdir_all`, `create_path`, `mp4_bytes`), which
 oxidrive's walkers need. It then idles, polling TEST UNIT READY every 2 s as udev polls a
-removable disk. oxidrive's own policy does the rest; `OXIDRIVE_FORCE_OPEN=1` publishes
-`force_open` instead, which is not needed:
+removable disk. oxidrive's own policy does the rest. `OXIDRIVE_FORCE_OPEN=1` instead publishes
+`force_open` on `oxidrive/<id>/cmd` every 2 s from 15 s after the car's last write: the first one
+forces a shared pass, a later one the window, taken at 28.8 s with the same uploads, which saves
+40 s of emulated time. Without it:
 
 | t (s) | what happens |
 | --- | --- |

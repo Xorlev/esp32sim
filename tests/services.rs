@@ -80,17 +80,20 @@ impl Service {
         }
     }
 
-    /// Stop the group and reap the process.
+    /// Stop the group and reap the process. Once the leader is reaped its id can be reused, so the
+    /// group gets SIGKILL only while a member is still there to hold the id.
     pub fn stop(&mut self) {
-        let group = format!("-{}", self.child.id());
+        let pgid = self.child.id();
+        let group = format!("-{pgid}");
         let signal = |sig: &str| { let _ = Command::new("kill").args([sig, "--", &group]).stderr(Stdio::null()).status(); };
         signal("-TERM");
         let t0 = Instant::now();
+        let mut exited = false;
         while t0.elapsed() < Duration::from_secs(5) {
-            if let Ok(Some(_)) = self.child.try_wait() { break; }
+            if let Ok(Some(_)) = self.child.try_wait() { exited = true; break; }
             std::thread::sleep(Duration::from_millis(20));
         }
-        signal("-KILL");
+        if !exited || group_alive(pgid) { signal("-KILL"); }
         let _ = self.child.wait();
     }
 }
