@@ -25,6 +25,8 @@ impl<'a, B> RecordingBus<'a, B> {
 }
 
 impl<B: Bus> Bus for RecordingBus<'_, B> {
+    fn reserve(&mut self, addr: u32) { self.bus.reserve(addr) }
+    fn reservation_held(&mut self, addr: u32) -> bool { self.bus.reservation_held(addr) }
     fn read8(&mut self, address: u32) -> Result<u8, Fault> {
         let result = self.bus.read8(address);
         self.accesses.push(MemoryAccess { kind: MemoryAccessKind::Read, address, width: 1, value: result.unwrap_or(0) as u32, fault: result.err() });
