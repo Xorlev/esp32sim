@@ -27,6 +27,8 @@ default too, with 16 MB of flash ([esp32p4.md](esp32p4.md)).
 | `--flash-mb N`, `--psram-mb N` | flash size (JEDEC follows it) and octal PSRAM size (default 8 / 2) |
 | `--sd IMAGE`, `--sd-rw IMAGE` | (P4) an SD card in the reference board's socket (CLK 43, CMD 44, D0-D3 39-42), holding the image: a high capacity card of the image's size, rounded down to 512 KiB. `--sd` is copy-on-write: what the firmware writes stays in memory and the file is never modified. `--sd-rw` writes through to the file. See [esp32p4.md](esp32p4.md), "SD card" |
 | `--sd-prg-us N`, `--sd-serial HEX` | (P4) the card's programming time after a write or an erase, in microseconds of emulated time (default 0: instant), and its CID serial number (default: derived from the image size) |
+| `--sd-timing` | (P4) commands and data take their time on the SD bus at the slot's card clock and width: CMD_DONE, DATA_OVER and the auto-stop come when the bits are through (default: at once). See [esp32p4.md](esp32p4.md), "The host" |
+| `--usb-host F` | (P4) a USB host on the high-speed USB-OTG port, running the commands in F (below) from power-up; the run then goes on to `--max-seconds`. See [esp32p4.md](esp32p4.md), "USB" |
 | `--board atech14\|waveshare-cam\|waveshare-lcd4b\|waveshare-amoled18-v2\|none` | board model (default atech14); on the C6: `waveshare-c6-lcd147` or `none`; on the classic ESP32: `ttgo-tdisplay` (alias `tdisplay`), `esp32dev-loopback` or `none`/`esp32dev` |
 | `--strap HEX`, `--reset-cause HEX`, `--efuse-regs F`, `--regs-init F` | reproduce a real chip's boot state (used by the differential tests) |
 | `--no-reboot` | stop at the first chip reset instead of rebooting from ROM |
@@ -93,7 +95,7 @@ not sampled edges. LEDC fades and MCPWM dead time, carrier and extra generator a
 | `--coverage`, `--coverage-file F` | block starts reached, per function; with a file, one `addr symbol` line each |
 | `--irq-latency` | cycles from an interrupt line appearing at a core to the core taking it, per line; retains block execution |
 | `--vcd F` | GPIO edges and interrupt lines as a VCD waveform (1 ps units); retains block execution |
-| `--debug AREAS` | what the model prints: device names or prefixes (`spi`, `usb`, `i2c`, `wifi`, `gdma`, `sha`, `rsa`, `lcd_cam`), `net`, `wifi-frames`, `aes`, `rom`, `mmio`, `rt`; also `ESP_EMU_DEBUG=a,b` |
+| `--debug AREAS` | what the model prints: device names or prefixes (`spi`, `usb`, `i2c`, `wifi`, `gdma`, `sha`, `rsa`, `lcd_cam`, `sdmmc`, `usb_otg` for the P4's USB-OTG core and the host's link; `usb` also takes USB-Serial/JTAG), `net`, `wifi-frames`, `aes`, `rom`, `mmio`, `rt`; also `ESP_EMU_DEBUG=a,b` |
 | `--log-periph` | log the first access to every unknown peripheral register |
 | `--no-jit` | run blocks through the interpreter instead of native code (aarch64 hosts compile blocks to machine code by default); the two must produce identical results, so this is the oracle when something looks wrong |
 | `--stop-after-exceptions N` | stop after N exceptions |
@@ -142,6 +144,43 @@ select ADC1 and GPIO5 selects ADC2; C6 GPIO0–6 select ADC1.
 `waituart0 <timeout_s> <text>` holds later actions until UART0 prints the text or
 the timeout expires. Raw counts and completed-conversion observations are exposed
 through the [host ADC API](peripherals.md#host-adc-inputs), with no CLI equivalent.
+
+## USB host (P4)
+
+`--usb-host FILE` plugs a host into the P4's high-speed USB-OTG port and runs FILE's commands in
+order, one a line (`#` starts a comment), each taking the emulated time it takes on the bus while
+the firmware runs, within the run's `--max-insns` and `--max-seconds` and its reboot policy
+(`--no-reboot`, an app-mode Restart). The first command that fails ends the file, unless its line
+starts with `?`: then the failure is logged and the file goes on. A failure that leaves no device
+on the port drops the interface and the volume, as Linux's disconnect does. The run then goes on
+to its time limit.
+What each command did goes to stderr as `[usb-host] t=<seconds> ...`, and the end-of-run report
+adds a `[usb]` line with the core's and the host's counts.
+
+| Command | What the host does |
+| --- | --- |
+| `attach [timeout_ms]` | VBUS on, wait for the device to connect (10 s), debounce 100 ms, port reset, GET_DESCRIPTOR, SET_ADDRESS, the configuration and strings, SET_CONFIGURATION |
+| `detach`, `reset` | VBUS off; reset and enumerate again |
+| `port-reset` | Linux's `usb_reset_device`: reset, GET_DESCRIPTOR(64), reset, SET_ADDRESS to the same address, the descriptors read and compared, SET_CONFIGURATION again |
+| `suspend`, `resume`, `idle MS` | stop SOFs; drive resume for 20 ms; let time pass |
+| `rate MBPS` | cap the host's bulk payload per microframe (a slower host) |
+| `msc` | open the bulk-only mass-storage interface: GET MAX LUN, INQUIRY |
+| `recovery linux`, `recovery bot` | how a transport error or a timed-out command is recovered: Linux v6.12 usb-storage's port reset, its class reset only if that fails (the default), or BOT 1.0's reset recovery |
+| `timeout MS` | how long a command may take before the host aborts it (30000, sd's SD_TIMEOUT) |
+| `inject vbus-off MS` | VBUS goes MS from now, whatever the host is doing then; a transfer in flight ends disconnected |
+| `ready INTERVAL_MS TIMEOUT_MS` | TEST UNIT READY until it passes, REQUEST SENSE after each failure |
+| `poll INTERVAL_MS MS` | TEST UNIT READY every interval for a while, as a car polls its drive; a NOT READY seen here or by `ready` drops the mounted volume |
+| `capacity`, `mode-sense`, `prevent`, `allow`, `sync`, `eject` | READ CAPACITY(10), MODE SENSE(6), PREVENT ALLOW MEDIUM REMOVAL, SYNCHRONIZE CACHE(10) (a refusal is logged, not an error), START STOP UNIT with LoEj |
+| `read LBA COUNT`, `write LBA COUNT BYTE`, `verify LBA COUNT BYTE` | READ(10) (its hash), WRITE(10) of one byte value (hex), READ(10) and compare |
+| `mount`, `ls` | mount the FAT32 volume on the LUN (an MBR's partition or from LBA 0); list its root directory |
+| `fat-write NAME BYTES CHUNK_KIB [GAP_MS] [FAT_EVERY]` | write an 8.3 file of test bytes into the root directory in a vfat-like order: the directory entry, the data in chunks, the FAT sectors (both copies) after every FAT_EVERY chunks (1), then the entry's size and cluster and FSInfo. Chunk i is due GAP_MS·i after the start, as a camera produces them; the log gives the rate overall and over the second half, the worst lateness against that schedule and whether the car kept up (never a whole chunk behind) |
+| `fat-read NAME` | read a file back; one this file wrote is compared with what it wrote |
+| `uart0 TEXT` | a line into the firmware's UART0 (its console) |
+
+`examples/usb_msc-p4/car.txt` is a car: it records a clip, ejects the drive, polls it while the
+example's application owns the card (MEDIUM NOT PRESENT) and takes it again.
+`examples/usb_msc-p4/faults.txt` is a car meeting faults: a command that times out mid-transfer,
+a port reset after an eject, and VBUS lost while a clip is being written.
 
 ## Virtual BLE
 

@@ -1,9 +1,10 @@
 # ESP32-P4 — plan
 
-Status: milestones 1 and 2 done, milestone 3 (USB) next. hello_world boots to `app_main` on one
-and on both cores and reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr
-counters, CLIC mode and two harts. The SDMMC host and an SD card carry IDF's sdmmc example through
-a FAT32 mount ([esp32p4.md](esp32p4.md)). Tracks
+Status: milestones 1 to 3 done, milestone 4 (the co-processor) next. hello_world boots to
+`app_main` on one and on both cores and reboots through the ROM; the core has F with the lazy FPU
+traps, the Zicntr counters, CLIC mode and two harts. The SDMMC host and an SD card carry IDF's
+sdmmc example through a FAT32 mount. The high-speed USB-OTG core presents the card to a host
+written in Rust, which records a clip on it like a car ([esp32p4.md](esp32p4.md)). Tracks
 [#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:
@@ -105,7 +106,9 @@ after an eject).
 
 Done when IDF's own tusb_msc example enumerates to the host, which reads the capacity, reads and
 writes blocks, mounts FAT32 and writes and reads a file, as a golden with the card's contents
-checked afterwards.
+checked afterwards. Done: the core in `esp-periph/src/usb_otg.rs`, the host in
+`esp-soc/src/usb_host/`, `--usb-host`, goldens `usbmsc-p4` and `usbmsc-p4-faults` (esp32p4.md,
+"USB").
 
 ### 4. The co-processor
 
