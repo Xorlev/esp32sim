@@ -270,6 +270,29 @@ fn p4_sd_firmware(images: &str, card: Option<&std::path::Path>, rw: bool, second
     run(BIN_P4, &args)
 }
 
+/// Long raw sector transfers through IDF's driver (`examples/sd_card-p4-sectors`): 64 and 128
+/// sectors with CMD25 and CMD18, where the driver refills its four DMA descriptors from its
+/// interrupt handler and the host sends the auto-stop; a misaligned buffer split into CMD17s; a
+/// read past the end refused by the driver; and a card that programs for 2 ms after each write,
+/// which the driver waits out polling CMD13.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn sd_card_sectors_p4() {
+    let card = tmp("sdsectors-p4.img");
+    sd_image::fat32(&card, 64 << 20, 512, "").unwrap();
+    let r = p4_sd_firmware("p4-sdsectors", Some(&card), true, "1", &["--sd-prg-us", "2000"]);
+    for line in ["sectors 64: write 0x0 in ", "read 0x0 in ", "sectors 128: write 0x0, read 0x0, same 1", "sectors 64 misaligned: read 0x0, same 1",
+                 "sectors past the end: read 0x104", "status: 0x0", "Card unmounted"] {
+        assert!(r.stdout.contains(line), "missing {line:?} in:\n{}", r.stdout);
+    }
+    let write_us: u64 = r.stdout.split("sectors 64: write 0x0 in ").nth(1).and_then(|t| t.split(' ').next()).and_then(|n| n.parse().ok()).unwrap();
+    assert!(write_us >= 2000, "the write took {write_us} us, less than the card's programming time");
+    assert_eq!(r.stdout.matches(", same 1").count(), 3, "every transfer read back what was written:\n{}", r.stdout);
+    expect_text("sdcard-sectors-p4.console.txt", &r.stdout);
+    expect_u64("sdcard-sectors-p4.insns", r.insns);
+    let files = sd_image::Volume::open(&card).unwrap().root_files();
+    assert_eq!(files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["NIHAO.TXT", "FOO.TXT"]);
+}
+
 #[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
 fn sd_card_p4() {
     let card = tmp("sdcard-p4.img");
