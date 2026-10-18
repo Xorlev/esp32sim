@@ -32,6 +32,7 @@ pub mod gpspi;
 pub mod rng;
 pub mod intmtx;
 pub mod sdmmc;
+pub mod usb_otg;
 
 pub use device::{Device, WriteEffect};
 pub use mmio::{DeviceSet, Dispatch, Misc, NO_SOURCE};
