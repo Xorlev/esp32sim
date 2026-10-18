@@ -3,10 +3,13 @@
 //! TCP uses bounded buffers in both directions. SYN, data and FIN share one retransmission queue,
 //! so a dropped virtual-air frame cannot discard acknowledged guest bytes or strand a handshake.
 //! This is a small relay, without window scaling, SACK or congestion control.
+//!
+//! A forward (`fwd=` of `--net`) sends TCP for one guest address and port to a fixed host
+//! address instead. With `--net none` the forwards are the only flows relayed.
 
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use crate::net::packet::{ethernet, ip_packet, transport_checksum, udp_packet, GATEWAY_MAC};
@@ -170,12 +173,30 @@ struct Udp {
     last_activity_us: u64,
 }
 
+/// TCP to `guest` (an address and port the guest connects to) goes to `host` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Forward { pub guest: SocketAddrV4, pub host: SocketAddr }
+
+impl Forward {
+    /// `GUEST_IP:PORT=HOST_IP:PORT`, both IPv4.
+    pub fn parse(spec: &str) -> Result<Forward, String> {
+        let (guest, host) = spec.split_once('=').ok_or_else(|| format!("{spec}: expected GUEST_IP:PORT=HOST_IP:PORT"))?;
+        let addr = |s: &str| s.parse::<SocketAddrV4>().map_err(|_| format!("{s}: expected an IPv4 address and a port"));
+        let (guest, host) = (addr(guest)?, addr(host)?);
+        if guest.port() == 0 || host.port() == 0 { return Err(format!("{spec}: port 0")); }
+        Ok(Forward { guest, host: SocketAddr::V4(host) })
+    }
+}
+
 pub struct Nat {
     tcp: Vec<Tcp>,
     udp: Vec<Udp>,
     isn: u32,
     pub resolver: [u8; 4],
     pub log: bool,
+    /// relay flows to where the guest sent them (`--net nat`); without it only `forwards` are
+    pub outbound: bool,
+    pub forwards: Vec<Forward>,
     pub tcp_opened: u64, pub tcp_refused: u64, pub udp_flows: u64,
     pub udp_evicted: u64, pub udp_send_errors: u64,
     pub bytes_to_host: u64, pub bytes_to_guest: u64,
@@ -183,8 +204,22 @@ pub struct Nat {
 
 impl Nat {
     pub fn new(log: bool) -> Self {
-        Self { tcp: Vec::new(), udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), log,
+        Self { tcp: Vec::new(), udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), log, outbound: true, forwards: Vec::new(),
             tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0 }
+    }
+
+    /// A NAT that relays the forwards and nothing else (`--net none,fwd=...`).
+    pub fn forward_only(log: bool, forwards: Vec<Forward>) -> Self {
+        Self { outbound: false, forwards, ..Self::new(log) }
+    }
+
+    /// Where TCP for `dip:dport` goes on the host, if anywhere.
+    pub fn tcp_target(&self, dip: &[u8; 4], dport: u16) -> Option<SocketAddr> {
+        let guest = SocketAddrV4::new(ip(dip), dport);
+        match self.forwards.iter().find(|f| f.guest == guest) {
+            Some(f) => Some(f.host),
+            None => self.outbound.then(|| address(dip, dport)),
+        }
     }
 
     /// Forward a UDP datagram through a connected socket, which accepts replies only from its peer.
@@ -245,14 +280,16 @@ impl Nat {
                 let Some(i) = self.tcp.iter().position(|c| matches!(c.transport, Transport::TimeWait | Transport::Closed)) else { return Vec::new() };
                 Some(i)
             } else { None };
-            let Some(pending) = connector(address(dip, dport)) else { return Vec::new() };
+            let Some(target) = self.tcp_target(dip, dport) else { return Vec::new() };
+            let Some(pending) = connector(target) else { return Vec::new() };
             if let Some(i) = evict { self.tcp.remove(i); }
             self.isn = self.isn.wrapping_add(0x10000);
             self.tcp.push(Tcp { guest_mac: *gmac, guest_ip: *gip, guest_port: sport, dst_ip: *dip, dst_port: dport,
                 transport: Transport::Connecting(pending), guest_write: GuestWrite::Open, host_closed: false,
                 our_seq: self.isn, guest_seq: seq.wrapping_add(1), guest_window: window,
                 to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us });
-            if self.log { eprintln!("[nat] TCP {}:{} -> {}:{} connecting", ip(gip), sport, ip(dip), dport); }
+            if self.log { eprintln!("[nat] TCP {}:{} -> {}:{} connecting{}", ip(gip), sport, ip(dip), dport,
+                                    if target == address(dip, dport) { String::new() } else { format!(" (forwarded to {target})") }); }
             return Vec::new();
         }
         let Some(i) = idx else { return Vec::new() };

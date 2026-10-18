@@ -442,21 +442,26 @@ fn fault_label(f: &cosim::Fault) -> String {
     }
 }
 
-/// `--wifi` and `--net MODE[,epoch=UNIX_SECONDS]`: the access point, and the NAT for `nat` (or
-/// `user`); `epoch` fixes the virtual network's clock (its SNTP answers) at power-on.
+/// `--wifi` and `--net MODE[,epoch=UNIX_SECONDS][,fwd=GUEST_IP:PORT=HOST_IP:PORT...]`: the access
+/// point, and the NAT for `nat` (or `user`) or for the forwards; `epoch` fixes the virtual
+/// network's clock (its SNTP answers) at power-on.
 fn wifi_config(spec: &str, net: &str, net_log: bool) -> (esp_soc::wifi::ApConfig, Option<esp_soc::nat::Nat>) {
     let mut cfg = esp_soc::wifi::ApConfig::parse(spec).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
     let (mode, opts) = net.split_once(',').unwrap_or((net, ""));
+    let mut forwards = Vec::new();
     for kv in opts.split(',').filter(|kv| !kv.is_empty()) {
         match kv.split_once('=') {
             Some(("epoch", v)) => cfg.epoch_s = Some(v.parse().unwrap_or_else(|_| usage_error(&format!("--net epoch={v}: seconds since 1970")))),
-            _ => usage_error(&format!("--net: unknown option {kv:?} (epoch=UNIX_SECONDS)")),
+            Some(("fwd", v)) => forwards.push(esp_soc::nat::Forward::parse(v).unwrap_or_else(|e| usage_error(&format!("--net fwd={e}")))),
+            _ => usage_error(&format!("--net: unknown option {kv:?} (epoch=UNIX_SECONDS, fwd=GUEST_IP:PORT=HOST_IP:PORT)")),
         }
     }
-    let nat = mode == "nat" || mode == "user";
+    let outbound = match mode { "nat" | "user" => true, "none" => false, _ => usage_error(&format!("--net {mode}: nat or none")) };
     eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp_soc::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
-    let nat = nat.then(|| esp_soc::nat::Nat::new(net_log));
-    if let Some(nat) = &nat { eprintln!("[emu] NAT to the host network enabled (DNS via {}.{}.{}.{})", nat.resolver[0], nat.resolver[1], nat.resolver[2], nat.resolver[3]); }
+    for f in &forwards { eprintln!("[emu] TCP to {} is forwarded to {}", f.guest, f.host); }
+    let nat = if outbound { let mut n = esp_soc::nat::Nat::new(net_log); n.forwards = forwards; Some(n) }
+              else { (!forwards.is_empty()).then(|| esp_soc::nat::Nat::forward_only(net_log, forwards)) };
+    if let Some(nat) = nat.as_ref().filter(|n| n.outbound) { eprintln!("[emu] NAT to the host network enabled (DNS via {}.{}.{}.{})", nat.resolver[0], nat.resolver[1], nat.resolver[2], nat.resolver[3]); }
     let net = esp_soc::net::VirtualNet::new(false);   // its fixed addresses, for the line below
     eprintln!("[emu] virtual network: station {}.{}.{}.{}, gateway {}.{}.{}.{} (DHCP, ARP, ICMP, DNS, NTP)", net.sta_ip[0], net.sta_ip[1], net.sta_ip[2], net.sta_ip[3], net.gw_ip[0], net.gw_ip[1], net.gw_ip[2], net.gw_ip[3]);
     (cfg, nat)

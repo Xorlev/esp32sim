@@ -102,14 +102,15 @@ impl VirtualNet {
             17 if body.len() >= 8 && be16(&body[2..4]) == 67 => self.dhcp(&body[8..], src),
             // with NAT the flow goes out through a host socket; DNS is redirected to the host's own
             // resolver but still looks like it came from the emulated one
-            17 if body.len() >= 8 && self.nat.is_some() => {
+            17 if body.len() >= 8 && self.nat.as_ref().is_some_and(|n| n.outbound) => {
                 let (sport, dport) = (be16(&body[0..2]), be16(&body[2..4]));
                 let (host_dst, reply_src) = if dport == 53 { (self.nat.as_ref().unwrap().resolver, dip) } else { (dip, dip) };
                 let now = self.now_us;
                 self.nat.as_mut().unwrap().udp_out(src, &sip, sport, &host_dst, &reply_src, dport, &body[8..], now);
                 Vec::new()
             }
-            6 if self.nat.is_some() => {
+            // a forward-only NAT takes the forwarded flows; the rest is refused below
+            6 if self.nat.as_ref().is_some_and(|n| n.outbound || (body.len() >= 4 && n.tcp_target(&dip, be16(&body[2..4])).is_some())) => {
                 let now = self.now_us;
                 self.nat.as_mut().unwrap().tcp_in(src, &sip, &dip, body, now)
             }
@@ -244,8 +245,8 @@ impl VirtualNet {
         vec![self.frame(src, 0x0800, &ip_packet(17, dip, sip, &udp))]
     }
 
-    /// Nothing here speaks TCP yet, so refuse connections immediately instead of letting firmware
-    /// sit in a 30-second connect timeout. A NAT backend is what will make these work.
+    /// Refuse a connection nothing relays at once, instead of letting firmware sit in a
+    /// 30-second connect timeout.
     fn tcp_reject(&mut self, t: &[u8], src: &[u8; 6], sip: &[u8; 4], dip: &[u8; 4]) -> Vec<Vec<u8>> {
         let (sport, dport) = (be16(&t[0..2]), be16(&t[2..4]));
         let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
@@ -256,7 +257,7 @@ impl VirtualNet {
         r.extend_from_slice(&[0x50, 0x14, 0, 0, 0, 0, 0, 0]);            // RST|ACK
         let c = transport_checksum(dip, sip, 6, &r).to_be_bytes(); r[16] = c[0]; r[17] = c[1];
         self.tcp_rejects += 1;
-        if self.log { eprintln!("[net] TCP {}.{}.{}.{}:{} -> refused (no NAT backend yet)", dip[0], dip[1], dip[2], dip[3], dport); }
+        if self.log { eprintln!("[net] TCP {}.{}.{}.{}:{} -> refused (nothing relays it)", dip[0], dip[1], dip[2], dip[3], dport); }
         vec![self.frame(src, 0x0800, &ip_packet(6, dip, sip, &r))]
     }
 }
