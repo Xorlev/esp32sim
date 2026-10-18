@@ -13,6 +13,10 @@ pub mod csr {
     pub const MCYCLEH: u32 = 0xB80; pub const MINSTRETH: u32 = 0xB82;
     pub const MVENDORID: u32 = 0xF11; pub const MARCHID: u32 = 0xF12; pub const MIMPID: u32 = 0xF13;
     pub const MHARTID: u32 = 0xF14;
+    /// The unprivileged counters (RISC-V unprivileged ISA, "Zicntr"): read-only shadows of
+    /// mcycle and minstret.
+    pub const CYCLE: u32 = 0xC00; pub const INSTRET: u32 = 0xC02;
+    pub const CYCLEH: u32 = 0xC80; pub const INSTRETH: u32 = 0xC82;
     /// Espressif performance counters. The machine-mode set is what `esp_cpu_get_cycle_count`
     /// uses; the user-mode alias at 0x802 is what the ROM's `ets_delay_us` busy-waits on.
     pub const MPCER: u32 = 0x7E0; pub const MPCMR: u32 = 0x7E1; pub const MPCCR: u32 = 0x7E2;
@@ -96,6 +100,9 @@ pub struct Cpu {
     pub fcsr: u32,
     /// EXT_ILL's value, when `has_ext_ill`
     pub ext_ill: u32,
+    /// `cycle`/`instret` (Zicntr) read the machine counters; without it they are unmodelled CSRs,
+    /// as they always were on the C3 and C6, which read the cycle count from MPCCR
+    pub user_counters: bool,
     /// the address an `lr.w` reserved, until the next `sc.w`
     pub reservation: Option<u32>,
     /// pcs the machine intercepts (stubs, probes), as a bloom over `emu_core::pc_bit`: `run` stops there
@@ -115,24 +122,26 @@ impl Cpu {
             mstatus: 0x1800,          // MPP = machine
             mtvec: 0, mepc: 0, mcause: 0, mtval: 0, mie: 0, mscratch: 0,
             insn_count: 0, retired_count: 0, cycle_count: 0, cycle_base: 0, instret_base: 0, waiting: false, irq: None, misa: MISA_RV32IMC,
-            has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
+            has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, user_counters: false, reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
         }
     }
     pub fn new_rv32imac() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAC; c }
-    /// An ESP32-P4 HP core: RV32IMAFC with EXT_ILL. Its custom extensions (Xesppie, hardware loops)
-    /// are not modelled and decode as illegal. FS is Off at reset, as on any core with F.
-    pub fn new_esp32p4() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAFC; c.has_ext_ill = true; c }
+    /// An ESP32-P4 HP core: RV32IMAFC with EXT_ILL and the Zicntr counters, which IDF reads the
+    /// cycle count from (`rdcycle`, ESP-IDF v5.5.3 riscv/include/riscv/rv_utils.h:106-108). Its
+    /// custom extensions (Xesppie, hardware loops) are not modelled and decode as illegal. FS is
+    /// Off at reset, as on any core with F.
+    pub fn new_esp32p4() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAFC; c.has_ext_ill = true; c.user_counters = true; c }
 
     pub fn reset(&mut self) {
         // `insn_count` is the emulator's own monotonic counter — it drives the run statistics and
         // the trace, so a chip reset must not rewind it (a reset that did made the browser UI
         // report a negative instruction rate). The architectural cycle counter is separately
         // monotonic and firmware reads its reset-relative value.
-        let (insns, retired, cycles, misa, ext_ill, bloom) = (self.insn_count, self.retired_count, self.cycle_count, self.misa, self.has_ext_ill, self.boundary_bloom);
+        let (insns, retired, cycles, misa, ext_ill, counters, bloom) = (self.insn_count, self.retired_count, self.cycle_count, self.misa, self.has_ext_ill, self.user_counters, self.boundary_bloom);
         *self = Cpu::new();
         self.insn_count = insns; self.retired_count = retired; self.cycle_count = cycles;
         self.cycle_base = cycles; self.instret_base = retired;
-        self.misa = misa; self.has_ext_ill = ext_ill; self.boundary_bloom = bloom;
+        self.misa = misa; self.has_ext_ill = ext_ill; self.user_counters = counters; self.boundary_bloom = bloom;
     }
 
     #[inline(always)]
@@ -172,6 +181,10 @@ impl Cpu {
             MCYCLEH => (self.cycle_count.wrapping_sub(self.cycle_base) >> 32) as u32,
             MINSTRET => self.retired_count.wrapping_sub(self.instret_base) as u32,
             MINSTRETH => (self.retired_count.wrapping_sub(self.instret_base) >> 32) as u32,
+            CYCLE if self.user_counters => self.cycle_count.wrapping_sub(self.cycle_base) as u32,
+            CYCLEH if self.user_counters => (self.cycle_count.wrapping_sub(self.cycle_base) >> 32) as u32,
+            INSTRET if self.user_counters => self.retired_count.wrapping_sub(self.instret_base) as u32,
+            INSTRETH if self.user_counters => (self.retired_count.wrapping_sub(self.instret_base) >> 32) as u32,
             MVENDORID => 0, MARCHID => 0, MIMPID => 0, MHARTID => 0,
             FFLAGS if self.has_f() => self.fcsr & 0x1f,
             FRM if self.has_f() => (self.fcsr >> 5) & 7,
@@ -207,6 +220,7 @@ impl Cpu {
             MINSTRET => { let c = self.retired_count.wrapping_sub(self.instret_base) & !0xffff_ffff | v as u64; self.instret_base = self.retired_count.wrapping_sub(c); }
             MINSTRETH => { let c = self.retired_count.wrapping_sub(self.instret_base) & 0xffff_ffff | ((v as u64) << 32); self.instret_base = self.retired_count.wrapping_sub(c); }
             MISA | MIP | MVENDORID | MARCHID | MIMPID | MHARTID => {}   // read-only
+            CYCLE | CYCLEH | INSTRET | INSTRETH if self.user_counters => {}
             _ => { self.csr_other.insert(n, v); }
         }
     }
