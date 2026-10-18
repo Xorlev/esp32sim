@@ -345,6 +345,10 @@ fn fat32_files_written_like_linux_and_read_back() {
     let fat: Vec<_> = w.iter().filter(|x| (fat1..root).contains(&x.0)).collect();
     assert!(fat.iter().all(|x| x.1 == 1) && fat.chunks(2).all(|p| p[0].0 + fs.fat_sectors as usize == p[1].0 && p[0].0 < fat2), "FAT sectors in pairs, the first copy then the second: {fat:?}");
     assert_eq!(w.len(), 2 + data.len() + fat.len() + 1);
+    // FSInfo: the free count down by the clip's clusters, the hint the last cluster allocated
+    let info = &port.dev.disk[(2048 + 1) * 512..(2048 + 2) * 512];
+    let (free, hint) = (u32::from_le_bytes(info[488..492].try_into().unwrap()), u32::from_le_bytes(info[492..496].try_into().unwrap()));
+    assert_eq!((free, hint), (fs.clusters - 1 - 391, 3 + 390), "200,000 bytes are 391 clusters from cluster 3");
     let mut mem = MemDisk(port.dev.disk.clone());
     let fs = Fat32::mount(&mut mem).unwrap();
     assert_eq!(fs.list_root(&mut mem).unwrap().len(), 1);

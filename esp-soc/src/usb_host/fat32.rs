@@ -1,10 +1,11 @@
 //! FAT32 on the host side of a block device, for the files a car writes onto the drive it
 //! records to: mount (an MBR's first FAT32 partition, or a volume from LBA 0), list, read, and
-//! write files in the root directory the way Linux's vfat does on a USB drive: the directory
-//! entry first, then the data in chunks as it comes, the FAT sectors covering each chunk's
-//! clusters (both copies), and at the end the entry's size and first cluster and FSInfo's
-//! counts. 8.3 names. Field offsets: Microsoft FAT32 File System Specification 1.03 (fatgen103),
-//! "Boot Sector and BPB", "FAT32 FSInfo Sector Structure", "FAT Directory Structure".
+//! write 8.3 files in the root directory in a vfat-like pattern: the directory entry first, the
+//! data in chunks as it comes, the FAT sectors covering each chunk's clusters (both copies), and
+//! at the end the entry's size and first cluster and FSInfo. It is not Linux's writeback order
+//! (page-cache batches, buffered metadata, periodic inode writeback, FSInfo at sync or unmount):
+//! a file cut off mid-write here keeps size 0 and no cluster, its data orphaned. Field offsets:
+//! Microsoft FAT32 File System Specification 1.03 (fatgen103).
 
 /// Blocks on the other end, by number.
 pub trait BlockDevice {
@@ -55,9 +56,11 @@ pub struct Fat32 {
     pub clusters: u32,
     pub data_lba: u64,
     pub label: String,
-    /// FSInfo's free count and next-free hint as the host keeps them
-    free: u32,
-    next_free: u32,
+    /// clusters allocated since FSInfo was last written, and where allocation looks first: the
+    /// last cluster allocated, or FSInfo's hint (fatgen103 calls it the next free cluster, Linux
+    /// and FatFs keep the last allocated one there; a search that starts at it covers both)
+    allocated: u32,
+    hint: u32,
 }
 
 /// `name.ext` as the 11 bytes of a short directory entry, upper case.
@@ -97,13 +100,12 @@ impl Fat32 {
         let data_lba = volume + reserved as u64 + (fats * fat_sectors) as u64;
         let clusters = (total - reserved - fats * fat_sectors) / spc;
         let mut fs = Fat32 { volume_lba: volume, sectors_per_cluster: spc, reserved, fats, fat_sectors, root_cluster: get32(&s, 44), fsinfo: get16(&s, 48) as u32,
-                             clusters, data_lba, label: String::from_utf8_lossy(&s[71..82]).trim_end().to_string(), free: u32::MAX, next_free: 2 };
+                             clusters, data_lba, label: String::from_utf8_lossy(&s[71..82]).trim_end().to_string(), allocated: 0, hint: 2 };
         let mut info = [0u8; 512];
         dev.read_blocks(volume + fs.fsinfo as u64, &mut info)?;
         if get32(&info, 0) == 0x4161_5252 && get32(&info, 484) == 0x6141_7272 {
-            fs.free = get32(&info, 488);
             let hint = get32(&info, 492);
-            if (2..clusters + 2).contains(&hint) { fs.next_free = hint; }
+            if (2..clusters + 2).contains(&hint) { fs.hint = hint; }
         }
         Ok(fs)
     }
@@ -144,10 +146,10 @@ impl Fat32 {
         Ok(())
     }
 
-    /// `n` free clusters from the next-free hint on, read a FAT sector at a time.
+    /// `n` free clusters from the hint on, read a FAT sector at a time.
     fn allocate(&mut self, dev: &mut dyn BlockDevice, n: usize) -> Result<Vec<u32>, String> {
         let mut out = Vec::with_capacity(n);
-        let mut c = self.next_free.max(2);
+        let mut c = self.hint;
         let mut seen = 0u32;
         let mut s = [0u8; 512];
         let mut loaded = u32::MAX;
@@ -159,8 +161,8 @@ impl Fat32 {
             c += 1;
             seen += 1;
         }
-        self.next_free = c;
-        if self.free != u32::MAX { self.free = self.free.saturating_sub(n as u32); }
+        if let Some(&l) = out.last() { self.hint = l; }
+        self.allocated += n as u32;
         Ok(out)
     }
 
@@ -174,7 +176,7 @@ impl Fat32 {
         for lba in self.root_sectors(dev)? {
             let mut s = [0u8; 512];
             dev.read_blocks(lba, &mut s)?;
-            for e in s.chunks_exact(32) {
+            for e in s.as_chunks::<32>().0 {
                 if e[0] == 0 { return Ok(out); }
                 if e[0] == 0xe5 || e[11] & 0x0f == 0x0f { continue; }
                 out.push(DirEntry { name: display_name(&e[..11]), size: get32(e, 28), cluster: (get16(e, 20) as u32) << 16 | get16(e, 26) as u32, attr: e[11] });
@@ -211,7 +213,7 @@ impl Fat32 {
         for lba in self.root_sectors(dev)? {
             let mut s = [0u8; 512];
             dev.read_blocks(lba, &mut s)?;
-            if let Some(slot) = s.chunks_exact(32).position(|e| e[0] == 0 || e[0] == 0xe5) {
+            if let Some(slot) = s.as_chunks::<32>().0.iter().position(|e| e[0] == 0 || e[0] == 0xe5) {
                 let e = &mut s[slot * 32..slot * 32 + 32];
                 e.fill(0);
                 e[..11].copy_from_slice(&raw);
@@ -226,13 +228,27 @@ impl Fat32 {
         Err("the root directory is full (it is not extended)".into())
     }
 
-    /// FSInfo's free count and next-free hint, as the host's view of them.
-    pub fn write_fsinfo(&self, dev: &mut dyn BlockDevice) -> Result<(), String> {
+    /// Take FSInfo's hint again, after the device may have changed the volume (the car saw the
+    /// medium go and come back).
+    pub fn refresh(&mut self, dev: &mut dyn BlockDevice) -> Result<(), String> {
+        let mut info = [0u8; 512];
+        dev.read_blocks(self.volume_lba + self.fsinfo as u64, &mut info)?;
+        let hint = get32(&info, 492);
+        if get32(&info, 0) == 0x4161_5252 && (2..self.clusters + 2).contains(&hint) { self.hint = hint; }
+        Ok(())
+    }
+
+    /// FSInfo as it stands on the volume, less what this host allocated since it last wrote it
+    /// (an unknown count stays unknown), and the last cluster allocated as the hint: the device
+    /// may have changed the volume since the mount.
+    pub fn write_fsinfo(&mut self, dev: &mut dyn BlockDevice) -> Result<(), String> {
         let lba = self.volume_lba + self.fsinfo as u64;
         let mut s = [0u8; 512];
         dev.read_blocks(lba, &mut s)?;
-        if self.free != u32::MAX { put32(&mut s, 488, self.free); }
-        put32(&mut s, 492, self.next_free);
+        let free = get32(&s, 488);
+        if free != u32::MAX { put32(&mut s, 488, free.saturating_sub(self.allocated)); }
+        put32(&mut s, 492, self.hint);
+        self.allocated = 0;
         dev.write_blocks(lba, &s)
     }
 }

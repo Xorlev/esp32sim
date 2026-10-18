@@ -291,7 +291,7 @@ impl<'p> UsbHost<'p> {
         let d = self.get_descriptor(req::STRING, index, lang, 255)?;
         if d.len() < 2 || d[1] != req::STRING { return Err(UsbError::Protocol(format!("string {index}: {:02x?}", d))); }
         let n = (d[0] as usize).min(d.len());
-        let units: Vec<u16> = d[2..n].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = d[2..n].as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
         Ok(String::from_utf16_lossy(&units))
     }
 
