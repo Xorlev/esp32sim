@@ -7,6 +7,8 @@
 //! `tests/README.md`). Regenerate after an intentional change with `UPDATE_GOLDENS=1`.
 #[path = "../../tests/common.rs"]
 mod common;
+#[path = "../../tests/sd_image.rs"]
+mod sd_image;
 use common::*;
 
 const BIN: &str = env!("CARGO_BIN_EXE_esp32sim");
@@ -249,6 +251,45 @@ fn hello_world_p4_smp() {
     assert!(core1 > 1_000_000_000, "core 1 did not run:\n{}", r.stderr);
     expect_text("hello-p4-smp.console.txt", &r.stdout);
     expect_u64("hello-p4-smp.insns", r.insns);
+}
+
+/// ESP-IDF's sdmmc example on the P4 (`examples/sd_card-p4`) with a card in the SD socket: the
+/// driver brings the host up, identifies the card (slot 1 through the GPIO matrix, four lines,
+/// 20 MHz), FatFs mounts its FAT32 volume, and the example writes, renames and reads back
+/// files through the IDMAC. The card is a 64 MiB image the test lays out, written through, so
+/// the files the firmware left are read back from it afterwards.
+fn p4_sdcard(card: Option<&std::path::Path>, rw: bool, seconds: &str) -> Run {
+    let rom = rom("esp32p4_rev0");
+    let mut args = vec!["--rom", rom.to_str().unwrap(), "--flash-mb", "2", "--bootloader", "web/wasm/fw/public/p4-sdcard-bootloader.bin",
+        "--ptable", "web/wasm/fw/public/p4-hello-ptable.bin", "--app", "web/wasm/fw/public/p4-sdcard.bin", "--max-seconds", seconds];
+    if let Some(c) = card { args.extend([if rw { "--sd-rw" } else { "--sd" }, c.to_str().unwrap()]); }
+    run(BIN_P4, &args)
+}
+
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn sd_card_p4() {
+    let card = tmp("sdcard-p4.img");
+    sd_image::fat32(&card, 64 << 20, 512, "").unwrap();
+    let r = p4_sdcard(Some(&card), true, "1");
+    assert!(r.stdout.contains("Read from file: 'Nihao SIMSD!'") && r.stdout.contains("Card unmounted"), "the example did not finish:\n{}", r.stdout);
+    expect_text("sdcard-p4.console.txt", &r.stdout);
+    expect_u64("sdcard-p4.insns", r.insns);
+    let files = sd_image::Volume::open(&card).unwrap().root_files();
+    let want: Vec<(String, Vec<u8>)> = vec![("NIHAO.TXT".into(), b"Nihao SIMSD!\n".to_vec()), ("FOO.TXT".into(), b"Hello SIMSD!\n".to_vec())];
+    assert_eq!(files, want, "the files the example left on the card");
+}
+
+/// The same firmware with an unformatted card (FatFs finds no volume and the example does not
+/// format) and with an empty socket (every command times out).
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn sd_card_p4_unformatted_and_absent() {
+    let card = tmp("sdcard-blank.img");
+    std::fs::File::create(&card).unwrap().set_len(64 << 20).unwrap();
+    let r = p4_sdcard(Some(&card), false, "1");
+    assert!(r.stdout.contains("vfs_fat_sdmmc: failed to mount card (13)") && r.stdout.contains("example: Failed to mount filesystem."), "{}", r.stdout);
+    assert!(std::fs::read(&card).unwrap().iter().all(|&b| b == 0), "copy-on-write leaves the image alone");
+    let r = p4_sdcard(None, false, "1");
+    assert!(r.stdout.contains("example: Failed to initialize the card (ESP_ERR_TIMEOUT)"), "{}", r.stdout);
 }
 
 /// The IEEE 802.15.4 energy scanner on the Waveshare ESP32-C6-LCD-1.47 (its owner's firmware,
