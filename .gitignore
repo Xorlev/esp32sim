@@ -21,6 +21,10 @@ examples/hello_world-p4/build/
 examples/hello_world-p4/sdkconfig
 examples/hello_world-p4/sdkconfig.old
 examples/hello_world-p4/managed_components/
+examples/sd_card-p4/build/
+examples/sd_card-p4/sdkconfig
+examples/sd_card-p4/sdkconfig.old
+examples/sd_card-p4/managed_components/
 examples/hello_world/sdkconfig*
 examples/hello_world/managed_components/
 examples/wifi-station/build/
