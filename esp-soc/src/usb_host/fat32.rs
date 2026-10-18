@@ -228,16 +228,6 @@ impl Fat32 {
         Err("the root directory is full (it is not extended)".into())
     }
 
-    /// Take FSInfo's hint again, after the device may have changed the volume (the car saw the
-    /// medium go and come back).
-    pub fn refresh(&mut self, dev: &mut dyn BlockDevice) -> Result<(), String> {
-        let mut info = [0u8; 512];
-        dev.read_blocks(self.volume_lba + self.fsinfo as u64, &mut info)?;
-        let hint = get32(&info, 492);
-        if get32(&info, 0) == 0x4161_5252 && (2..self.clusters + 2).contains(&hint) { self.hint = hint; }
-        Ok(())
-    }
-
     /// FSInfo as it stands on the volume, less what this host allocated since it last wrote it
     /// (an unknown count stays unknown), and the last cluster allocated as the hint: the device
     /// may have changed the volume since the mount.

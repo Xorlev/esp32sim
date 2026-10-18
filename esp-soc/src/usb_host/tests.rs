@@ -3,7 +3,7 @@
 #[path = "../../../tests/sd_image.rs"]
 mod sd_image;
 use super::fat32::{clip_bytes, Fat32, MemDisk};
-use super::msc::{op, sense, Dir, Msc, MscError, Sense};
+use super::msc::{op, sense, Dir, Msc, MscError, Recovery, Sense};
 use super::*;
 use emu_core::Fault;
 use esp_periph::usb_otg::{BusEvent, DmaMemory, Handshake, InReply, UsbFunction, UsbTiming};
@@ -18,7 +18,7 @@ impl DmaMemory for NoMem {
 enum Bot { Idle, DataIn(Vec<u8>, usize), DataOut(usize, Vec<u8>), Status([u8; 13]) }
 
 #[derive(Default)]
-struct Knobs { not_ready: u32, phase_on: Option<u8>, bad_tag_on: Option<u8>, short_on: Option<(u8, usize)>, nak_in: u32 }
+struct Knobs { not_ready: u32, phase_on: Option<u8>, bad_tag_on: Option<u8>, short_on: Option<(u8, usize)>, nak_in: u32, zlp_before_csw_on: Option<u8> }
 
 struct FakeMsc {
     disk: Vec<u8>,
@@ -42,6 +42,9 @@ struct FakeMsc {
     commands: Vec<u8>,
     write_lba: usize,
     writes: Vec<(usize, usize)>,
+    bus_resets: u32,
+    /// stop answering bulk IN after this many more IN data packets
+    hang_after: Option<u32>,
 }
 
 const DEVICE: [u8; 18] = [18, 1, 0x00, 0x02, 0xef, 2, 1, 64, 0x3a, 0x30, 0x02, 0x40, 0x00, 0x01, 1, 2, 3, 1];
@@ -57,7 +60,7 @@ fn string(s: &str) -> Vec<u8> { let mut v = vec![2 + 2 * s.len() as u8, 3]; for 
 impl FakeMsc {
     fn new(blocks: usize) -> Self {
         FakeMsc { disk: vec![0; blocks * 512], vbus: false, setup: [0; 8], ctrl_in: Vec::new(), ctrl_pos: 0, ctrl_stall: false, ep0_pid: true, configured: false,
-                  pid: [false; 2], halt: [false; 2], bot: Bot::Idle, tag: 0, want: 0, sense: Sense::default(), knobs: Knobs::default(), bot_resets: 0, clear_halts: 0, commands: Vec::new(), write_lba: 0, writes: Vec::new() }
+                  pid: [false; 2], halt: [false; 2], bot: Bot::Idle, tag: 0, want: 0, sense: Sense::default(), knobs: Knobs::default(), bot_resets: 0, clear_halts: 0, commands: Vec::new(), write_lba: 0, writes: Vec::new(), bus_resets: 0, hang_after: None }
     }
     fn csw(&self, residue: u32, status: u8) -> [u8; 13] {
         let mut c = [0u8; 13];
@@ -128,6 +131,8 @@ impl FakeMsc {
             (0x02, req::CLEAR_FEATURE) => { let i = (index >> 7) as usize & 1; self.halt[i] = false; self.pid[i] = false; self.clear_halts += 1; }
             (0xa1, msc::GET_MAX_LUN) => self.ctrl_in = vec![0],
             (0x40, 0x01) => {}
+            // vendor: NAK bulk IN after wValue more packets, until a bus reset
+            (0x40, 0x02) => self.hang_after = Some(u16::from_le_bytes([self.setup[2], self.setup[3]]) as u32),
             (0x21, msc::BULK_ONLY_RESET) => { self.bot = Bot::Idle; self.bot_resets += 1; }
             _ => self.ctrl_stall = true,
         }
@@ -139,7 +144,7 @@ impl UsbFunction for FakeMsc {
     fn vbus(&mut self, _now: u64, on: bool) { self.vbus = on; }
     fn pullup(&self) -> bool { self.vbus }
     fn speed_capability(&self) -> Speed { Speed::High }
-    fn bus_reset(&mut self, _now: u64) { self.configured = false; self.bot = Bot::Idle; }
+    fn bus_reset(&mut self, _now: u64) { self.configured = false; self.bot = Bot::Idle; self.bus_resets += 1; self.hang_after = None; }
     fn enumerated(&mut self, _now: u64, _speed: Speed) {}
     fn bus_event(&mut self, _now: u64, _e: BusEvent) {}
     fn setup(&mut self, _mem: &mut dyn DmaMemory, pkt: [u8; 8]) { self.setup = pkt; self.ep0_pid = true; self.control(); }
@@ -155,6 +160,7 @@ impl UsbFunction for FakeMsc {
         }
         if self.halt[1] { return InReply::Stall; }
         if self.knobs.nak_in > 0 { self.knobs.nak_in -= 1; return InReply::Nak; }
+        match &mut self.hang_after { Some(0) => return InReply::Nak, Some(n) => *n -= 1, None => {} }
         let pid = self.pid[1];
         let reply = match &mut self.bot {
             Bot::DataIn(d, pos) => {
@@ -169,6 +175,7 @@ impl UsbFunction for FakeMsc {
                 }
                 chunk
             }
+            Bot::Status(_) if self.knobs.zlp_before_csw_on.is_some() && self.knobs.zlp_before_csw_on == self.commands.last().copied() => { self.knobs.zlp_before_csw_on = None; Vec::new() }
             Bot::Status(c) => { let c = c.to_vec(); self.bot = Bot::Idle; c }
             _ => return InReply::Nak,
         };
@@ -287,12 +294,13 @@ fn a_short_data_stage_and_a_stalled_unknown_command() {
 }
 
 #[test]
-fn a_phase_error_or_a_wrong_tag_ends_in_reset_recovery() {
+fn a_phase_error_or_a_wrong_tag_ends_in_bot_reset_recovery() {
     let mut dev = FakeMsc::new(2048);
     dev.knobs.phase_on = Some(op::SYNCHRONIZE_CACHE10);
     dev.knobs.bad_tag_on = Some(op::PREVENT_ALLOW);
     let mut port = FakePort::new(dev);
     let mut m = msc(&mut port);
+    m.recovery = Recovery::Bot;
     assert_eq!(m.sync_cache(), Err(MscError::Phase));
     assert_eq!(m.prevent_removal(true), Err(MscError::BadCsw("tag mismatch".into())));
     assert_eq!(m.stats.resets, 2);
@@ -377,4 +385,55 @@ fn control_writes_end_in_a_data1_status() {
         h.control(setup_packet(0x40, 0x01, 0, 0, len), vec![0xa5; len as usize]).unwrap();
     }
     assert_eq!(h.port().link().unwrap().stats.toggle_errors, 0);
+}
+
+/// Linux's usb-storage recovers from a transport error with a port reset and re-enumeration
+/// (usb_stor_invoke_transport, Handle_Errors), not the class reset.
+#[test]
+fn a_phase_error_ends_in_a_port_reset_under_linux() {
+    let mut dev = FakeMsc::new(2048);
+    dev.knobs.phase_on = Some(op::SYNCHRONIZE_CACHE10);
+    let mut port = FakePort::new(dev);
+    let mut m = msc(&mut port);
+    assert_eq!(m.recovery, Recovery::Linux);
+    assert_eq!(m.sync_cache(), Err(MscError::Phase));
+    assert_eq!((m.stats.port_resets, m.stats.resets), (1, 0));
+    assert_eq!(m.host.address, 1, "the device keeps its address");
+    m.test_unit_ready().unwrap();
+    drop(m);
+    assert_eq!((port.dev.bus_resets, port.dev.bot_resets), (3, 0), "the enumeration's reset and the recovery's two");
+    assert!(port.dev.configured, "SET_CONFIGURATION restored it");
+}
+
+/// A command that outlives its timeout is aborted; Linux then resets the port and the next
+/// command works.
+#[test]
+fn a_command_timeout_aborts_and_resets_the_port() {
+    let mut port = FakePort::new(FakeMsc::new(2048));
+    let mut m = msc(&mut port);
+    m.read_capacity().unwrap();
+    m.host.control(setup_packet(0x40, 0x02, 4, 0, 0), Vec::new()).unwrap();
+    m.timeout_ns = 50_000_000;
+    let t0 = m.host.now_ns();
+    assert_eq!(m.read10(0, 16), Err(MscError::Usb(UsbError::Timeout)));
+    assert!(m.host.now_ns() - t0 >= 50_000_000);
+    assert_eq!((m.stats.aborts, m.stats.port_resets), (1, 1));
+    m.timeout_ns = 30_000_000_000;
+    assert_eq!(m.read10(0, 16).unwrap().len(), 16 * 512);
+}
+
+/// A zero-length packet where the CSW should be: Linux reads the CSW again
+/// (usb_stor_Bulk_transport), BOT's host treats it as an invalid CSW and resets.
+#[test]
+fn a_zero_length_packet_before_the_csw_is_read_past_under_linux() {
+    for (recovery, ok) in [(Recovery::Linux, true), (Recovery::Bot, false)] {
+        let mut dev = FakeMsc::new(2048);
+        dev.knobs.zlp_before_csw_on = Some(op::TEST_UNIT_READY);
+        let mut port = FakePort::new(dev);
+        let mut m = msc(&mut port);
+        m.recovery = recovery;
+        assert_eq!(m.test_unit_ready().is_ok(), ok, "{recovery:?}");
+        assert_eq!(m.stats.resets, u64::from(!ok));
+        m.test_unit_ready().unwrap();
+    }
 }

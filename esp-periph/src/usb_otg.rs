@@ -11,7 +11,7 @@
 //! at once from its endpoint registers, moving the payload through DMA; the link decides when
 //! they happen. Slave mode (the data FIFOs from 0x1000) and host mode are not modelled.
 pub mod link;
-pub use link::{BusEvent, Completion, Handshake, InReply, LinkStats, Outcome, PortStatus, Request, Speed, UsbFunction, UsbLink, UsbTiming};
+pub use link::{BusEvent, Completion, Handshake, InReply, LinkFault, LinkStats, Outcome, PortStatus, Request, Speed, UsbFunction, UsbLink, UsbTiming};
 use crate::device::{Device, WriteEffect};
 use crate::regram::RegRam;
 use emu_core::ClockDomain;

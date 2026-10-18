@@ -343,6 +343,35 @@ impl<'p> UsbHost<'p> {
         Ok(())
     }
 
+    /// usb_reset_device (Linux v6.12 drivers/usb/core/hub.c: usb_reset_and_verify_device and
+    /// hub_port_init's new scheme): reset, GET_DESCRIPTOR(64) at address 0, reset again,
+    /// SET_ADDRESS to the old address, the descriptors read again and compared with the old
+    /// ones, then SET_CONFIGURATION with the old configuration. Each reset is followed by 50 ms
+    /// (hub_port_reset: TRSTRCY 10 ms "plus some extra" 40 ms), SET_ADDRESS by 10 ms.
+    pub fn reset_device(&mut self) -> Result<(), UsbError> {
+        let (dev, cfg) = match (self.device.clone(), self.config.clone()) { (Some(d), Some(c)) => (d, c), _ => return Err(UsbError::Protocol("no configured device to reset".into())) };
+        let address = self.address.max(1);
+        self.reset()?;
+        self.idle_ns(50_000_000)?;
+        let first = DeviceDescriptor::parse(&self.get_descriptor(req::DEVICE, 0, 0, 64)?)?;
+        if first.mps0 != dev.mps0 { return Err(UsbError::Protocol("the reset changed bMaxPacketSize0".into())); }
+        self.reset()?;
+        self.idle_ns(50_000_000)?;
+        self.set_address(address)?;
+        self.idle_ns(10_000_000)?;
+        let now = DeviceDescriptor::parse(&self.get_descriptor(req::DEVICE, 0, 0, 18)?)?;
+        let head = self.get_descriptor(req::CONFIGURATION, 0, 0, 9)?;
+        if head.len() < 9 { return Err(UsbError::Protocol("short configuration descriptor".into())); }
+        let total = u16::from_le_bytes([head[2], head[3]]);
+        let again = ConfigInfo::parse(&self.get_descriptor(req::CONFIGURATION, 0, 0, total)?)?;
+        if now != dev || again != cfg { return Err(UsbError::Protocol("the device's descriptors changed".into())); }
+        self.set_configuration(cfg.value)?;
+        self.say(format_args!("device reset, configuration {} restored", cfg.value));
+        self.device = Some(dev);
+        self.config = Some(cfg);
+        Ok(())
+    }
+
     pub fn bulk_out(&mut self, ep: u8, mps: u16, data: Vec<u8>, timeout_ns: u64) -> Result<(), UsbError> {
         let c = self.request(Request::BulkOut { ep: ep & 15, data, mps, zlp: false }, timeout_ns)?;
         Self::data(c).map(|_| ())

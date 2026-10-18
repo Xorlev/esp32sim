@@ -79,12 +79,33 @@ impl std::fmt::Display for MscError {
     }
 }
 
+/// How the host gets a device back after a transport error or a command that timed out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Recovery {
+    /// Linux's usb-storage (v6.12): a port reset and re-enumeration, the class reset if that
+    /// fails; a data stage that runs long gives a faked INVALID FIELD IN CDB; a zero-length CSW
+    /// is read again; a residue past the transfer is clamped
+    Linux,
+    /// BOT 1.0's reset recovery (§5.3.4) for all of them
+    Bot,
+}
+
+/// Why a transport did not end in a CSW to use.
+enum Failure {
+    /// the device or the link is gone: nothing to recover
+    Fatal(UsbError),
+    /// a transport error or a timeout: recover, then report this
+    Recover(MscError),
+    /// sense the host made up
+    Check(Sense),
+}
+
 /// A command's result: the data stage and the CSW.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reply { pub data: Vec<u8>, pub csw: Csw }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct MscStats { pub commands: u64, pub check_conditions: u64, pub resets: u64, pub stalls: u64, pub bytes_read: u64, pub bytes_written: u64 }
+pub struct MscStats { pub commands: u64, pub check_conditions: u64, pub resets: u64, pub port_resets: u64, pub aborts: u64, pub stalls: u64, pub bytes_read: u64, pub bytes_written: u64 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inquiry { pub device_type: u8, pub removable: bool, pub vendor: String, pub product: String, pub revision: String }
@@ -103,7 +124,9 @@ pub struct Msc<'p> {
     pub blocks: u64,
     /// blocks per READ(10)/WRITE(10) at most (Linux usb-storage's default max_sectors, 240)
     pub max_blocks: u32,
+    /// how long a command may take before it is aborted (Linux sd's SD_TIMEOUT, 30 s)
     pub timeout_ns: u64,
+    pub recovery: Recovery,
     pub stats: MscStats,
 }
 
@@ -121,7 +144,7 @@ impl<'p> Msc<'p> {
         let bulk = |dir_in: bool| f.endpoints.iter().find(|e| e.attributes & 3 == 2 && (e.address & 0x80 != 0) == dir_in).copied();
         let (i, o) = (bulk(true).ok_or_else(|| MscError::NotMsc("no bulk IN endpoint".into()))?, bulk(false).ok_or_else(|| MscError::NotMsc("no bulk OUT endpoint".into()))?);
         let mut m = Msc { interface: f.number, ep_in: i.address, ep_out: o.address, mps_in: i.mps, mps_out: o.mps, host, lun: 0, max_lun: 0, tag: 0,
-                          block_size: 512, blocks: 0, max_blocks: 240, timeout_ns: 10_000_000_000, stats: MscStats::default() };
+                          block_size: 512, blocks: 0, max_blocks: 240, timeout_ns: 30_000_000_000, recovery: Recovery::Linux, stats: MscStats::default() };
         m.max_lun = match m.host.control(setup_packet(0xa1, GET_MAX_LUN, 0, m.interface as u16, 1), Vec::new()) {
             Ok(d) => d.first().copied().unwrap_or(0),
             Err(UsbError::Stall(_)) => 0,
@@ -141,12 +164,67 @@ impl<'p> Msc<'p> {
         Ok(())
     }
 
-    fn csw_in(&mut self) -> Result<Vec<u8>, UsbError> { let t = self.timeout_ns; self.host.bulk_in(self.ep_in, self.mps_in, 13, t) }
+    /// usb_stor_Bulk_reset (usb_stor_reset_common, Linux v6.12 drivers/usb/storage/transport.c):
+    /// the class reset with a 5 s timeout, 6 s for the device to recover, then the halts cleared
+    /// on bulk IN and bulk OUT.
+    fn linux_bulk_reset(&mut self) -> Result<(), MscError> {
+        self.stats.resets += 1;
+        self.host.say(format_args!("Bulk-Only Mass Storage Reset"));
+        let to = std::mem::replace(&mut self.host.timing.control_timeout_ns, 5_000_000_000);
+        let r = self.host.control(setup_packet(0x21, BULK_ONLY_RESET, 0, self.interface as u16, 0), Vec::new());
+        self.host.timing.control_timeout_ns = to;
+        r?;
+        self.host.idle_ns(6_000_000_000)?;
+        let a = self.host.clear_halt(self.ep_in);
+        self.host.clear_halt(self.ep_out)?;
+        a.map_err(MscError::from)
+    }
 
-    /// One command through bulk-only transport (BOT §5.3, host side of §6.7).
+    /// After a transport error or an aborted command. Linux (usb_stor_invoke_transport,
+    /// Handle_Errors): a port reset (usb_stor_port_reset, usb_reset_device), the class reset if
+    /// that fails. BOT: reset recovery.
+    fn recover(&mut self) -> Result<(), MscError> {
+        match self.recovery {
+            Recovery::Bot => self.reset_recovery(),
+            Recovery::Linux => {
+                self.stats.port_resets += 1;
+                self.host.say(format_args!("port reset"));
+                match self.host.reset_device() {
+                    Ok(()) => Ok(()),
+                    Err(e) => { self.host.say(format_args!("port reset failed: {e}")); self.linux_bulk_reset() }
+                }
+            }
+        }
+    }
+
+    fn csw_in(&mut self, deadline: u64) -> Result<Vec<u8>, UsbError> {
+        let t = deadline.saturating_sub(self.host.now_ns()).max(1);
+        self.host.bulk_in(self.ep_in, self.mps_in, 13, t)
+    }
+
+    /// One command through bulk-only transport (BOT §5.3, the host side of §6.7), recovered as
+    /// `recovery` says when it fails.
     pub fn command(&mut self, cdb: &[u8], dir: Dir) -> Result<Reply, MscError> {
+        match self.transport(cdb, dir) {
+            Ok(r) => Ok(r),
+            Err(Failure::Fatal(e)) => Err(e.into()),
+            Err(Failure::Check(s)) => { self.stats.check_conditions += 1; Err(MscError::Check(s)) }
+            Err(Failure::Recover(e)) => {
+                if e == MscError::Usb(UsbError::Timeout) { self.stats.aborts += 1; self.host.say(format_args!("command aborted after {} ms", self.timeout_ns / 1_000_000)); }
+                self.recover()?;
+                Err(e)
+            }
+        }
+    }
+
+    fn transport(&mut self, cdb: &[u8], dir: Dir) -> Result<Reply, Failure> {
+        let linux = self.recovery == Recovery::Linux;
         self.tag = self.tag.wrapping_add(1);
         self.stats.commands += 1;
+        let deadline = self.host.now_ns() + self.timeout_ns;
+        let left = |h: &mut UsbHost| deadline.saturating_sub(h.now_ns()).max(1);
+        // a STALL's halt is cleared before going on, as BOT §5.3.2 and Linux's interpret_urb_result do
+        let fail = |e: UsbError| match e { UsbError::Timeout => Failure::Recover(MscError::Usb(UsbError::Timeout)), e => Failure::Fatal(e) };
         let (len, flags) = match &dir { Dir::None => (0, 0), Dir::In(n) => (*n, 0x80), Dir::Out(d) => (d.len(), 0) };
         let mut cbw = Vec::with_capacity(31);
         cbw.extend_from_slice(&CBW_SIGNATURE.to_le_bytes());
@@ -156,48 +234,65 @@ impl<'p> Msc<'p> {
         let mut cb = [0u8; 16];
         cb[..cdb.len().min(16)].copy_from_slice(&cdb[..cdb.len().min(16)]);
         cbw.extend_from_slice(&cb);
-        let t = self.timeout_ns;
-        if let Err(e) = self.host.bulk_out(self.ep_out, self.mps_out, cbw, t) {
-            if matches!(e, UsbError::Stall(_)) { self.stats.stalls += 1; self.reset_recovery()?; }
-            return Err(e.into());
+        let t = left(&mut self.host);
+        match self.host.bulk_out(self.ep_out, self.mps_out, cbw, t) {
+            Ok(()) => {}
+            Err(UsbError::Stall(_)) => {
+                self.stats.stalls += 1;
+                if linux { self.host.clear_halt(self.ep_out).map_err(Failure::Fatal)?; }
+                return Err(Failure::Recover(MscError::BadCsw("the CBW STALLed".into())));
+            }
+            Err(e) => return Err(fail(e)),
         }
         let mut data = Vec::new();
+        let mut too_long = false;
+        let t = left(&mut self.host);
         match dir {
             Dir::None => {}
             Dir::In(n) => match self.host.bulk_in(self.ep_in, self.mps_in, n, t) {
                 Ok(d) => data = d,
-                Err(UsbError::Stall(d)) => { self.stats.stalls += 1; data = d; self.host.clear_halt(self.ep_in)?; }
-                Err(UsbError::Babble) => { self.reset_recovery()?; return Err(MscError::Phase); }
-                Err(e) => return Err(e.into()),
+                Err(UsbError::Stall(d)) => { self.stats.stalls += 1; data = d; self.host.clear_halt(self.ep_in).map_err(Failure::Fatal)?; }
+                // Linux reads the CSW after a data stage that ran long and fakes the sense
+                Err(UsbError::Babble) if linux => too_long = true,
+                Err(UsbError::Babble) => return Err(Failure::Recover(MscError::Phase)),
+                Err(e) => return Err(fail(e)),
             },
             Dir::Out(d) => match self.host.bulk_out(self.ep_out, self.mps_out, d, t) {
                 Ok(()) => {}
-                Err(UsbError::Stall(_)) => { self.stats.stalls += 1; self.host.clear_halt(self.ep_out)?; }
-                Err(e) => return Err(e.into()),
+                Err(UsbError::Stall(_)) => { self.stats.stalls += 1; self.host.clear_halt(self.ep_out).map_err(Failure::Fatal)?; }
+                Err(e) => return Err(fail(e)),
             },
         }
-        let raw = match self.csw_in() {
+        let mut raw = match self.csw_in(deadline) {
             Ok(r) => r,
             Err(UsbError::Stall(_)) => {
                 self.stats.stalls += 1;
-                self.host.clear_halt(self.ep_in)?;
-                match self.csw_in() {
+                self.host.clear_halt(self.ep_in).map_err(Failure::Fatal)?;
+                match self.csw_in(deadline) {
                     Ok(r) => r,
-                    Err(UsbError::Stall(_)) => { self.reset_recovery()?; return Err(MscError::BadCsw("the CSW STALLed twice".into())); }
-                    Err(e) => return Err(e.into()),
+                    Err(UsbError::Stall(_)) => return Err(Failure::Recover(MscError::BadCsw("the CSW STALLed twice".into()))),
+                    Err(UsbError::Babble) => return Err(Failure::Recover(MscError::BadCsw("more than 13 bytes".into()))),
+                    Err(e) => return Err(fail(e)),
                 }
             }
-            Err(UsbError::Babble) => { self.reset_recovery()?; return Err(MscError::BadCsw("more than 13 bytes".into())); }
-            Err(e) => return Err(e.into()),
+            Err(UsbError::Babble) => return Err(Failure::Recover(MscError::BadCsw("more than 13 bytes".into()))),
+            Err(e) => return Err(fail(e)),
         };
+        // a zero-length packet where the CSW should be: Linux reads again
+        if linux && raw.is_empty() { raw = self.csw_in(deadline).map_err(fail)?; }
         let valid = raw.len() == 13 && u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) == CSW_SIGNATURE;
         if !valid || u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) != self.tag {
-            self.reset_recovery()?;
-            return Err(MscError::BadCsw(if valid { "tag mismatch".into() } else { format!("{} bytes: {:02x?}", raw.len(), raw) }));
+            return Err(Failure::Recover(MscError::BadCsw(if valid { "tag mismatch".into() } else { format!("{} bytes: {:02x?}", raw.len(), raw) })));
         }
-        let csw = Csw { tag: self.tag, residue: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]), status: raw[12] };
-        if csw.status == 2 { self.reset_recovery()?; return Err(MscError::Phase); }
-        if csw.status > 2 || csw.residue as usize > len { self.reset_recovery()?; return Err(MscError::BadCsw(format!("status {} residue {} for {} bytes", csw.status, csw.residue, len))); }
+        let mut csw = Csw { tag: self.tag, residue: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]), status: raw[12] };
+        if csw.status == 2 { return Err(Failure::Recover(MscError::Phase)); }
+        if csw.status > 2 { return Err(Failure::Recover(MscError::BadCsw(format!("status {}", csw.status)))); }
+        if csw.residue as usize > len {
+            if !linux { return Err(Failure::Recover(MscError::BadCsw(format!("residue {} for {} bytes", csw.residue, len)))); }
+            csw.residue = len as u32;
+        }
+        // INVALID FIELD IN CDB, as Linux fakes it for a data stage that ran long and a good status
+        if too_long && csw.status == 0 { return Err(Failure::Check(Sense { key: sense::ILLEGAL_REQUEST, asc: 0x24, ascq: 0 })); }
         Ok(Reply { data, csw })
     }
 

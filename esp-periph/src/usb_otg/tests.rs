@@ -593,3 +593,24 @@ fn the_reset_line_holds_the_core() {
     b.wr(reg::GAHBCFG, GAHBCFG_GINT);
     assert_eq!(b.rd(reg::GAHBCFG), GAHBCFG_GINT);
 }
+
+/// A VBUS loss injected at a set time ends the transfer in flight and is a session end for the
+/// core, whatever the host was doing.
+#[test]
+fn an_injected_vbus_loss_ends_a_transfer_in_flight() {
+    let mut b = Bench::new();
+    b.enumerate();
+    b.open_bulk1();
+    b.submit(Request::BulkIn { ep: 1, len: 512, mps: 512 });
+    let now = b.d.now;
+    let at = b.link().ticks_to_ns(now) + 300_000;
+    b.link().inject(at, LinkFault::VbusOff);
+    let c = b.complete(1000);
+    assert_eq!(c.outcome, Outcome::Disconnected);
+    let now = b.d.now;
+    assert!(b.link().ticks_to_ns(now) >= at);
+    let p = b.link().port();
+    assert!(!p.power && !p.connected);
+    assert_ne!(b.rd(reg::GOTGINT) & GOTGINT_SEDET, 0, "session end");
+    assert_eq!(b.rd(reg::GOTGCTL) & gotgctl::BSESVLD, 0);
+}

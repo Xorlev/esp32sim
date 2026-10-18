@@ -128,6 +128,13 @@ impl UsbTiming {
     pub fn with_rate(mut self, bytes_per_s: u64) -> Self { self.frame_budget = Some((bytes_per_s / 8000).max(1) as u32); self }
 }
 
+/// Something that happens to the cable at a set time, whatever the host is doing then.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkFault {
+    /// VBUS goes (the car powers down): a transfer in flight ends Disconnected
+    VbusOff,
+}
+
 /// What a root hub reports about its port.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PortStatus {
@@ -181,6 +188,8 @@ pub struct UsbLink {
     /// the data PID each bulk endpoint expects next: [OUT, IN]
     toggles: [[bool; 16]; 2],
     remote_wake: bool,
+    /// a fault to inject, and when
+    fault: Option<(u64, LinkFault)>,
     pub stats: LinkStats,
     pub log: bool,
 }
@@ -189,7 +198,7 @@ impl UsbLink {
     /// A host on a device clock of `hz` ticks per second, the port unpowered, at time `now`.
     pub fn new(timing: UsbTiming, hz: u64, now: u64) -> Self {
         UsbLink { timing, hz, now, power: false, pullup: false, change_at: now, port: Port::Off, port_op: None, waiting: None, xfer: None, done: None,
-                  next_xact: None, timer: None, poke: false, budget: (u64::MAX, 0), toggles: [[false; 16]; 2], remote_wake: false, stats: LinkStats::default(), log: false }
+                  next_xact: None, timer: None, poke: false, budget: (u64::MAX, 0), toggles: [[false; 16]; 2], remote_wake: false, fault: None, stats: LinkStats::default(), log: false }
     }
 
     pub fn ns_to_ticks(&self, ns: u64) -> u64 { (ns as u128 * self.hz as u128).div_ceil(1_000_000_000) as u64 }
@@ -200,7 +209,7 @@ impl UsbLink {
     pub fn wake_at(&self) -> Option<u64> {
         let xact = self.next_xact.filter(|_| self.xfer.is_some());
         let soon = (self.poke || self.port_op.is_some()).then_some(self.now);
-        [xact, self.timer, soon].into_iter().flatten().min()
+        [xact, self.timer, soon, self.fault.map(|f| f.0)].into_iter().flatten().min()
     }
 
     /// Advance to `now`; true when work is due.
@@ -246,6 +255,23 @@ impl UsbLink {
     pub fn reset_toggle(&mut self, ep_addr: u8) { self.toggles[(ep_addr >> 7) as usize][(ep_addr & 15) as usize] = false; }
     pub fn reset_toggles(&mut self) { self.toggles = [[false; 16]; 2]; }
 
+    /// Make `fault` happen at `at_ns`, in place of one set before.
+    pub fn inject(&mut self, at_ns: u64, fault: LinkFault) { self.fault = Some((self.ns_to_ticks(at_ns), fault)); }
+
+    fn inject_now(&mut self, t: u64, fault: LinkFault, dev: &mut dyn UsbFunction) {
+        if self.log { eprintln!("[usb-link] t={} fault: {:?}", self.ticks_to_ns(t), fault); }
+        match fault {
+            LinkFault::VbusOff => {
+                if matches!(self.port, Port::Running { .. }) { dev.bus_event(t, BusEvent::SofStop); }
+                self.power = false;
+                self.port = Port::Off;
+                self.timer = None;
+                dev.vbus(t, false);
+                if self.xfer.is_some() || self.waiting.is_some() { let x = self.xfer.take(); self.waiting = None; self.next_xact = None; self.finish_with(t, Outcome::Disconnected, x.as_ref()); }
+            }
+        }
+    }
+
     /// The device's pull-up changed.
     pub fn device_pullup(&mut self, now: u64, on: bool) {
         if on != self.pullup { self.pullup = on; self.change_at = now; self.poke = true; }
@@ -258,6 +284,7 @@ impl UsbLink {
     pub fn service(&mut self, now: u64, dev: &mut dyn UsbFunction, mem: &mut dyn DmaMemory) {
         self.now = now;
         while let Some(t) = self.wake_at().filter(|&t| t <= now) {
+            if self.fault.is_some_and(|f| f.0 <= t) { let (_, f) = self.fault.take().unwrap(); self.inject_now(t, f, dev); continue; }
             if self.poke { self.poke = false; self.connection(t, dev); continue; }
             if self.timer.is_some_and(|x| x <= t) { self.timer = None; self.port_timer(t, dev); continue; }
             if let Some(r) = self.port_op.take() { self.port_request(t, r, dev); continue; }
