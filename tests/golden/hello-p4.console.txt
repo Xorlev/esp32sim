@@ -53,3 +53,11 @@ I (36) spi_flash: detected chip: gd
 I (36) spi_flash: flash io: dio
 I (36) sleep_gpio: Configure to isolate all GPIO pins in sleep state
 I (36) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (36) main_task: Started on CPU0
+I (36) main_task: Calling app_main()
+Hello world!
+This is esp32p4 chip with 2 CPU core(s), , silicon revision v1.0, 2MB external flash
+Minimum free heap size: 617824 bytes
+Restarting in 10 seconds...
+Restarting in 9 seconds...
+Restarting in 8 seconds...

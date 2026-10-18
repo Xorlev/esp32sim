@@ -77,10 +77,14 @@ impl Device for IntMatrix {
     }
 }
 
-/// One core's CLIC register block. `CLIC_INT_CTRL(i)` packs IP (bit 0), IE (bit 8), the
-/// attributes (SHV bit 16, TRIG bits 18:17, MODE bits 23:22) and CTL (bits 31:24); with
-/// NLBITS = 3 the level is CTL[7:5], the unimplemented low bits reading as ones.
-/// IDF v5.5.3 include/soc/clic_reg.h.
+/// One core's CLIC register block. `CLIC_INT_CTRL(i)` packs four byte registers: IP (byte 0,
+/// bit 0), IE (byte 1, bit 8), the attributes (byte 2: SHV bit 16, TRIG bits 18:17, MODE bits
+/// 23:22, read-only machine mode) and CTL (byte 3; reset 0x1F); with NLBITS = 3 the level is
+/// CTL[7:5], the unimplemented low bits reading as ones. IDF v5.5.3 include/soc/clic_reg.h.
+/// A level-triggered ID's IP follows its matrix input. An edge-triggered ID's IP latches the
+/// rising edge, clears when the core takes it hardware-vectored (CLIC specification) and when
+/// software writes 1 to it, which is how IDF acknowledges one (riscv/include/esp_private/
+/// interrupt_clic.h:321-324, `rv_utils_intr_edge_ack`).
 #[derive(Clone)]
 pub struct ClicCore {
     /// CLIC_INT_CONFIG.MNLBITS (bits 4:1); NVBITS reads 1
@@ -90,12 +94,12 @@ pub struct ClicCore {
     pub thresh: u32,
     /// IE, the attributes and CTL of each ID; IP is kept apart
     pub ctrl: [u32; CLIC_IDS],
-    /// edge-triggered IDs: IP latched by an edge, written by software
+    /// edge-triggered IDs: IP latched by an edge
     pub ip_latch: u64,
     /// IDs whose interrupt-matrix input is asserted now
     pub input: u64,
 }
-impl Default for ClicCore { fn default() -> Self { ClicCore { mnlbits: 0, thresh: 0, ctrl: [3 << 22; CLIC_IDS], ip_latch: 0, input: 0 } } }
+impl Default for ClicCore { fn default() -> Self { ClicCore { mnlbits: 0, thresh: 0, ctrl: [0x1f << 24 | 3 << 22; CLIC_IDS], ip_latch: 0, input: 0 } } }
 impl ClicCore {
     fn edge(&self, id: usize) -> bool { self.ctrl[id] & (1 << 17) != 0 }
     pub fn pending(&self, id: usize) -> bool { if self.edge(id) { self.ip_latch & (1 << id) != 0 } else { self.input & (1 << id) != 0 } }
@@ -104,8 +108,8 @@ impl ClicCore {
     pub fn level(&self, id: usize) -> u32 { (self.ctrl[id] >> 24) | 0x1f }
     pub fn vectored(&self, id: usize) -> bool { self.ctrl[id] & (1 << 16) != 0 }
     /// The highest-level enabled, pending ID above the threshold, the higher ID on a tie (the
-    /// RISC-V CLIC specification's rule): what the core would take with `mstatus.MIE` set and
-    /// no interrupt level of its own.
+    /// RISC-V CLIC specification's rule): what the core takes if MIE is set and its own level
+    /// is lower.
     pub fn candidate(&self) -> Option<(usize, u32)> {
         let thresh = self.thresh >> 24;
         let mut best: Option<(usize, u32)> = None;
@@ -123,6 +127,8 @@ impl ClicCore {
         for id in 0..CLIC_IDS { if rising & (1 << id) != 0 && self.edge(id) { self.ip_latch |= 1 << id; } }
         self.input = input;
     }
+    /// The core took `id`: a hardware-vectored edge interrupt is no longer pending.
+    pub fn taken(&mut self, id: usize) { if id < CLIC_IDS && self.edge(id) && self.vectored(id) { self.ip_latch &= !(1 << id); } }
     fn read(&self, off: u32) -> u32 {
         match off {
             0x0 => 1 | (self.mnlbits & 0x1e),                                                     // INT_CONFIG: NVBITS = 1
@@ -132,14 +138,17 @@ impl ClicCore {
             _ => 0,
         }
     }
-    fn write(&mut self, off: u32, v: u32) {
+    /// A write of the byte lanes in `lanes` (bit n = byte n): the ROM and IDF write the four byte
+    /// registers of a control word one at a time.
+    fn write(&mut self, off: u32, v: u32, lanes: u32) {
+        let mask = (0..4).filter(|b| lanes & (1 << b) != 0).fold(0u32, |m, b| m | 0xff << (8 * b));
         match off {
-            0x0 => self.mnlbits = v & 0x1e,
-            0x8 => self.thresh = v & 0xff00_0000,
+            0x0 => self.mnlbits = (self.mnlbits & !mask) | (v & mask & 0x1e),
+            0x8 => self.thresh = (self.thresh & !mask) | (v & mask & 0xff00_0000),
             0x1000..=0x10bc => {
                 let id = ((off - 0x1000) / 4) as usize;
-                self.ctrl[id] = (v & 0xff07_0100) | 3 << 22;                                       // MODE reads machine mode
-                if v & 1 != 0 { self.ip_latch |= 1 << id; } else { self.ip_latch &= !(1 << id); }
+                self.ctrl[id] = (self.ctrl[id] & !mask) | (v & mask & 0xff07_0100) | 3 << 22;
+                if lanes & 1 != 0 && v & 1 != 0 && self.edge(id) { self.ip_latch &= !(1 << id); }
             }
             _ => {}
         }
@@ -148,19 +157,20 @@ impl ClicCore {
 
 /// The CLIC of both cores: core 0's at 0x20800000 (configuration) and 0x20801000 (one control
 /// word per ID), core 1's at +0x10000 (IDF v5.5.3 include/soc/clic_reg.h DUALCORE_CLIC_CTRL_OFF).
-/// Silicon decodes these addresses per core: each core sees its own block at 0x20800000 and the
-/// other's at +0x10000. The bus has no core context, so this is core 0's view; core 1 does not
-/// run yet. The registers are complete, but no interrupt reaches the core: taking one needs the
-/// core's CLIC mode (`mtvt` vectoring, `mintstatus`, the level in `mcause`), which it does not have.
+/// Here offsets 0x00000-0x01FFF are core 0's block and 0x10000-0x11FFF core 1's; silicon decodes
+/// the window per core, each core seeing its own block first, and the bus swaps the halves when
+/// core 1 is the one running (`SocBus::cur_core`).
 #[derive(Default)]
 pub struct Clic { pub core: [ClicCore; 2], log: bool }
+impl Clic {
+    pub fn write_lanes(&mut self, off: u32, v: u32, lanes: u32) {
+        if self.log { eprintln!("[clic] core{} {:#06x} <- {:#010x} (lanes {:#x})", (off >> 16) & 1, off & 0xffff, v, lanes); }
+        self.core[(off >> 16) as usize & 1].write(off & 0xffff, v, lanes);
+    }
+}
 impl Device for Clic {
     fn read(&mut self, off: u32) -> u32 { self.core[(off >> 16) as usize & 1].read(off & 0xffff) }
-    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
-        if self.log { eprintln!("[clic] core{} {:#06x} <- {:#010x}", (off >> 16) & 1, off & 0xffff, v); }
-        self.core[(off >> 16) as usize & 1].write(off & 0xffff, v);
-        WriteEffect::INTMAP
-    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect { self.write_lanes(off, v, 0xf); WriteEffect::INTMAP }
     fn debug(&mut self, on: bool) { self.log = on; }
 }
 
@@ -599,26 +609,32 @@ mod tests {
     fn clic_takes_strictly_above_threshold_and_latches_edges() {
         let mut c = ClicCore::default();
         let id = 16 + 6;
-        c.write(0x1000 + 4 * id as u32, 1 << 8 | 1 << 29);            // IE, level 1, level-triggered
+        c.write(0x1000 + 4 * id as u32, 1 << 8 | 1 << 29, 0xf);            // IE, level 1, level-triggered
         c.set_input(1 << id);
         assert_eq!(c.read(0x1000 + 4 * id as u32) & 1, 1);
         assert_eq!(c.candidate(), Some((id, 0x3f)));
-        c.write(0x8, 0x3f << 24);                                     // threshold level 1 masks level 1
+        c.write(0x8, 0x3f << 24, 0xf);                                     // threshold level 1 masks level 1
         assert_eq!(c.candidate(), None);
-        c.write(0x8, 0x1f << 24);
+        c.write(0x8, 0x1f << 24, 0xf);
         assert_eq!(c.candidate(), Some((id, 0x3f)));
         c.set_input(0);
         assert_eq!(c.candidate(), None);
         let e = 16 + 7;
-        c.write(0x1000 + 4 * e as u32, 1 << 8 | 1 << 17 | 3 << 29);  // edge-triggered, level 3
+        c.write(0x1000 + 4 * e as u32, 1 << 8 | 1 << 17 | 3 << 29, 0xf);   // edge-triggered, level 3
         c.set_input(1 << e);
         c.set_input(0);
         assert_eq!(c.candidate(), Some((e, 0x7f)));
-        c.write(0x1000 + 4 * e as u32, 1 << 8 | 1 << 17 | 3 << 29);  // software clears IP
+        c.write(0x1000 + 4 * e as u32, 1 << 8, 0x2);                         // IE byte alone keeps IP
+        assert_eq!(c.candidate(), Some((e, 0x7f)));
+        c.write(0x1000 + 4 * e as u32, 1, 0x1);                              // IDF's acknowledge: IP = 1
         assert_eq!(c.candidate(), None);
+        c.set_input(1 << e);
+        c.write(0x1000 + 4 * e as u32, 1 << 16 | 1 << 17, 0x4);              // hardware-vectored
+        c.taken(e);
+        assert_eq!(c.candidate(), None, "a vectored edge interrupt clears when it is taken");
         assert_eq!(c.read(0x0), 1);
         assert_eq!(c.read(0x4), 48 | 3 << 21);
-        assert_eq!(c.read(0x1000) >> 22 & 3, 3);
+        assert_eq!(c.read(0x1000) >> 22, 0x1f << 2 | 3, "CTL resets to 0x1F, MODE reads machine");
     }
 
     #[test]

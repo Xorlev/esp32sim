@@ -289,6 +289,7 @@ impl<S: Soc> Machine<S> {
     }
 
     fn step_core_modeled(&mut self, core: usize) -> Result<u32, Stop> {
+        S::select_core(&mut self.bus, core);
         let pc = self.cores[core].pc();
         if self.probe_bloom & pc_bit(pc) != 0 && !self.cores[core].waiting() {
             if let Some(name) = self.fn_probes.get(&pc) {

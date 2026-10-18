@@ -27,18 +27,66 @@ macro_rules! st {
 /// Execute one instruction.
 pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> Result<(), Trap> { step_outcome(cpu, bus).result() }
 
+/// A CLIC candidate as the SoC presents it (`Cpu::clic`): the CPU line (CLIC ID - 16) in bits
+/// 4:0, the 8-bit level in bits 15:8, the SHV (hardware-vectored) attribute in bit 16. The SoC
+/// has applied the threshold; the core applies its own level.
+pub const CLIC_IRQ_LEVEL_SHIFT: u32 = 8;
+pub const CLIC_IRQ_SHV: u32 = 1 << 16;
+/// IDF's CPU lines 0-31 are CLIC IDs 16-47 (ESP-IDF v5.5.3 riscv/include/esp_private/interrupt_clic.h:40-41).
+pub const CLIC_EXT_OFFSET: u32 = 16;
+
+/// Take a CLIC interrupt (CLIC specification, "CLIC Interrupt Operation"): one strictly above
+/// the current level, with MIE set and `mtvec` in mode 3. mcause gets the ID and the previous
+/// level, the level becomes the interrupt's, and an SHV interrupt jumps through `mtvt + 4*id`,
+/// a memory read made with MINHV set; the rest enter at the 64-byte-aligned `mtvec` base.
+#[cold]
+#[inline(never)]
+fn clic_take<B: Bus>(cpu: &mut Cpu, bus: &mut B, irq: u32, pc: u32) -> Option<StepOutcome> {
+    use crate::state::{mcause, mstatus};
+    let level = (irq >> CLIC_IRQ_LEVEL_SHIFT) & 0xff;
+    if level <= cpu.mil { return None; }
+    cpu.waiting = false;
+    if !cpu.mie_enabled() || !cpu.clic_mode() { return None; }
+    let (line, id) = (irq & 0x1f, (irq & 0x1f) + CLIC_EXT_OFFSET);
+    cpu.insn_count += 1; cpu.cycle_count += 1;
+    cpu.mepc = pc;
+    cpu.mtval = 0;
+    let mpie = if cpu.mstatus & mstatus::MIE != 0 { mstatus::MPIE } else { 0 };
+    cpu.mstatus = (cpu.mstatus & !(mstatus::MIE | mstatus::MPIE)) | mpie | mstatus::MPP;
+    cpu.mcause = mcause::INTERRUPT | cpu.mil << mcause::MPIL_SHIFT | id;
+    cpu.mil = level;
+    if irq & CLIC_IRQ_SHV != 0 {
+        let entry = cpu.mtvt.wrapping_add(4 * id);
+        match bus.read32(entry) {
+            Ok(target) => cpu.pc = target & !1,
+            Err(_) => {
+                cpu.trap(exc::INSN_ACCESS_FAULT, entry, entry);
+                cpu.mcause |= mcause::MINHV;
+                return Some(StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Exception(exc::INSN_ACCESS_FAULT)), control: None });
+            }
+        }
+    } else {
+        cpu.pc = cpu.mtvec & !0x3f;
+    }
+    Some(StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Interrupt(line)), control: None })
+}
+
 /// Execute one slow-path event and retain its exact fetch window and trap timing.
 pub fn step_outcome<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> StepOutcome {
     let pc = cpu.pc;
     // The SoC's INTC decides enable/priority and hands us the line (`Core::set_irq`); the CPU
-    // only gates on mstatus.MIE.
+    // only gates on mstatus.MIE, or with a CLIC on MIE and its own level too.
     if cpu.waiting || cpu.mie_enabled() {
         if let Some(line) = cpu.irq {
-            cpu.waiting = false;
-            if cpu.mie_enabled() {
-                cpu.insn_count += 1; cpu.cycle_count += 1;
-                cpu.trap(0x8000_0000 | line, 0, pc);
-                return StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Interrupt(line)), control: None };
+            if cpu.clic {
+                if let Some(o) = clic_take(cpu, bus, line, pc) { return o; }
+            } else {
+                cpu.waiting = false;
+                if cpu.mie_enabled() {
+                    cpu.insn_count += 1; cpu.cycle_count += 1;
+                    cpu.trap(0x8000_0000 | line, 0, pc);
+                    return StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Interrupt(line)), control: None };
+                }
             }
         }
     }

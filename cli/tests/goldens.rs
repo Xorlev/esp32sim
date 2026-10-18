@@ -201,20 +201,39 @@ fn hello_world_c6_reboot() {
     expect_u64("hello-c6-reboot.insns", r.insns);
 }
 
-/// hello_world for the ESP32-P4 rev < 3 from the ECO0 mask ROM (docs/esp32p4.md), with the
-/// default boot mode and console: the bootloader loads the app, which starts at 360 MHz with the
-/// board's heap regions.
+fn p4_hello(seconds: &str) -> (Vec<String>, Run) {
+    let rom = rom("esp32p4_rev0");
+    let args: Vec<String> = ["--rom", rom.to_str().unwrap(), "--flash-mb", "2",
+        "--bootloader", &format!("{FW}/p4-hello-bootloader.bin"), "--ptable", &format!("{FW}/p4-hello-ptable.bin"), "--app", &format!("{FW}/p4-hello_world.bin"), "--max-seconds", seconds].iter().map(|s| s.to_string()).collect();
+    let r = run(BIN_P4, &args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    (args, r)
+}
+
+/// hello_world for the ESP32-P4 rev < 3 from the ECO0 mask ROM (docs/esp32p4.md), single-core,
+/// with the default boot mode and console: through the bootloader into FreeRTOS, `app_main` and
+/// the countdown, on the CLIC's systimer tick and yield interrupts.
 #[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
 fn hello_world_p4() {
-    let rom = rom("esp32p4_rev0");
-    let args = ["--rom", rom.to_str().unwrap(), "--flash-mb", "2",
-        "--bootloader", &format!("{FW}/p4-hello-bootloader.bin"), "--ptable", &format!("{FW}/p4-hello-ptable.bin"), "--app", &format!("{FW}/p4-hello_world.bin"), "--max-seconds", "0.1"];
-    let r = run(BIN_P4, &args);
-    assert!(r.stdout.contains("cpu_start: cpu freq: 360000000 Hz"), "the app never started:\n{}", r.stdout);
+    let (args, r) = p4_hello("3");
+    assert!(r.stdout.contains("Hello world!") && r.stdout.contains("Restarting in 9 seconds..."), "app_main never printed:\n{}", r.stdout);
     expect_text("hello-p4.console.txt", &r.stdout);
     expect_u64("hello-p4.insns", r.insns);
-    let r2 = run(BIN, &[&["--chip", "p4"][..], &args[..]].concat());
+    let mut chip = vec!["--chip", "p4"];
+    chip.extend(args.iter().map(|s| s.as_str()));
+    let r2 = run(BIN, &chip);
     assert_eq!(r.stdout, r2.stdout); assert_eq!(r.insns, r2.insns);
+}
+
+/// The P4's esp_restart(): a software CPU reset through LP_CLKRST, back through the ROM with
+/// the reset cause and core 0's saved PC, and into app_main again.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn hello_world_p4_reboot() {
+    let (_, r) = p4_hello("12");
+    assert!(r.stderr.contains("[emu] chip reset at t="), "no reset seen:\n{}", r.stderr);
+    assert!(r.stdout.matches("Hello world!").count() >= 2, "the app did not come back after the reset:\n{}", r.stdout);
+    assert!(r.stdout.contains("rst:0xc (SW_CPU_RESET)"), "the second boot banner lacks the reset cause:\n{}", r.stdout);
+    expect_text("hello-p4-reboot.console.txt", &r.stdout);
+    expect_u64("hello-p4-reboot.insns", r.insns);
 }
 
 /// The IEEE 802.15.4 energy scanner on the Waveshare ESP32-C6-LCD-1.47 (its owner's firmware,

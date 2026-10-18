@@ -4,6 +4,7 @@ use crate::bus::{SocBus, FLASH_HIGH, FLASH_LOW, MMU_ENTRIES, MMU_FLASH_VALID, MM
 use crate::periph::{self, CLIC_EXT_OFFSET};
 use esp_periph::Misc;
 use esp_soc::{BoardModel, CoreState, Soc};
+use riscv_rv32::exec::{CLIC_IRQ_LEVEL_SHIFT, CLIC_IRQ_SHV};
 use riscv_rv32::Cpu;
 use std::marker::PhantomData;
 
@@ -65,9 +66,22 @@ impl<R: Revision> Soc for Esp32p4<R> {
         c.pc = entry;
         c.x[2] = 0x4FF3_CFC0;                 // SOC_ROM_STACK_START, the stack the ROM leaves the bootloader
     }
-    /// Nothing is presented: the CLIC registers hold their state, but the core cannot take a CLIC
-    /// interrupt yet (`SocBus::refresh_lines` reports what would have been taken).
-    fn irqs(_bus: &SocBus, out: &mut [Option<u32>]) { out.fill(None); }
+    /// Each core's CLIC candidate, as the core's CLIC mode takes it (`riscv_rv32::exec::CLIC_IRQ_*`).
+    /// IDs 0-15 are the core's own and IDF routes nothing to them.
+    fn irqs(bus: &SocBus, out: &mut [Option<u32>]) {
+        for (core, o) in out.iter_mut().enumerate() {
+            let c = &bus.periph.clic.core[core];
+            *o = c.candidate().filter(|&(id, _)| id >= CLIC_EXT_OFFSET as usize).map(|(id, level)| {
+                (id as u32 - CLIC_EXT_OFFSET) | level << CLIC_IRQ_LEVEL_SHIFT | if c.vectored(id) { CLIC_IRQ_SHV } else { 0 }
+            });
+        }
+    }
+    /// A hardware-vectored edge interrupt is no longer pending once taken.
+    fn interrupt_taken(bus: &mut SocBus, core: usize, line: u32) {
+        bus.periph.clic.core[core & 1].taken((line + CLIC_EXT_OFFSET) as usize);
+        bus.irq_dirty = true;
+    }
+    fn select_core(bus: &mut SocBus, core: usize) { bus.cur_core = core; }
     /// Core 1 stays held even when HP_SYS_CLKRST releases it: `mhartid` reads 0 on every core of
     /// this CPU model, so it would run the ROM as core 0. The release is reported once.
     fn core_state(bus: &SocBus, core: usize) -> CoreState {
@@ -84,7 +98,7 @@ impl esp_soc::SocBus for SocBus {
     fn cycles(&self) -> u64 { self.cycles }
     fn next_deadline(&self) -> Option<u64> { match self.periph.cycles_until_timer() { u32::MAX => None, c => Some(c.max(1) as u64) } }
     fn irq_dirty(&mut self) -> &mut bool { &mut self.irq_dirty }
-    fn refresh_irq(&mut self) -> bool { self.refresh_lines(); true }
+    fn refresh_irq(&mut self) -> bool { self.periph.refresh_lines(); true }
     fn misc(&mut self) -> &mut Misc { &mut self.periph.misc }
     fn load_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), String> { SocBus::load_bytes(self, addr, data) }
     fn write_flash(&mut self, offset: usize, data: &[u8]) -> Result<(), String> { SocBus::write_flash(self, offset, data) }
@@ -134,7 +148,6 @@ impl esp_soc::SocBus for SocBus {
         *self.mmu_psram = [0; MMU_ENTRIES];
         self.mmu_flash_index = 0;
         self.mmu_psram_index = 0;
-        self.undelivered = [0; 2];
         self.core1_reported.set(false);
         for area in self.debug.iter() { esp_periph::Dispatch::debug(&mut self.periph, area, true); }
         self.periph.misc.log_all = self.debug.has("mmio");

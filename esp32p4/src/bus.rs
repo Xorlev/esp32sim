@@ -39,6 +39,9 @@ pub const FLASH_SPI0: u32 = 0x5008_C000;
 pub const PSRAM_MSPI0: u32 = 0x5008_E000;
 pub const SPI_MMU_ITEM_CONTENT: u32 = 0x37c;
 pub const SPI_MMU_ITEM_INDEX: u32 = 0x380;
+/// Both cores' CLIC blocks (include/soc/clic_reg.h).
+pub const CLIC_LOW: u32 = 0x2080_0000;
+pub const CLIC_HIGH: u32 = 0x2082_0000;
 
 /// Which MMU an item register belongs to.
 #[derive(Clone, Copy)]
@@ -66,8 +69,8 @@ pub struct SocBus {
     pub irq_dirty: bool,
     pub gpio_events: Option<Vec<(u64, u8, bool)>>,
     pub debug: esp_soc::DebugFlags,
-    /// CLIC IDs already reported as pending but not deliverable, per core
-    pub(crate) undelivered: [u64; 2],
+    /// the core the machine is running, for the core-local CLIC window (`Soc::select_core`)
+    pub cur_core: usize,
     /// core 1's release from reset has been reported
     pub(crate) core1_reported: std::cell::Cell<bool>,
 }
@@ -80,7 +83,7 @@ impl SocBus {
             flash: vec![0xff; flash_size], psram: Vec::new(),
             mmu_flash: Box::new([0; MMU_ENTRIES]), mmu_psram: Box::new([0; MMU_ENTRIES]), mmu_flash_index: 0, mmu_psram_index: 0,
             periph: Peripherals::new(mac, wafer), wafer, board: Box::new(esp_soc::NoBoard),
-            cycles: 0, last_fault: None, irq_dirty: true, gpio_events: None, debug: Default::default(), undelivered: [0; 2], core1_reported: Default::default(),
+            cycles: 0, last_fault: None, irq_dirty: true, gpio_events: None, debug: Default::default(), cur_core: 0, core1_reported: Default::default(),
         }
     }
 
@@ -145,20 +148,32 @@ impl SocBus {
         }
     }
 
+    /// The CLIC window is per core: the running core's own block at 0x20800000, the other core's
+    /// at 0x20810000 (include/soc/interrupt_reg.h, INTERRUPT_CURRENT/OTHER_CORE_INT_THRESH_REG).
+    #[inline]
+    fn clic_view(&self, a: u32) -> u32 { if self.cur_core == 1 && (CLIC_LOW..CLIC_HIGH).contains(&a) { a ^ 0x1_0000 } else { a } }
+
     fn periph_read(&mut self, addr: u32, size: u32) -> u32 {
-        let a = addr & !3;
+        let a = self.clic_view(addr & !3);
         let w = match Self::mmu_reg(a) { Some((m, o)) => self.mmu_read(m, o), None => self.periph.read32(a) };
         match size { 1 => (w >> ((addr & 3) * 8)) & 0xff, 2 => (w >> ((addr & 2) * 8)) & 0xffff, _ => w }
     }
 
     fn periph_write(&mut self, addr: u32, v: u32, size: u32) {
-        let a = addr & !3;
+        let a = self.clic_view(addr & !3);
         let merge = |old: u32| match size {
             4 => v,
             1 => { let sh = (addr & 3) * 8; (old & !(0xff << sh)) | ((v & 0xff) << sh) }
             _ => { let sh = (addr & 2) * 8; (old & !(0xffff << sh)) | ((v & 0xffff) << sh) }
         };
         if let Some((m, o)) = Self::mmu_reg(a) { let old = self.mmu_read(m, o); self.mmu_write(m, o, merge(old)); return; }
+        // The CLIC's control words are four byte registers: a byte write touches its own only.
+        if (CLIC_LOW..CLIC_HIGH).contains(&a) {
+            let lanes = match size { 4 => 0xf, 1 => 1 << (addr & 3), _ => 3 << (addr & 2) };
+            self.periph.clic.write_lanes(a - CLIC_LOW, merge(0), lanes);
+            self.irq_dirty = true;
+            return;
+        }
         let v = if size == 4 { v } else { merge(self.periph.read32(a)) };
         self.periph.write32(a, v);
         if self.periph.spi_exec { self.run_spi(); }
@@ -200,21 +215,6 @@ impl SocBus {
         Ok(())
     }
 
-    /// Re-derive each core's CLIC input. Nothing is presented to the cores, so a candidate that
-    /// would be taken is reported once per ID instead.
-    pub(crate) fn refresh_lines(&mut self) -> bool {
-        let changed = self.periph.refresh_lines();
-        for core in 0..2 {
-            let Some((id, level)) = self.periph.clic.core[core].candidate() else { continue };
-            if self.undelivered[core] & (1 << id) != 0 { continue; }
-            self.undelivered[core] |= 1 << id;
-            let srcs: Vec<String> = self.periph.sources_of(core, id as u32).iter().map(|&s| format!("{} ({})", s, crate::periph::src::name(s))).collect();
-            let c = &self.periph.clic.core[core];
-            eprintln!("[esp32p4] core {} CLIC: interrupt id {} (CPU line {}, source {}) pending at level {:#x} over threshold {:#x}, {}; not delivered: the core has no CLIC mode (mtvt vectoring, mintstatus, mcause.mpil)",
-                core, id, id as i32 - crate::periph::CLIC_EXT_OFFSET as i32, if srcs.is_empty() { "none".into() } else { srcs.join(", ") }, level, c.thresh >> 24, if c.vectored(id) { "hardware-vectored" } else { "not vectored" });
-        }
-        changed
-    }
 
     fn devices(&mut self, cycles: u32) {
         if self.periph.spi_exec { self.run_spi(); }

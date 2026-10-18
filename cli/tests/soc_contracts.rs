@@ -114,22 +114,21 @@ fn c6_plic_and_intpri_share_host_input_interrupt_state() {
     assert!(bus.irq_dirty);
 }
 
-/// The P4's sources reach its CLIC registers, but no interrupt is presented to the core: the
-/// core model has no CLIC mode yet.
+/// The P4's sources reach each core's CLIC through its interrupt matrix, and the CLIC's candidate
+/// is presented to the core as line, level and the hardware-vectoring attribute.
 #[test]
-fn p4_host_input_reaches_the_clic_but_not_the_core() {
+fn p4_host_input_reaches_the_core_through_the_clic() {
     let mut bus = esp32p4::bus::SocBus::new(1, [0; 6], (1, 0));
     let source = esp32p4::periph::src::USB_SERIAL_JTAG as u32;
     bus.periph.write32(0x500d_6000 + source * 4, 16 + 3);
-    bus.periph.write32(0x2080_1000 + (16 + 3) * 4, 1 << 8 | 1 << 29);
+    bus.periph.write32(0x2080_1000 + (16 + 3) * 4, 1 << 8 | 1 << 16 | 1 << 29);
     bus.periph.usb.int_ena = 1 << 2;
     bus.irq_dirty = false;
     bus.serial_input(b"a");
     assert!(bus.irq_dirty);
     bus.refresh_irq();
-    assert_eq!(bus.periph.clic.core[0].candidate(), Some((16 + 3, 0x3f)));
     let mut pending = [None, None];
     esp32p4::P4::irqs(&bus, &mut pending);
-    assert_eq!(pending, [None, None]);
+    assert_eq!(pending, [Some(3 | 0x3f << 8 | 1 << 16), None]);
     assert_eq!(bus.irq_sources_of(0, 3), [source as usize]);
 }
