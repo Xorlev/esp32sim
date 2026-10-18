@@ -50,10 +50,10 @@ pub enum SdDataError {
     NoCrcStatus,
 }
 
-/// Something on an SD bus: a memory card now, an SDIO function later (slot 1 of the P4 is the
-/// ESP-Hosted link). The host sends commands and moves data; the device answers in the SD
-/// protocol's terms and knows nothing about registers or DMA. `now` is emulated time in
-/// nanoseconds.
+/// Something on an SD bus: a memory card (`SdCard`) or an SDIO function (the P4's ESP-Hosted
+/// co-processor on slot 1). The host sends commands and moves data; the device answers in the SD
+/// protocol's terms and knows nothing about the host's registers or DMA. `now` is emulated time
+/// in nanoseconds.
 pub trait SdDevice {
     /// A command on CMD and the device's answer.
     fn command(&mut self, now: u64, cmd: u8, arg: u32) -> Result<SdResponse, SdCmdError>;
@@ -69,6 +69,9 @@ pub trait SdDevice {
     fn bus_width(&self) -> Option<u8> { None }
     /// The SDIO interrupt (DAT1 low).
     fn interrupt(&self) -> bool { false }
+    /// An SDIO function, whose DAT1 carries its interrupt between transfers (SDIO Simplified
+    /// Specification v3.00 §8.1.2).
+    fn io(&self) -> bool { false }
     fn name(&self) -> &str;
     fn set_log(&mut self, _on: bool) {}
 }
@@ -211,6 +214,8 @@ pub struct Sdmmc {
     data_due: u64,
     pub stats: SdmmcStats,
     log: bool,
+    /// each slot's SDIO interrupt as last seen on DAT1
+    sdio_irq: [bool; SLOTS],
 }
 
 impl Sdmmc {
@@ -219,7 +224,7 @@ impl Sdmmc {
             bmod: 0, dbaddr: 0, idsts: 0, idinten: 0, dscaddr: 0, bufaddr: 0, tcbcnt: 0, tbbcnt: 0, resp_index: 0, cursor: 0,
             ram: RegRam::new(), card_detect_n: 0, write_protect: 0, devices: Vec::new(), route: [None; SLOTS], now_ns: 0, xfer: None,
             pending: Pending::None, bci_slot: None, read_irq: false, timed: false, ciu_hz: 0, deferred: Vec::new(), data_due: 0,
-            stats: SdmmcStats::default(), log: false };
+            stats: SdmmcStats::default(), log: false, sdio_irq: [false; SLOTS] };
         s.reset_registers();
         s
     }
@@ -288,6 +293,20 @@ impl Sdmmc {
         }
         if self.bci_slot.is_some() { self.busy_clear(); }
         self.read_irq = false;
+        self.rintsts != before
+    }
+
+    /// Sample DAT1 of the slots an SDIO function sits on. RINTSTS's per-slot SDIO interrupt
+    /// (bit 16 + slot) is set when DAT1 goes low: IDF treats it as edge triggered and reads the D1
+    /// pin for the level (esp_driver_sdmmc/src/sdmmc_host.c, `sdmmc_host_io_int_wait`). True when
+    /// RINTSTS changed.
+    pub fn poll_sdio(&mut self) -> bool {
+        let before = self.rintsts;
+        for slot in 0..SLOTS {
+            let irq = self.route[slot].and_then(|i| self.devices.get(i)).is_some_and(|d| d.io() && d.interrupt());
+            if irq && !self.sdio_irq[slot] { self.rintsts |= int::SDIO_SLOT0 << slot; }
+            self.sdio_irq[slot] = irq;
+        }
         self.rintsts != before
     }
 

@@ -477,6 +477,13 @@ impl GpioP4 {
     }
     /// FUNCn_OUT_SEL bits 8:0 of a pin: the output signal on it, 256 for GPIO_OUT.
     pub fn out_signal(&self, pin: u8) -> u32 { self.g.func_out_sel.get(pin as usize).map_or(0x100, |v| v & 0x1ff) }
+    /// The level a pin's GPIO_OUT drives while its output is enabled, through pin 63. The
+    /// W1TS/W1TC registers reach every bit of OUT1 and ENABLE1 (pins 32-56, gpio_reg.h:65-161);
+    /// the IO MUX function of pins 49-56 is not checked.
+    pub fn drive(&self, pin: u8) -> Option<bool> {
+        let bit = 1u64.checked_shl(pin as u32)?;
+        (self.g.enable & bit != 0).then_some(self.g.out & bit != 0)
+    }
 }
 impl Device for GpioP4 {
     fn read(&mut self, off: u32) -> u32 {
@@ -497,6 +504,10 @@ impl SdPins {
     /// pins: SDMMC_SLOT0_IOMUX_PIN_NUM_CLK 43, CMD 44, D0-D3 39-42
     /// (IDF v5.5.3 components/soc/esp32p4/include/soc/sdmmc_pins.h).
     pub const SOCKET: SdPins = SdPins { clk: 43, cmd: 44, data: [39, 40, 41, 42] };
+    /// ESP-Hosted's co-processor link on slot 1 through the GPIO matrix: CLK 18, CMD 19, D0-D3
+    /// 14-17, the defaults esp_hosted 2.12.13 gives the ESP32-P4 (Kconfig,
+    /// ESP_HOSTED_PRIV_SDIO_PIN_*_SLOT_1) and the reference board's wiring.
+    pub const HOSTED: SdPins = SdPins { clk: 18, cmd: 19, data: [14, 15, 16, 17] };
 }
 
 /// GPIO matrix signals of the SDMMC host (IDF v5.5.3 include/soc/gpio_sig_map.h): slot 1's
@@ -520,6 +531,8 @@ pub struct Peripherals {
     /// the high-speed USB-OTG core (0x50000000) and the cable to a host, if one is attached
     pub usb_otg: Dwc2,
     pub sd_pins: Vec<SdPins>,
+    /// an SDIO function is on the bus: its DAT1 is sampled after each command (`sync_sdio`)
+    pub has_sdio: bool,
     pub efuse: Efuse,
     /// SPI_MEM_C: the flash controller's cache side (the MMU registers are the bus's)
     pub spi0: MspiCache<SpiMem>,
@@ -613,7 +626,7 @@ impl Peripherals {
         Peripherals {
             uart: [Uart::new(UartLayout::C6), Uart::new(UartLayout::C6)], usb: UsbSerialJtag::new(CPU_HZ), systimer: SystimerP4::default(),
             timg: [TimerGroup::new(), TimerGroup::new()], gpio: GpioP4::new(), io_mux: RegRam::new(),
-            sdmmc: Sdmmc::new(SdmmcLayout::Esp32p4), sd_pins: Vec::new(), usb_otg: Dwc2::new(Dwc2Config::esp32p4_hs(CPU_HZ)),
+            sdmmc: Sdmmc::new(SdmmcLayout::Esp32p4), sd_pins: Vec::new(), has_sdio: false, usb_otg: Dwc2::new(Dwc2Config::esp32p4_hs(CPU_HZ)),
             efuse: efuse_p4(mac, wafer, (0, 3)),
             spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true), psram1: psram_controller(),
             sha: Sha::new(), intmtx: IntMatrix::new(), clic: Clic::default(), cache: Cache::new(), hp_sys: HpSys::default(), hp_clkrst: HpClkRst::new(),
@@ -685,10 +698,23 @@ impl Peripherals {
     /// Put a device on the SD bus at `pins`, in place of one already there.
     pub fn attach_sd(&mut self, pins: SdPins, mut dev: Box<dyn esp_periph::sdmmc::SdDevice>) {
         dev.set_log(self.sdmmc.logging());
+        self.has_sdio |= dev.io();
         match self.sd_pins.iter().position(|&p| p == pins) {
             Some(i) => self.sdmmc.devices[i] = dev,
             None => { self.sdmmc.attach(dev); self.sd_pins.push(pins); }
         }
+    }
+
+    /// DAT1 of each SDIO function on the bus: its D1 pin's input level (low while it interrupts,
+    /// which `sdmmc_host_io_int_wait` reads first) and the slot's RINTSTS SDIO bit. True when an
+    /// interrupt line may have moved.
+    pub fn sync_sdio(&mut self) -> bool {
+        self.sdmmc.route = self.sd_routes();
+        let mut changed = self.sdmmc.poll_sdio();
+        for (i, pins) in self.sd_pins.iter().enumerate() {
+            if let Some(d) = self.sdmmc.devices.get(i).filter(|d| d.io()) { changed |= self.gpio.g.set_input(pins.data[1], !d.interrupt()); }
+        }
+        changed
     }
 
     /// Emulated time in nanoseconds, from the device clock.

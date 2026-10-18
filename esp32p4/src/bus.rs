@@ -236,6 +236,20 @@ impl SocBus {
         self.periph.sdmmc.route = self.periph.sd_routes();
         let mut dma = DmaView { l2mem: &mut self.l2mem, psram: &mut self.psram, mmu: &self.mmu_psram };
         self.periph.sdmmc.run(&mut dma);
+        if self.periph.has_sdio { self.sync_sdio(); }
+    }
+
+    /// An SDIO function's DAT1 after a command or at the co-simulation's slice end.
+    #[cold]
+    #[inline(never)]
+    pub fn sync_sdio(&mut self) {
+        if self.periph.sync_sdio() { self.irq_dirty = true; }
+    }
+
+    /// Put an SDIO function on the bus at `pins` (the co-processor at `periph::SdPins::HOSTED`).
+    pub fn attach_sdio(&mut self, pins: crate::periph::SdPins, dev: Box<dyn esp_periph::sdmmc::SdDevice>) {
+        self.periph.attach_sd(pins, dev);
+        self.sync_sdio();
     }
 
     /// Let the USB host on the cable carry out what is due, its transactions moving data through
