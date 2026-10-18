@@ -111,6 +111,7 @@ impl esp_soc::SocBus for SocBus {
         p.efuse = old.efuse;
         p.optional.i2s0.keep_rx_input(&mut old.optional.i2s0);
         p.adc.analog = old.adc.analog;
+        p.optional.sdio.stats = old.optional.sdio.stats;   // counts for the whole run
         p.adc.analog.set_stream_clock_offset(self.cycles); // the new peripheral clock starts at zero
         p.misc.log_unknown = old.misc.log_unknown;
         p.usb.connected = old.usb.connected;

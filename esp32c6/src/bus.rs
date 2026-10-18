@@ -147,6 +147,7 @@ impl SocBus {
         self.periph.write32(a, v);
         if self.periph.sha.dma_pending { self.sha_dma_write(a); }
         if matches!(a >> 12, 0x60015 | 0x60080) || a == PERIPH_BASE + 0x960ac { self.parlio_dma_write(a); }
+        if a >> 12 == 0x60017 { self.sdio_slc_write(); }
         if old_drive != (self.periph.gpio.enable, self.periph.gpio.out) {
             self.deliver_gpio_output();
         }
