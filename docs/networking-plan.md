@@ -16,7 +16,10 @@ MAC is handled by two layers in front of the host network:
   written to that socket, socket reads come back as segments the emulator sequences, acknowledges
   and retransmits; UDP flows are a bound `UdpSocket` per (port, destination) with a reply path
   and an idle reaper. Name lookups are forwarded to the host's own first resolver from
-  `/etc/resolv.conf`. `--net none` refuses outbound traffic instead (immediate RST).
+  `/etc/resolv.conf`. `--net none` refuses outbound traffic instead (immediate RST). A forward
+  (`fwd=GUEST_IP:PORT=HOST_IP:PORT`) relays TCP for one guest address to a fixed host address,
+  with either mode; under `none` the forwards are all that is relayed
+  ([networking-howto.md](networking-howto.md)).
 
 No libslirp, no tun device, no entitlement, no root. TLS works: the panel fetches
 `https://www.elprisetjustnu.se` and polls Home Assistant on the LAN. That needed the RSA/MPI

@@ -32,6 +32,33 @@ adopts whatever you give it. The AP is WPA2-PSK when `psk=` is present and open 
 gateway with an immediate RST, so applications fail fast instead of hanging — useful when you want a
 run to be reproducible and offline.
 
+## Forwarding a guest address to a host service
+
+`fwd=GUEST_IP:PORT=HOST_IP:PORT` (repeatable, in `--net`) sends TCP the firmware opens to
+`GUEST_IP:PORT` to `HOST_IP:PORT` on the host instead, the way QEMU's `guestfwd` does. The
+firmware keeps its own address and port: a server on the host can listen on an unprivileged port
+while the firmware connects to 445 or 1883, and the guest sees every segment come from the
+address it connected to.
+
+```sh
+esp32sim-p4 ... --coproc c6:... --wifi ssid=esp32sim,psk=esp32sim-pass \
+    --net none,epoch=1767225600,fwd=10.0.2.100:445=127.0.0.1:4445,fwd=10.0.2.100:1883=127.0.0.1:1884
+```
+
+- With `none` the forwards are the only traffic that leaves the emulator: DNS still answers every
+  name with 10.0.2.3 and SNTP answers from the network's own clock (`epoch=`), so nothing reaches
+  a real server but the ones forwarded, and a firmware that has an address of the real network
+  built in cannot reach it. With `nat` a forward takes precedence over the guest's destination
+  and the rest goes out as before.
+- Any address the guest can route to works as `GUEST_IP`. 10.0.2.100 is in the subnet: the
+  gateway answers ARP for it like any other address. A host name in the firmware's configuration
+  resolves to 10.0.2.3 under `none`, so forward 10.0.2.3 for it.
+- TCP only. The mapping is fixed, but a forwarded connection reaches a real server, whose answers
+  arrive when the host delivers them: such a run is not the same to the instruction every time,
+  unlike one with `none` alone.
+- `ESP_EMU_DEBUG_NET=1` logs each forwarded flow as `connecting (forwarded to HOST_IP:PORT)`; the
+  end-of-run `[emu] nat:` line counts them.
+
 The same `--wifi` and `--net` work on the **ESP32-C6** (`esp32sim-c6`): the access point and the
 network are the same code, the MAC model is the C6's own ([wifi-c6-plan.md](wifi-c6-plan.md)). A C6
 radio run also needs `--stub bb_init=0`, and what has been tried is one station on one open or
@@ -43,7 +70,8 @@ WPA2 network; `examples/c6-wifi-station` has the full command. The C3 also suppo
 - **DNS** — with NAT, queries go to the host's first `nameserver` from `/etc/resolv.conf` and the
   answer comes back looking as if 10.0.2.3 produced it. With `--net none`, the built-in responder
   answers every A query with 10.0.2.3 itself, so lookups succeed and the connection is then refused.
-- **Time** — with NAT, SNTP requests reach the real server the firmware asked for. With `--net none`,
+- **Time** — with NAT, SNTP requests reach the real server the firmware asked for, so `epoch=` does
+  not apply to them. With `--net none`,
   the built-in SNTP server answers (stratum 1) so firmware that waits for time still gets it in the
   first seconds: the network's clock plus emulated time since power-on. `--net none,epoch=S` fixes
   that clock (seconds since 1970) and makes such a run the same every time; without it the host's
@@ -78,7 +106,10 @@ WPA2 network; `examples/c6-wifi-station` has the full command. The C3 also suppo
 ## Known limits
 
 - **Inbound connections** are not forwarded yet, so a server inside the guest (a firmware web UI)
-  cannot be opened from the host.
+  cannot be opened from the host. `fwd=` goes the other way, guest to host.
+- **The NAT's TCP window** is 5840 bytes each way, without window scaling: a guest's upload or
+  download has at most that much in flight, whatever its own window ([esp32p4.md](esp32p4.md),
+  "Services").
 - **Multicast and mDNS** do not cross the NAT: `something.local` will not resolve, and Home
   Assistant / ESP-IDF discovery protocols will not see anything. Use IP addresses.
 - **UDP reply peers** must match the destination IP and port of the outgoing datagram. The

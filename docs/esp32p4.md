@@ -7,7 +7,9 @@ into FreeRTOS on one or both cores, reaches an SD card in the board's socket thr
 host (milestone 2, "SD card" below), presents it as a USB mass-storage device to a host on
 the high-speed USB-OTG port, a car written in Rust (milestone 3, "USB" below), and reaches WiFi
 through an emulated ESP32-C6 on SDIO running unmodified ESP-Hosted slave firmware, the two chips
-in lock-step in one process (milestone 4a, "The co-processor" below).
+in lock-step in one process (milestone 4a, "The co-processor" below). Through the C6 an
+application reaches real servers on the host: oxidrive archives a car's clips to a samba share
+and reports to a mosquitto broker in an `external_` test (milestone 4b, "Services" below).
 
 ```sh
 cargo build --release
@@ -921,8 +923,9 @@ The WiFi side is not part of these numbers, and through the air it is the first 
 virtual access point's receive pacing (`esp-soc/src/wifi.rs`, `StationLink::next_rx`) delivers
 one frame per 400 µs of airtime (`RX_GAP_US`) and none while the last descriptor it filled is
 still unrecycled, for up to 50 ms (`RX_STALL_US`), as an 802.11b/g link without A-MPDU would:
-about 30 Mbit/s of 1500-byte frames at best, below the board's 36. An SMB upload in 4b meets that
-pacing, and the station's transmit side, before it meets the SDIO link.
+about 30 Mbit/s of 1500-byte frames at best, below the board's 36. oxidrive's SMB upload meets
+neither this pacing nor the SDIO link first: at about 0.55 MB/s it is most likely held by the
+NAT's 5840-byte TCP window ("Services", "Upload throughput").
 
 ### Faults
 
@@ -968,6 +971,177 @@ are the eight of "Compared with a board" (the core dump, the heap 108 bytes lowe
 geometry, the journal and the configuration, the die temperature), the configuration's effects
 (no car paired, no syslog, the placeholder addresses), and the network: the SSID and address
 in the WiFi line, the NAS reachable on the board, MQTT's session up there and refused here.
+With the services of milestone 4b behind forwards the NAS is reachable and the session comes up
+here too ("Services").
+
+## Services
+
+Milestone 4b puts real servers behind the virtual network: mosquitto as the MQTT broker and
+samba's smbd as the NAS, run unprivileged on 127.0.0.1 from a directory of their own per test,
+and reached from the P4 through ESP-Hosted, the C6's radio, the virtual access point and two TCP
+forwards. `tests/services.rs` starts them (`Mosquitto::start`, `Samba::start`), waits until
+each accepts a connection, and stops each with its process group when dropped (SIGTERM, then
+SIGKILL after 5 s: smbd's parent stops its children on SIGTERM, a SIGKILL to it alone would leave
+them). `external_samba_and_mosquitto_serve_a_test_client` checks both with their own clients.
+
+**Installing them.** macOS: `brew install samba mosquitto`. Homebrew installs smbd as
+`/opt/homebrew/opt/samba/sbin/samba-dot-org-smbd`; `/usr/sbin/smbd` is the system's own SMB
+server and is never used. Linux (Debian, Ubuntu): `apt install samba mosquitto
+mosquitto-clients`, `/usr/sbin/smbd`; the configurations below should serve unchanged, but have
+only been run on macOS. `SMBD`, `PDBEDIT`, `SMBCLIENT`, `MOSQUITTO`, `MOSQUITTO_PASSWD`,
+`MOSQUITTO_SUB` and `MOSQUITTO_PUB` override the paths.
+
+**samba** (`services::samba_conf`), samba 4.25:
+
+```ini
+[global]
+  smb ports = PORT                      # unprivileged; the forward maps 445 to it
+  bind interfaces only = yes
+  interfaces = 127.0.0.1
+  server role = standalone server
+  server min protocol = SMB2_10
+  server max protocol = SMB3_11         # oxidrive's libsmb2 negotiates 3.1.1, signed
+  server signing = mandatory
+  map to guest = never
+  passdb backend = tdbsam:DIR/private/passdb.tdb
+  username map = DIR/users.map          # UNIX_USER = TEST_USER
+  private dir = DIR/private             # and lock, state, cache, pid, ncalrpc, log under DIR
+  vfs mkdir use tmp name = no
+  disable spoolss = yes
+  load printers = no
+[SHARE]
+  path = DIR/share
+  read only = no
+  valid users = UNIX_USER
+```
+
+samba keeps a password only for an account of the host, so the test user is mapped to the
+account running the test (`username map`), whose password entry `pdbedit -a -t` makes in the
+test's own passdb. `vfs mkdir use tmp name = no` is needed on macOS: samba 4.25 makes a
+directory under a temporary name with mode 0 and renames it into place, macOS refuses that rename
+(EACCES), and the client gets ACCESS_DENIED with a mode-0 directory left behind; oxidrive's
+`mkdir_p` then fails every clip. smbd runs with `--foreground --no-process-group`; its "tdb
+mutexes not available" warnings are harmless on macOS.
+
+**mosquitto** (`services::mosquitto_conf`), 2.1.2: `listener PORT 127.0.0.1`,
+`allow_anonymous false`, `password_file` made with `mosquitto_passwd -c -b`, `persistence false`.
+
+**The forward.** oxidrive's NAS probe connects to port 445 of its share's host whatever the URL
+says, so the share stays at port 445 for the firmware and a forward takes it to smbd's port
+(`--net none,fwd=...`, [networking-howto.md](networking-howto.md), "Forwarding a guest address to a
+host service"). With `none` everything else stays inside the virtual network: names resolve to
+10.0.2.3, SNTP answers from the fixed epoch, every other connection is refused, so a firmware
+cannot reach a real server it has built in.
+
+**oxidrive's provisioning.** `cli/tests/oxidrive_services.rs` makes the NVS partition from
+`OXIDRIVE_DIR/nvs.csv` as before; for these tests its SMB URL is `smb://10.0.2.100/SHARE` and its
+MQTT URL `mqtt://10.0.2.100:1883`, with the test accounts of the file (`esp32sim` / `esp32sim-smb`,
+`esp32sim` / `esp32sim-mqtt`). The test reads the two URLs from the CSV, starts the services, and
+forwards the guest addresses to them (a host name in a URL stands for 10.0.2.3). Neither the CSV
+nor anything the firmware publishes is in this repository; the device id in the topics comes from
+the board's MAC at test time. The P4's temperature sensor is register RAM, and oxidrive vetoes
+every window and every shared pass when it cannot read its die temperature, so the test seeds
+LP_TSENS's OUT field (0x5012F000 bits 7:0, `tsens_struct.h`) with 104, which IDF's driver reads as
+25 °C in the −10..80 °C range oxidrive asks for (0.4386 × 104 − 20.52, `temperature_sensor_ll.h`);
+its read-modify-writes of the other fields keep it.
+
+**The broker and the NAS** (`external_oxidrive_meets_its_broker_and_its_nas`). The station takes
+its lease at 6.81 s, and at 7.30 s the firmware finds the NAS (`senses: nas_reachable=true ...
+temp_c=Some(25)`), starts its MQTT client, and logs `session up` 3 ms later and `session ready,
+commands on oxidrive/<id>/cmd` at 8.33 s. A subscriber started by the test then receives the
+retained `oxidrive/<id>/avail` (`online`) and `oxidrive/<id>/state`, the firmware's JSON state
+document (`"nas":{"reachable":true}`, `"window":{"phase":"serving"}`, `"temp_c":25`, ...). 9 s of
+emulated time take 9.3 s on the host. The build seeds Home Assistant discovery on, so it also
+announces its sensors and buttons.
+
+**An archive window** (`external_oxidrive_archives_a_window`). The car of "USB" enumerates at
+0.27 s and records two saved events, `TeslaCam/SavedClips/<stamp>/event.mp4`, 2 MiB each as a
+4.1 MB/s camera writes them: directories three deep under long names and a clip whose top-level
+MP4 boxes are `ftyp`, `mdat` and `moov` (`fat32::mkdir_all`, `create_path`, `mp4_bytes`), which
+oxidrive's walkers need. It then idles, polling TEST UNIT READY every 2 s as udev polls a
+removable disk. oxidrive's own policy does the rest; `OXIDRIVE_FORCE_OPEN=1` publishes
+`force_open` instead, which is not needed:
+
+| t (s) | what happens |
+| --- | --- |
+| 60.3 | the first probe; a shared pass (oxidrive reading alongside the car, which keeps the card) uploads the older event and holds the newest back for one pass, as its archiver does |
+| 69.8 | the shared pass done: `.part` written, read back, renamed, the manifest (`.oxidrive-index.tsv`) written |
+| 70.8 | the card quiet for a minute: `supervisor: card taken for archiving` |
+| 71.3 | the car's poll: `sense 2/3a/00 (MEDIUM NOT PRESENT)` |
+| 70.8-79.7 | the window uploads the newer event (`1 uploaded, 1 already there`), `.part`, read-back, rename, manifest |
+| 79.7 | `supervisor: card returned to the car` |
+| 81.3 | the car's poll passes; it reads the volume again (a medium change) and records a third event |
+
+Afterwards fsck (`sd_image::fsck`: macOS's `fsck_msdos -n` or Linux's `fsck.fat -n` on the
+volume copied out of the image) passes, every clip reads back over USB and off the image as the
+car wrote it, both uploads on the share equal the card byte for byte, no `.part` is left, and the
+manifest lists both with their sizes and CRC-32s. The third event, written after the window, is
+not uploaded within the run. 86 s of emulated time take 179 s on the host.
+
+**Upload throughput.** The window test times each upload from the firmware's SMB log
+(`begin_part` to the `.part` size check after the last write, then the read-back and rename) and
+samples the station's frames and the NAT's bytes every 100 ms; `OXIDRIVE_WINDOW_CLIP_MIB` sizes
+the clip the window takes (the shared pass's stays at 2 MiB, and oxidrive paces that pass itself):
+
+| SD bus | window's clip | write | read back |
+| --- | --- | --- | --- |
+| at once | 8 MiB | 0.51-0.53 MB/s (3 runs) | 0.55 MB/s |
+| at once | 16 MiB | 0.54 MB/s | 0.55 MB/s |
+| timed (`OXIDRIVE_SD_TIMING=1`: the card and the SDIO link, as `--sd-timing`) | 8 MiB | 0.35 MB/s | 0.55 MB/s |
+| timed | 16 MiB | 0.35 MB/s | 0.55 MB/s |
+
+On a first boot oxidrive reads back every upload before it renames it, so its own figure
+(`window: 16777216 bytes in 61.6s = 0.27 MB/s end to end`) counts both directions. Its board
+uploads at about 2 MB/s on the same archiver path. What sets the emulator's
+rate, by experiment (one constant changed and the 8 MiB run repeated; none of these is
+committed):
+
+| change | write | read back | station frames a second while writing, out / in |
+| --- | --- | --- | --- |
+| none | 0.53 MB/s | 0.55 MB/s | 1003 / 2023 |
+| an MSS option (1400) in the NAT's SYN-ACK | 0.54 MB/s | 0.55 MB/s | 391 / 797 |
+| the access point's receive pacing at 100 µs instead of 400 µs | 0.55 MB/s | 0.62 MB/s | 1043 / 2098 |
+| the NAT's window at 16384 or 65535 instead of 5840 bytes | none: the first 1.5 MB write never completes | | |
+
+- **The NAT's window is the likeliest bound.** The NAT advertises at most 5840 bytes and scales
+  nothing, so each direction has at most 5840 bytes in flight whatever the firmware's lwIP
+  offers (65535 in this build, as on its board). Both directions run at about that window over a
+  10.7 ms round trip (5840 bytes at 0.54 MB/s), and the rate does not follow the segment size:
+  536-byte segments take 1003 frames a second, 1400-byte ones 391, for the same rate, so it is
+  not a per-packet cost. No CPU is saturated: while writing, P4 core 0 retires an instruction on
+  77% of its cycles, core 1 on 44%, the C6 on 28%; while reading back 40%, 66% and 8%. A
+  per-byte cost on core 0 is not ruled out. The direct test, a larger window, could not be made:
+  with 16384 or 65535 bytes the first write stalls (last row). Where the 10.7 ms go (the P4's and
+  the C6's ESP-Hosted queues, the C6's WiFi driver, the NAT's 500 µs host-socket poll) is not
+  measured yet. The servers answer in host time, so repeated runs differ by a few percent.
+- **The NAT's SYN-ACK carries no MSS option**, so lwIP keeps its initial send MSS of 536 bytes
+  (lwIP `tcp.c`, `INITIAL_MSS`, raised only by the option); a NAS sends one. Here it costs
+  frames, not rate.
+- **The ceilings "Throughput" names do not bind here.** The receive pacing, a frame per 400 µs
+  (2500 a second), is about 81% used while writing, by the two ACKs the NAT returns for each
+  segment, yet a quarter of the gap moves the write by 4% and the read-back by 12%. No frame was
+  dropped for want of a descriptor, and 802.11b/g without A-MPDU, about 30 Mbit/s of 1500-byte
+  frames, is far above 0.55 MB/s.
+- **The timed SD bus slows only the write** (0.53 to 0.35 MB/s): the upload reads the card on
+  slot 0 while its packets cross to the C6 on slot 1 of the same SDMMC host, so each card read's
+  wire time holds the SDIO link; the read-back touches no card and does not change. That is the
+  sharing "Timed SD transfers" below anticipated.
+- **Against the board's ~2 MB/s** the emulator's rate is not comparable yet: the NAT would need
+  the window the firmware asks for (with window scaling) and an MSS option first, and then the
+  round trip taken apart; the emulator also has no cache or PSRAM stalls. Raising the window
+  alone (last row) stalled the first write: libsmb2 waited 80 s for a reply, the firmware
+  recorded the radio dead (`err 0xffffffff x4 over 50s`) and its fail-safe restarted the P4. That
+  wants understanding before the window changes: a burst the 5840-byte window never let through
+  meets something on the way (the C6's buffers, the access point's queue, the NAT).
+
+**An update** (`external_oxidrive_refuses_an_unsigned_update`, goal 4, not passing). oxidrive
+fetches an update from the share and checks a signature only the owner's key makes, so the test
+can only exercise the refusal: a manifest with the image's true size, CRC-32 and SHA-256 and a
+signature no key made. The firmware checks the manifest, takes the card for the update, and then
+stops: it hashes the download with the SHA accelerator in DMA mode, which on the P4 runs through
+the AXI GDMA (IDF v5.5.3 `mbedtls/port/crypto_shared_gdma`, `SOC_AXI_GDMA_SUPPORTED`), not
+modelled, so SHA_BUSY (0x50091018) never clears and core 0 spins on it. The card stays with the
+application. mbedTLS's AES in DMA mode goes the same way on the P4.
 
 ## Compared with a board
 
@@ -998,7 +1172,8 @@ Eight blocks differ:
 - the firmware's journal and configuration, which the board's NVS holds from earlier boots and
   the emulator's blank flash does not: it reports a first boot, seeds a default and runs
   unconfigured (four blocks);
-- the die temperature: the temperature sensor is register RAM here.
+- the die temperature: the temperature sensor is register RAM here (the services test seeds a
+  reading, "Services").
 
 The board's lines from 93 on come through the C6 (WiFi, the clock, MQTT). With the C6 on slot 1
 (`--coproc`, "The co-processor", "oxidrive") the WiFi and clock lines are reached and 80 lines
@@ -1072,8 +1247,13 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
   a task that uses PIE.
 - **The co-processor**: native only; the SDIO link without timing by default and the slave
   without busy or read wait, CRC or suspend ("The co-processor"); faults are injected on the link
-  rather than arising from a model of the bus; the services behind the NAT that oxidrive wants
-  (MQTT, SMB) are milestone 4b.
+  rather than arising from a model of the bus. The services oxidrive wants are real servers on
+  the host, run by `external_` tests ("Services"); there is no in-process broker or SMB server, so
+  no golden reaches them, and `--usb-host` does not run with `--coproc` yet (a test drives the car
+  through `CoSim`'s `UsbPort`).
+- **The temperature sensor** (LP_TSENS) is register RAM: IDF's driver reads OUT as 0, which it
+  turns into −48 °C and ESP_FAIL. A model would give a fixed die temperature from OUT and the DAC
+  range the driver writes over regi2c; it is a `device_set!` entry and needs a CPU-time receipt.
 - **USB**: the full-speed OTG core (0x50040000) and USB_WRAP, host mode, the core's slave mode
   (the data FIFOs), descriptor DMA, isochronous and interrupt endpoints, LPM, the
   per-endpoint interrupt source (94), and the time a transaction takes inside the core: it
@@ -1103,58 +1283,77 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
   KEYMNG, UART2-4, TRACE0/1, LP_UART, LP_PERI, LP_GPIO and DSI, all configuration the firmware
   writes and reads back (`--log-periph` lists them). The watchdogs never fire.
 
-## Handoff: where milestone 4b starts
+## Handoff: where milestone 4c starts
 
-**Status.** Milestone 4a is done: the C6's SDIO slave (HINF, SLC, SLCHOST) and the I/O card a host
-sees, SDIO functions on the P4's SDMMC host with their interrupt on DAT1, the two machines in
-lock-step with the C6's EN on GPIO 54, `--coproc`, and IDF's station example reaching `got ip`
-through unmodified ESP-Hosted 2.12.13 on both chips (golden `hosted-p4`), ESP-Hosted's raw
-throughput test both ways (goldens `hosted_rawtp_rx`, `hosted_rawtp_tx`), and deterministic fault
-hooks on the link with ESP-Hosted's reaction to each pinned ("Faults"). oxidrive now brings its
-WiFi up through the C6, takes a lease, resolves the NTP pool and starts SNTP, then finds its
-services missing: the MQTT session is refused and the NAS is unreachable ("The co-processor",
-"oxidrive"). Milestones 1-3 are as described above.
+**Status.** Milestone 4b is done ("Services"): real servers on the host (mosquitto, samba's
+smbd) run by `tests/services.rs`, reached through guest-to-host TCP forwards (`--net
+none,fwd=...`, which keep everything else inside the virtual network); oxidrive provisioned for
+them, its MQTT session up with its retained availability and state, its NAS probe answered; an
+archive window end to end with a car that writes Tesla's directory tree (long names, three levels,
+MP4 clips): a shared pass and then a window upload through `.part`, read-back, rename and
+manifest, the car sees MEDIUM NOT PRESENT and gets the card back, its next clip lands, fsck is
+clean, and every clip and upload compares byte for byte; the upload rate measured (0.53 MB/s, 0.35
+with the SD bus timed) and explained as far as experiments go: not the access point's pacing,
+not a per-packet cost, most likely the NAT's 5840-byte window over a 10.7 ms round trip.
+`CoSim` is a USB host's port. Milestones 1-4a are as described above. Not done: the update
+refusal (goal 4) stops on SHA's DMA mode, which needs the P4's AXI GDMA ("An update").
 
-**What milestone 4b needs** ([esp32p4-plan.md](esp32p4-plan.md), "4. The co-processor"):
+**What milestone 4c needs**: the hazards of "The car, for archive windows" below, built into the
+car and run against oxidrive, and the measurements the firmware's shared-reading plan asks of the
+emulator (its section "Snapshot overlay: reviewed, reduced design", the "Experiments" table). The
+services test is the base for all of them (`cli/tests/oxidrive_services.rs`: `rig`, the car on
+`Rig`'s `UsbPort`, `upload_phases`, the samples).
 
-1. **Test services behind the NAT.** An MQTT broker and an SMB2 server the P4 reaches through the
-   C6, the virtual network and the NAT. Two shapes, not exclusive: a minimal SMB2 server (and a
-   broker) in process, next to `esp-soc/src/nat.rs`, which the virtual network answers for at a
-   fixed address and name, deterministic and usable by goldens and CI; or a containerised samba
-   and mosquitto on the host, reached with `--net nat`, for `external_` tests against a real
-   server. An upload most likely needs NEGOTIATE, SESSION_SETUP (NTLMSSP), TREE_CONNECT,
-   CREATE, WRITE, CLOSE and QUERY_INFO; a trace of the firmware's SMB2 client and a capture
-   against a real samba say which, before a server is written. The address goes in the
-   provisioning, not in the repository.
-2. **oxidrive provisioning.** `oxidrive_board::nvs_image` already makes the firmware's NVS
-   partition at test time from `OXIDRIVE_DIR/nvs.csv`: point its SMB and MQTT entries at the
-   services, with test credentials the services accept. The CSV stays beside the images; nothing
-   derived from the firmware, its NVS or its capture is committed.
-3. **Then the archive window**, with the car of "The car, for archive windows" below (items 1-4):
-   oxidrive takes the card from the car (TEST UNIT READY: MEDIUM NOT PRESENT), uploads a clip to
-   the SMB server, gives the card back, and the car's next writes land intact; afterwards fsck the
-   image and compare every clip, and check the upload on the server byte for byte.
-4. **Throughput honesty.** An SMB upload through the C6 meets the virtual access point's receive
-   pacing first, not the SDIO link ("Throughput"): one frame per 400 µs of airtime, none while the
-   last descriptor filled is unrecycled for up to 50 ms, 802.11b/g with no A-MPDU, about
-   30 Mbit/s at best. The upload's TCP ACKs come back that way. Compare with the board's 2 MB/s
-   only once both are understood, as for the USB rate; pass `--net ...,epoch=` so the runs are
-   reproducible (NTLMv2 timestamps, TLS validity and MQTT keepalives read the clock).
-5. **The owner's radio wedge.** A one-shot stub that makes the P4's `hosted_malloc_align`
-   (esp_hosted's `port_esp_hosted_host_os.c`) return NULL at its Nth call would reproduce the
-   board's wedge chain end to end; today's stubs return a value on every call, so it needs a
-   counted, one-shot stub in the machine (medium effort). The fault hooks show where such a chain
-   ends: a wedged slave or a lost DAT1 edge stalls ESP-Hosted silently ("Faults").
+1. **A car that writes into a window** (item 1 below): WRITE(10)s queued chunk after chunk until a
+   command fails or a poll says NOT READY, instead of today's car, which writes only between polls
+   that passed. esp_tinyusb's callbacks let those writes reach the card under the application's
+   FatFs; fsck and the clip comparison say what that costs.
+2. **A caching FAT layer** (item 2): the car keeps its FAT and directories (`fat32::Fat32` and what
+   it read) across polls and reads the volume again only after a NOT READY then READY, or a UNIT
+   ATTENTION; then fsck and compare. Today's test remounts after the change it saw.
+3. **Windows shorter than the poll** (item 3): the window here held the card 8.9 s and the car,
+   polling every 2 s, saw it; a car polling every 5 s, or a window of a small clip, will not. It
+   matters where the application writes the card in a window: reclaim's deletions, FatFs's FSInfo.
+4. **Writeback realism** (item 4): data in page-cache batches, the FAT and directory sectors held
+   and written back late and out of order, intermediate entry sizes, FSInfo at sync, torn files
+   from the previous boot, with the parameters of the firmware's `testkit::sim` writeback model
+   (its `WritebackCfg`: the flusher interval, the share of metadata held back past its data, how
+   long it trails). Count the torn clips each completeness rule accepts.
+5. **Car write latency under a shared reader**: the car at 4 MB/s with a programming time
+   (`--sd-prg-us`, `SdCardConfig::prg_ns`) while a shared pass runs, and the per-WRITE(10)
+   latency distribution for reader chunks of 16, 32, 64 and 128 KiB. `Msc` would record each
+   command's time; the reader's chunk is the firmware's. The emulator runs one instruction a
+   cycle with no cache or PSRAM stalls, so these are lower bounds. A reader's CMD18 that meets
+   the card programming gets no response (0x107, status 0x400e00; "The card").
+6. **The first epoch after a mount**: the car's fsck at mount racing the firmware's first shared
+   pass after boot, and a USB reset without power loss (`UsbHost::reset_device`) with the car's
+   fsck rewriting FAT1 in bulk.
+7. **The network under the firmware**: the NAT's window and window scaling, an MSS option in its
+   SYN-ACK, and the round trip taken apart (where the 10.7 ms go) before the rate is compared
+   with the board's; first why a window of 16384 or 65535 bytes stalls the first 1.5 MB write
+   ("Upload throughput").
+8. **The AXI GDMA** for SHA's (and AES's) DMA mode, which the update path and TLS need, then
+   `external_oxidrive_refuses_an_unsigned_update` should pass.
+9. **The temperature sensor** as a model rather than the test's seeded register: a fixed die
+   temperature from LP_TSENS OUT and the DAC range the driver writes over regi2c. After a P4
+   restart the seed is gone and oxidrive vetoes every window again.
+10. **The owner's radio wedge** (carried from 4b's plan): a one-shot stub that makes the P4's
+   `hosted_malloc_align` (esp_hosted's `port_esp_hosted_host_os.c`) return NULL at its Nth call
+   would reproduce the board's wedge chain end to end; the fault hooks show where such a chain
+   ends ("Faults").
 
 **Timed SD transfers** are there (`--sd-timing`). oxidrive's 11.0 MB/s with them against its
 board's 10.9 MB/s is a coincidence, not a calibration ("USB", "Throughput"): the card's
 programming time is 0 and cache and PSRAM stalls are not modelled. The card's read access time
 and its programming time per block (`--sd-prg-us` is per write; measure it on a card first) are
-what is left; an archive window's reads of the card on slot 0 and ESP-Hosted's traffic on slot 1
-will share the one host, so timing both slots matters there.
+what is left. An archive window's reads of the card on slot 0 and ESP-Hosted's traffic on slot 1
+share the one host, and timing both slots takes the upload from 0.53 to 0.35 MB/s ("Upload
+throughput").
 
-**The car, for archive windows.** The car here checks the drive between commands. What a window
-needs from it, and what the sources say a window will meet:
+**The car, for archive windows.** The car here checks the drive between commands. Milestone 4b
+gave it Tesla's tree (directories, long names, MP4 clips: `fat32::mkdir_all`, `create_path`,
+`mp4_bytes`) and nothing of the list below. What a window needs from it, and what the sources say a
+window will meet:
 
 1. A car that keeps writing into a window: queued WRITE(10)s, chunk after chunk, until a command
    fails or a poll says NOT READY, rather than stopping at the next poll. esp_tinyusb's default

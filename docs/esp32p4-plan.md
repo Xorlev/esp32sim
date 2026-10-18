@@ -1,14 +1,15 @@
 # ESP32-P4 — plan
 
-Status: milestone 4a done, 4b next. hello_world boots to `app_main` on one and on both
+Status: milestones 4a and 4b done, 4c next. hello_world boots to `app_main` on one and on both
 cores and reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr counters,
 CLIC mode and two harts. The SDMMC host and an SD card carry IDF's sdmmc example through a FAT32
 mount. The high-speed USB-OTG core presents the card to a host written in Rust, which records a
 clip on it like a car; oxidrive enumerates to that car and the clip lands intact. An emulated C6
 on SDIO runs unmodified ESP-Hosted slave firmware in lock-step with the P4: IDF's WiFi station
-example takes a lease through it, and oxidrive brings its WiFi up and stops at its services, MQTT
-and SMB ([esp32p4.md](esp32p4.md), "The co-processor", which also lists where its console still
-differs from the board's). Tracks [#215](https://github.com/mikroverk/esp32sim/issues/215).
+example takes a lease through it, and oxidrive reaches a real MQTT broker and SMB server on the
+host through it and runs an archive window against the car end to end ([esp32p4.md](esp32p4.md),
+"The co-processor" and "Services"; the former also lists where its console still differs from the
+board's). Tracks [#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:
 the real mask ROM, the real 2nd-stage bootloader and an unmodified ESP-IDF image, checked
@@ -129,8 +130,14 @@ car's next writes landing intact.
   throughput test both ways (goldens `hosted_rawtp_rx`, `hosted_rawtp_tx`); deterministic fault
   hooks on the link with ESP-Hosted's reaction to each; oxidrive's WiFi comes up (esp32p4.md,
   "The co-processor").
-- **4b**: an MQTT broker and an SMB2 server behind the NAT, oxidrive provisioned for them, then
-  the archive window (esp32p4.md, "Handoff: where milestone 4b starts").
+- **4b, done**: mosquitto and samba on the host (`tests/services.rs`), reached through guest-to-host
+  forwards (`--net none,fwd=...`); oxidrive provisioned for them; its MQTT session, retained state
+  and NAS probe; an archive window with the car writing Tesla's directory tree: MEDIUM NOT PRESENT
+  to the car, the clip uploaded through `.part`, rename and manifest, the card back, the car's next
+  clip intact, fsck clean, every clip and upload compared; the upload rate measured and explained;
+  an unsigned update refused (esp32p4.md, "Services").
+- **4c**: the car's hazards in archive windows and the shared-reading measurements
+  (esp32p4.md, "Handoff: where milestone 4c starts").
 
 BLE is not modelled (see the roadmap); firmware that uses it must tolerate a controller that
 never answers.

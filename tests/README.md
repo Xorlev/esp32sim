@@ -53,6 +53,17 @@ Tests named `external_*` need inputs only a developer machine has (full objdump 
 without them; run them by name. Their hermetic counterparts (`decoder_matches_corpus`,
 `encodings_match_fixture`) run in the default suite against checked-in oracles.
 
+`tests/services.rs` runs real servers for `external_` tests: mosquitto and samba's smbd, each
+unprivileged on 127.0.0.1 from a directory of its own, in a process group stopped when the
+fixture is dropped (setup in [esp32p4.md](../docs/esp32p4.md), "Services"). Its own tests run
+everywhere with `sh` and `sleep` (readiness, early exit, timeout, the group gone after the drop,
+the configurations); `external_samba_and_mosquitto_serve_a_test_client` needs the servers.
+`cli/tests/oxidrive_services.rs` uses it for the owner's oxidrive firmware (`OXIDRIVE_DIR`):
+its broker and NAS, an archive window with the car, and an unsigned update refused.
+`sd_image::fsck` checks a card image's volume with the system's FAT checker (`fsck_msdos -n`,
+`fsck.fat -n`, or `FSCK_FAT`); `external_fat32_tree_passes_fsck` holds the car's long-name and
+directory writes to it.
+
 Use `--release`: the debug build runs the same scenarios ~30x slower. On a mismatch the actual
 output is left next to the golden as `*.actual` for diffing.
 
