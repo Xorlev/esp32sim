@@ -1,8 +1,10 @@
 # ESP32-P4 — plan
 
-Status: milestone 1 in progress. hello_world boots to `app_main` on one and on both cores and
-reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr counters, CLIC mode
-and two harts; oxidrive stops at its first SDMMC access ([esp32p4.md](esp32p4.md)). Tracks
+Status: milestone 2 done, milestone 3 next. hello_world boots to `app_main` on one and on both
+cores and reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr counters,
+CLIC mode and two harts. The SDMMC host and an SD card carry IDF's sdmmc example through a FAT32
+mount, and oxidrive probes its card at 4 bits and 40 MHz, logs its geometry and stops at USB-OTG
+([esp32p4.md](esp32p4.md), which lists where its console still differs from the board's). Tracks
 [#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:
@@ -85,7 +87,9 @@ from `0x800`) and an SD card model behind it, backed by an image file: CMD0/8/55
 initialisation, 4-bit at 40 MHz, single- and multi-block reads and writes through the IDMAC.
 Slot 1 of the same host carries ESP-Hosted in milestone 4, so the host is written for two slots.
 
-Done when oxidrive probes a FAT32 image at 4 bits and 40 MHz and logs its geometry.
+Done when oxidrive probes a FAT32 image at 4 bits and 40 MHz and logs its geometry. Done: the
+host in `esp-periph/src/sdmmc.rs`, the card in `sdmmc/card.rs`, `--sd`/`--sd-rw`, golden
+`sdcard-p4` (esp32p4.md, "SD card").
 
 ### 3. USB device and the car
 

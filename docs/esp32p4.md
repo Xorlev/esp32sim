@@ -3,7 +3,8 @@
 The fourth chip, and the first with two RISC-V cores: silicon **rev < 3** (v0.x, v1.x), as on the
 Waveshare ESP32-P4-WIFI6 (v1.0) the plan targets ([esp32p4-plan.md](esp32p4-plan.md), milestone 1).
 Unmodified ESP-IDF firmware boots from the real mask ROM, through the real 2nd-stage bootloader,
-into FreeRTOS on one or both cores.
+into FreeRTOS on one or both cores, and reaches an SD card in the board's socket through the
+SDMMC host (milestone 2, "SD card" below).
 
 ```sh
 cargo build --release
@@ -84,7 +85,7 @@ edge.
 
 The core's P4 paths cost the other chips nothing, measured against cdbbe33d (the F extension
 alone) with `cargo build --release --bins`, alternating runs, median `user` time, identical
-instruction counts:
+instruction counts (the SD card's receipt is in "SD card" below):
 
 | demo | runs | cdbbe33d | this branch | instructions |
 | --- | --- | --- | --- | --- |
@@ -93,23 +94,200 @@ instruction counts:
 | `c6-hello` (30 s) | 7 | 5.59 s | 5.63 s | 4,800,000,000 |
 | pocket-tank (8 s) | 5 | 13.92 s | 13.98 s | 1,113,634,993 + 1,490,529,616 |
 
+## SD card
+
+`--sd IMAGE` puts a card holding the image in the reference board's SD socket; `--sd-rw IMAGE`
+does the same and writes through to the file, where `--sd` keeps what the firmware writes in
+memory and never modifies the file. ESP-IDF v5.5.3's own sdmmc example
+(`examples/sd_card-p4`, golden `sdcard-p4`) mounts a FAT32 card through it, writes `hello.txt`,
+renames it, reads it back and unmounts:
+
+```sh
+./target/release/esp32sim-p4 --flash-mb 2 --bootloader $FW/p4-sdcard-bootloader.bin \
+    --ptable $FW/p4-hello-ptable.bin --app $FW/p4-sdcard.bin --sd-rw card.img --max-seconds 1
+```
+
+```
+I (87) example: Filesystem mounted
+Name: SIMSD
+Type: SDHC
+Speed: 20.00 MHz (limit: 20.00 MHz)
+Size: 64MB
+CSD: ver=2, sector_size=512, capacity=131072 read_bl_len=9
+SSR: bus_width=4
+I (87) example: Read from file: 'Hello SIMSD!'
+I (87) example: Card unmounted
+```
+
+The golden's card is a 64 MiB image the test lays out by hand (`tests/sd_image.rs`: an MBR,
+FAT32 from LBA 2048), so its bytes are the same on every host; afterwards the test reads
+`FOO.TXT` and `NIHAO.TXT` back from it. A blank image ends in `Failed to mount filesystem`
+(the example does not format) and an empty socket in `ESP_ERR_TIMEOUT`, the card's commands
+timing out (`sd_card_p4_unformatted_and_absent`).
+
+### The host
+
+The SDMMC block (0x50083000) is Synopsys' DesignWare Mobile Storage Host with Espressif's
+wrapper from 0x800. It is modelled once, in `esp-periph/src/sdmmc.rs`, for the chips that carry
+the core: the ESP32 and S3 have the same registers below 0x200 and a CLOCK register at 0x800
+(`SdmmcLayout`); only the P4 is wired. Sources are IDF v5.5.3
+`soc/esp32p4/register/hw_ver1/soc/sdmmc_struct.h` and `sdmmc_reg.h`, and what the driver does
+with them, `esp_driver_sdmmc/src/sdmmc_host.c` and `sdmmc_transaction.c`,
+`hal/esp32p4/include/hal/sdmmc_ll.h`.
+
+A command runs to completion in the register write that starts it (the bus calls
+`Sdmmc::run` after any write that left one pending): the response, CMD_DONE, the whole data
+phase through the IDMAC, DATA_OVER and the auto-stop. Nothing on the bus takes emulated time.
+
+| register | modelled |
+| --- | --- |
+| CTRL 0x00 | controller, FIFO and DMA reset (bits 0-2) clear at once; the controller and DMA resets abort a transfer; INT_ENABLE (4) gates the controller's interrupt; DMA_ENABLE, USE_INTERNAL_DMA (25) read back |
+| CLKDIV, CLKSRC, CLKENA, TMOUT, FIFOTH, DEBNCE, USRID, UHS, RST_N, EMMCDDR, ENSHIFT | read back from their reset values; the card clock is not checked |
+| CTYPE 0x18 | 1, 4 or 8 lines per slot; a data phase on other lines than the card drives fails every block's CRC (DCRC) |
+| BLKSIZ, BYTCNT | block and transfer size, 512 after reset |
+| INTMASK, MINTSTS, RINTSTS | MINTSTS is RINTSTS & INTMASK; RINTSTS is write-1-to-clear |
+| CMDARG, CMD 0x2C | START (31) stays set until the command is taken; a clock-update command (UPDATE_CLK_REG, 21) is taken at once without CMD_DONE; STOP_ABORT ends a transfer; SEND_AUTO_STOP sends CMD12 after the data |
+| RESP0-3 | a short response in RESP0, an R2 in RESP0-3 (bit 0 first), the auto-stop's in RESP1 |
+| STATUS 0x48 | FIFO empty, below the transmit watermark, command FSM idle, DAT3 high with a device on the slot, DATA_BUSY from the card, the index of the last response |
+| CDETECT, WRTPRT 0x50, 0x54 | the GPIO matrix's card-detect and write-protect inputs of each slot (below) |
+| TCBCNT, TBBCNT | bytes moved to or from the card, and through the FIFO |
+| VERID, HCON | 0x5432270A and HCON's field reset values |
+| BMOD, PLDMND, DBADDR, IDSTS, IDINTEN, DSCADDR, BUFADDR | the IDMAC (below) |
+| CARDTHRCTL 0x100 | BUSY_CLR_INT_EN (1): BCI (RINTSTS 13) once the card that took a write releases DAT0 |
+| CLK_EDGE_SEL, RAW_INTS, DLL_CLK_CONF, DLL_CONF 0x800-0x80C | CLK_EDGE_SEL from its reset value; RAW_INTS reads RINTSTS (a guess: the header says only "raw ints"); DLL_CONF reports DLL_CAL_END |
+
+A command to a slot with nothing on it, or one the card does not answer, sets RTO with CMD_DONE.
+A data error sets its bit (DRTO when the card sends nothing, DCRC, EBE when a write gets no CRC
+status) and DATA_OVER after it, as the core reports data-over after a data error, and the
+IDMAC's CES. The interrupt is source 23 (`ETS_SDIO_HOST_INTR_SOURCE`, include/soc/interrupts.h):
+`(CTRL.INT_ENABLE && MINTSTS) || (IDSTS & IDINTEN)`.
+
+The IDMAC walks descriptors in memory (`sdmmc_desc_t`, sdmmc_struct.h): chained (CH, DES3) or in
+a ring (the next 16 bytes plus BMOD's skip length, back to DBADDR after ER), one or two buffers
+each. A finished descriptor goes back to the CPU with OWN cleared and its other bits kept, and
+raises RI (reception) or TI (transmission) with NIS unless DIC is set. One the CPU still owns
+suspends the transfer with DU and AIS; a PLDMND write fetches it again. An address it cannot
+reach is a fatal bus error (FBE, AIS, FBE_CODE). It reaches L2MEM and PSRAM through its MMU, at
+cached or uncached addresses (`SOC_SDMMC_PSRAM_DMA_CAPABLE`); caches are not modelled. IDF's
+driver keeps four descriptors of up to 4 KiB in a ring and refills them from its interrupt
+handler, so a transfer over 16 KiB suspends on DU once per refill, which silicon only does when
+the CPU is slower than the card.
+
+**Slots and the socket.** A device hangs on pins, and the routing decides which slot reaches it,
+looked up when a command starts (`Peripherals::sd_routes`). Slot 0 is wired to its IO MUX pins,
+CLK 43, CMD 44, D0-D3 39-42 (`soc/esp32p4/include/soc/sdmmc_pins.h`): it reaches the socket
+while the clock pad selects function 0 (`FUNC_GPIO43_SD1_CCLK_PAD`, io_mux_reg.h). Slot 1 goes
+through the GPIO matrix: it reaches a device whose clock pad is a GPIO (function 1) driving
+`SD_CARD_CCLK_2_PAD_OUT_IDX` (gpio_sig_map.h). The `--sd` card sits on slot 0's pins, as on the
+reference board; IDF's example reaches it through slot 1 and the matrix (`SDMMC_HOST_DEFAULT()`
+is slot 1 on the P4), oxidrive through slot 0. ESP-Hosted's C6 (milestone 4) will be an
+`SdDevice` attached at CLK 18, CMD 19, D0-D3 14-17 (`Peripherals::attach_sd`), which slot 1
+reaches the same way; the trait already carries the SDIO interrupt (DAT1), unused so far.
+CDETECT and WRTPRT read `SD_CARD_DETECT_N_1/2` and `SD_CARD_WRITE_PRT_1/2` (signals 126, 127,
+130, 131) through FUNCn_IN_SEL: a pin's level or a constant, inverted if asked. The driver
+routes constant low to card detect and inverted constant high to write protect when the board
+has neither line, so a card counts as present on both slots.
+
+**Clocks, reset, pins, power.** HP_SYS_CLKRST's SOC_CLK_CTRL1.REG_SDMMC_SYS_CLK_EN (bit 14) and
+PERI_CLK_CTRL01/02 (the SDIO_LS clock source, enable and divider edges) read back, which is what
+`sdmmc_host_get_real_freq` computes the bus frequency from (160 MHz PLL / 8 = 20 MHz for the
+example, / 4 = 40 MHz for oxidrive); the clock gate is not checked. LP_CLKRST
+HP_SDMMC_EMAC_RST_CTRL.RST_EN_SDMMC (0x5011104C bit 28) resets the host's registers and leaves
+what is attached (lp_clkrst_reg.h). IO_MUX is register RAM; the driver only writes it. The card's
+on-chip LDO (channel 4, `sd_pwr_ctrl_by_on_chip_ldo.c` through `hal/esp32p4/include/hal/ldo_ll.h`)
+is PMU configuration the driver writes and never polls, register RAM here; its `ldo: The
+voltage value 0 is out of the recommended range` warning is IDF's own.
+
+**GPIO layout.** The P4 has 57 PIN registers from 0x74, which puts FUNCn_IN_SEL_CFG at 0x158 and
+FUNCn_OUT_SEL_CFG at 0x558, four bytes above the C6's (register/hw_ver1/soc/gpio_reg.h).
+`periph::GpioP4` moves both arrays down four bytes into the shared model, keeps PIN49-56 and
+OUT_SEL49-56 as register RAM, and resets FUNCn_IN_SEL to the header's values (0x3F, constant
+high, or 0x3E, constant low). Pin levels stay the shared model's 49.
+
+### The card
+
+`esp-periph/src/sdmmc/card.rs`, after the SD Physical Layer Simplified Specification v9.10:
+
+- **States** (§4.2, §4.3, the transitions of §4.8): idle, ready, ident, stby, tran, data, rcv,
+  prg, dis and ina. An R1 shows CURRENT_STATE as the command found the card, READY_FOR_DATA
+  cleared while programming (§4.10.1). A command that is not legal in the state, including the
+  SDIO commands 5, 52 and 53, is not answered and sets ILLEGAL_COMMAND for the next response;
+  the error bits clear with the response that reports them.
+- **Identification** (§4.2): CMD0; CMD8 echoes its check pattern for 2.7-3.6 V and stays silent
+  otherwise; CMD55 and ACMD41, busy for one poll, then ready with CCS. Without HCS, or without a
+  CMD8 since the reset, the card stays busy, as a high capacity card must (§4.2.3). CMD2 and CMD10
+  give the CID, CMD3 an RCA (R6), CMD9 the CSD, CMD7 selects and deselects (R1b), CMD4 and CMD15.
+- **Registers** (chapter 5): CID with MID 0, OID "ES", product "SIMSD", revision 1.0, a serial
+  number derived from the image size and 2024-01; CSD version 2.0 with C_SIZE from the image,
+  TAAC 1 ms, CCC 0x535 (classes 0, 2, 4, 5, 8, 10), TRAN_SPEED 25 MHz or 50 MHz once high speed is
+  switched on; both with their CRC7 (§4.5). SCR: SD 3.0x, security 2.00 (3.00 above 32 GiB),
+  1 and 4 lines, CMD23. SD status (ACMD13, §4.10.2): bus width, speed class 10, AU 4 MiB. OCR
+  2.7-3.6 V, no 1.8 V.
+- **Transfer** (§4.3): CMD6 check and switch (§4.3.10; group 1 offers default and high speed),
+  ACMD6 bus width, CMD13, CMD16 (blocks stay 512 bytes), CMD17 and CMD18 reads, CMD24 and CMD25
+  writes, CMD12, CMD23 block count, ACMD22 written blocks, ACMD23 and ACMD42 accepted, CMD32, CMD33
+  and CMD38 erase (erased blocks read 0). A start address past the end answers OUT_OF_RANGE and
+  moves no data; a multi-block transfer that runs past it stops there.
+- **Time.** The card answers at once. ACMD41 reports busy once (`SdCard::init_polls`).
+  Programming after a write or an erase is instant; `SdCard::prg_polls` holds the card in prg
+  for that many status polls (CMD13 or the host's DAT0 check), for a test or a later timing
+  model.
+- **Image.** A card of the image's size rounded down to 512 KiB (C_SIZE's unit), from 512 KiB to
+  2 TiB, held by an `SdStore`: `FileStore` (copy-on-write or write-through) or `MemStore`. The
+  card stays in the socket through a chip reset, with its state; IDF's init resets it with CMD0.
+- **Not modelled**: SDSC (byte addresses, CSD 1.0), UHS-I and CMD11, DDR, eMMC, lock and unlock,
+  write protection, the PIO data FIFO at 0x200, the card-detect interrupt, timing.
+
+`--debug sdmmc` prints every command, its response and the card's state. The run's report adds
+the commands, the unanswered ones and the bytes moved.
+
+The SD card costs the other chips nothing: it is new code the P4 alone calls, plus a default
+method on `SocBus` and a load kind (8) for the browser build. Measured against b31a21de with
+`cargo build --release --bins`, alternating runs, median `user` time, identical instruction
+counts:
+
+| demo | runs | b31a21de | this branch | instructions |
+| --- | --- | --- | --- | --- |
+| S3 `hello` (30 s) | 7 | 0.38 s | 0.38 s | 11,990,488 + 6,798,360 |
+| `c3-hello` (30 s) | 7 | 3.80 s | 3.79 s | 4,800,000,000 |
+| `c6-hello` (30 s) | 7 | 5.58 s | 5.53 s | 4,800,000,000 |
+| `p4-hello` (27 s) | 7 | 17.47 s | 17.36 s | 9,720,000,000 + 0 |
+| `p4-hello-smp` (27 s) | 7 | 18.41 s | 18.24 s | 9,720,000,000 + 9,713,148,105 |
+| pocket-tank (8 s) | 5 | 13.98 s | 13.99 s | 1,113,634,993 + 1,490,529,616 |
+
+The P4 runs pay one flag test per peripheral write and a few compares per GPIO and SDMMC
+access; nothing in the change makes them faster, so the 0.6-0.9% they gained is most likely
+code layout.
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,
 partition table and app as a board whose console was captured, with the bootloader's flash mode
-set to QIO as espflash wrote it, 32 MB of flash and 32 MB of PSRAM, both cores.
-`external_oxidrive_console_matches_the_board` (`OXIDRIVE_DIR` names the images and the capture;
-the board's MAC comes from there, not from this repository) compares the two with timestamps
-stripped. 49 of the board's 105 lines match, among them the twelve `hex_psram` mode-register
-lines, the MSPI timing tuning, `Found 32MB PSRAM device`, `cpu_start: Multicore app`, the
-application information, the heap regions, `spi_flash: flash io: qio` and the ESP-Hosted
-start-up. Three differ by construction, because the ECO0 ROM stands in for the board's ECO2:
-the banner pair, and the heap region below the ROM's own data, whose length IDF takes from the
-ROM's `ets_rom_layout` (`_dram0_rtos_reserved_start` is 0x4FF3FBA4 in the ECO0 ELF, and 12 bytes
-later on the board). The run then stops at the firmware's first SDMMC access: `sdmmc_host_reset`
-waits for the host's CTRL reset bits (0x50083000) to clear, they never do, it calls
-`vTaskDelay` before the scheduler runs, and that panics. The SD card host is the plan's
-milestone 2.
+set to QIO as espflash wrote it, 32 MB of flash and 32 MB of PSRAM, both cores, and a FAT32 card
+in the socket: a 4 GiB image laid out as a card formatter lays out an SDHC card (MBR, FAT32 from
+LBA 2048, 32 KiB clusters). `external_oxidrive_console_matches_the_board` (`OXIDRIVE_DIR` names
+the images and the capture; the board's MAC comes from there, not from this repository)
+compares the two with timestamps stripped, line by line, picking the comparison up again after
+lines that differ. 67 of the board's 105 lines match, among them the twelve `hex_psram`
+mode-register lines, the MSPI timing tuning, `Found 32MB PSRAM device`, `cpu_start: Multicore
+app`, the application information, the heap regions, `spi_flash: flash io: qio`, the ESP-Hosted
+start-up and the firmware's own start-up lines. Three differ by construction, because the ECO0
+ROM stands in for the board's ECO2: the banner pair, and the heap region below the ROM's own
+data, whose length IDF takes from the ROM's `ets_rom_layout` (`_dram0_rtos_reserved_start` is
+0x4FF3FBA4 in the ECO0 ELF, and 12 bytes later on the board). Four blocks differ:
+
+- the board's flash held a core dump, the emulator's coredump partition is blank: one line
+  where the board prints three;
+- the firmware's free heap at start is 108 bytes lower than the board's (open; ESP-Hosted's
+  SDIO link, which has no slave on slot 1 and sends it no command in this run, is the first
+  place to look);
+- the card lines: the firmware probes the card through slot 0 at 4 data lines and 40000 kHz,
+  as the board does, and reports the image's size, serial number and FAT geometry, not the
+  board card's;
+- the run then reaches USB-OTG: TinyUSB's `check_dwc2` reads 0 from GSNPSID and asserts, and the
+  board's remaining 30 lines (the USB mass storage presentation onwards) do not come.
+
+The run is idle from there to the end of its 3 s.
 
 ## What the bring-up found
 
@@ -132,7 +310,7 @@ milestone 2.
 | CPU | two RV32IMAFC cores (`Cpu::new_esp32p4`, `misa` 0x40001125): F with the lazy FPU traps, EXT_ILL, Zicntr, CLIC mode, `mhartid`; core 1 held in reset until HP_SYS_CLKRST releases it. Xesppie and the hardware loops decode as illegal |
 | Memory | 128 KB mask ROM at 0x4FC00000 (reset vector), 768 KB L2MEM at 0x4FF00000 and its uncached alias at 0x8FF00000, 8 KB TCM at 0x30100000, LP ROM (empty) and 32 KB LP RAM; flash (0x40000000) and PSRAM (0x48000000) windows behind two 1024-entry MMUs of 64 KB pages, reached through SPI_MEM_C / SPI_MEM_S item registers, with their uncached aliases |
 | Interrupts | both interrupt matrices (128 sources, rev < 3) and both CLIC register blocks, delivered through the cores' CLIC mode |
-| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG; everything else is register RAM, listed by `--log-periph` |
+| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`); everything else is register RAM, listed by `--log-periph` |
 | Time base | 360 MHz, the rev < 3 application clock; one instruction is one cycle |
 
 The revision is a type parameter (`esp32p4::Revision`, `RevLt3`): rev >= 3 (its own ROM, the
@@ -142,55 +320,54 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 
 ## Not there yet
 
-- **SDMMC, USB-OTG, ESP-Hosted, AXI-DMA, the LP core**: milestones 2 to 4 of the plan.
+- **USB-OTG, ESP-Hosted, AXI-DMA, the LP core**: milestones 3 and 4 of the plan.
   Xesppie's save and restore, which FreeRTOS runs only for a task that uses PIE.
-- **GPIO** uses the shared model at the C6's register offsets; the P4's FUNCn_IN_SEL and
-  FUNCn_OUT_SEL arrays sit 4 bytes higher and it has 55 pins. Configuration reads back, so the
-  console is unaffected; pin-level boards need the layout parameter.
+- **GPIO** has the P4's register layout (`periph::GpioP4`), but pin levels, interrupts and edges
+  are the shared model's 49 pins; the P4 has 55.
 - **`--boot app`** maps the image and jumps to it without the clocks and caches the bootloader
   would have set.
 - **`Machine::run_until_cycle`** still schedules core 0 alone; nothing that drives the P4 needs it.
 - **Unmodelled blocks** hello_world touches: PMU, PVT, APB_SARADC, LP_WDT, LP_ANA_PERI, LP_ADC,
-  KEYMNG, UART2-4, TRACE0/1, SDMMC, LP_UART, LP_PERI, LP_GPIO and DSI, all configuration the
-  firmware writes and reads back (`--log-periph` lists them). The watchdogs never fire.
+  KEYMNG, UART2-4, TRACE0/1, LP_UART, LP_PERI, LP_GPIO and DSI, all configuration the firmware
+  writes and reads back (`--log-periph` lists them). The watchdogs never fire.
 
-## Handoff: where milestone 2 starts
+## Handoff: where milestone 3 starts
 
-**Status.** Milestone 1's boot is done: the ROM, the bootloader and FreeRTOS run on one or both
-cores, `esp_restart()` comes back through the ROM, and the goldens `hello-p4`, `hello-p4-reboot`
-and `hello-p4-smp` pin it. The core has F (lazy FPU traps), Zicntr, CLIC mode and two harts.
-What milestone 1 still lacks is oxidrive matching the board through its first SD card access.
+**Status.** Milestone 2 is done: the SDMMC host, its IDMAC and an SD card behind it carry IDF's
+own sdmmc example through mount, write, rename, read and unmount (golden `sdcard-p4`), and
+oxidrive probes its card at 4 bits and 40 MHz through slot 0 and logs the FAT32 geometry, as on
+the board ("Compared with a board").
 
 **Where oxidrive stops.** `OXIDRIVE_DIR=<images> ESP32SIM_ROM_DIR=<roms> cargo test --release -p
-esp32p4 --test oxidrive -- --ignored external_ --nocapture` reports 49 of 105 board lines
-matching, then a panic. The firmware initialises the SD host before the scheduler runs (the board
-later logs `sdmmc_host_init: SDMMC host already initialized` from the card's path, so this first
-initialisation is presumably ESP-Hosted's SDIO transport): `sdmmc_host_init` calls `sdmmc_host_reset`, which sets CTRL's
-controller, DMA and FIFO reset bits at 0x50083000 and waits for the hardware to clear them
-(IDF v5.5.3 components/esp_driver_sdmmc/src/sdmmc_host.c:126-160,
-hal/esp32p4/include/hal/sdmmc_ll.h:398-449). SDMMC is register RAM here, so they never clear;
-after 100 ms the loop calls `vTaskDelay`, which with no task running dereferences
-`pxCurrentTCBs[0]` = NULL and takes a load access fault at mtval 0x14. The board's next line is
-`W (674) i2c: This driver is an old driver, ...`.
+esp32p4 --test oxidrive -- --ignored external_ --nocapture` reports 67 of 105 board lines
+matching and every divergent block. After the card the firmware brings up TinyUSB (0.21.0~1, the
+`espressif__tinyusb` managed component) on its high-speed port, rhport 1: the DWC2 core at
+0x50000000, interrupt source 93 (`ETS_USB_OTG_INTR_SOURCE`), 16 endpoints, a 1024-word FIFO,
+DMA mode (`src/portable/synopsys/dwc2/dwc2_esp32.h`). `dwc2_core_init` first checks GSNPSID
+(0x50000040) for a DWC2 ID (bits 31:16 0x4F54, `DWC2_OTG_ID` in `dwc2_type.h`); register RAM
+reads 0, so `check_dwc2`, `dwc2_core_init`, `dcd_init`, `tud_rhport_init` and `tusb_rhport_init`
+each print `ASSERT FAILED`, and the firmware goes on without USB. The board's next line is its
+USB mass storage stack coming up on the high-speed port.
 
-**What milestone 2 needs**, in the order the driver will ask for it
-([esp32p4-plan.md](esp32p4-plan.md), "2. SD card"):
+**What milestone 3 needs** ([esp32p4-plan.md](esp32p4-plan.md), "3. USB device and the car"):
 
-1. A DesignWare MSHC host at 0x50083000 (`sdmmc_struct.h`, `hal/esp32p4/include/hal/sdmmc_ll.h`;
-   the ESP32 and S3 carry the same core), with Espressif's wrapper from 0x800 (CLK_EDGE_SEL,
-   RAW_INTS 0x804, DLL_CLK_CONF 0x808, DLL_CONF 0x80C). First CTRL's reset bits clearing, then
-   CMD.start_command (bit 31) clearing once a command is taken (`sdmmc_ll_is_command_taken`),
-   starting with the clock-update commands (`update_clk_reg`), CDETECT reporting the card
-   (`card_detect_n` low for the slot), and RINTSTS/MINTSTS command-done, data-over and errors.
-2. Its interrupt: source 23 (`ETS_SDIO_HOST_INTR_SOURCE`, include/soc/interrupts.h), which
-   `esp_intr_alloc` routes through the interrupt matrix to a CLIC line; the chip's
-   `device_set!` table takes it like any other source.
-3. The IDMAC: DBADDR 0x88, IDSTS 0x8C, IDINTEN 0x90, descriptors and buffers in L2MEM or PSRAM,
-   moved by a pump in `esp32p4/src/bus.rs` the way the C6's GDMA pumps are.
-4. An SD card behind it, backed by an image file: CMD0/8/55/41/2/3/9/7/6 initialisation, 4 bits
-   at 40 MHz, single- and multi-block reads and writes. Two slots, because slot 1 is ESP-Hosted's
-   SDIO link in milestone 4.
-5. Clocks and pins as the driver touches them: HP_SYS_CLKRST's SDMMC clock and reset fields,
-   IO_MUX for slot 0's dedicated pins, and probably the GPIO layout parameter (above) for slot 1.
+1. The DWC2 core's identity: GSNPSID (IDF v5.5.3 `hal/esp32p4/include/hal/usb_dwc_ll.h` changes
+   its reset sequence from 4.20a, 0x4F54420A, upwards) and GHWCFG1-4 at 0x44-0x50
+   (`soc/esp32p4/include/soc/usb_dwc_struct.h`), which TinyUSB reads for the PHY type, endpoint
+   and FIFO counts.
+2. The core reset and FIFO flushes self-clearing (GRSTCTL CSFTRST, or CSFTRSTDONE from 4.20a,
+   AHBIDL, TXFFLSH/RXFFLSH), then device mode: the device registers, the endpoint registers and
+   the data FIFOs, with buffer DMA from L2MEM and PSRAM (the IDMAC's memory view in
+   `esp32p4/src/bus.rs` is the template).
+3. The UTMI PHY at 0x5009C000 and its clocks: HP_SYS_CLKRST SOC_CLK_CTRL1.REG_USB_OTG20_SYS_CLK_EN
+   and LP_AON_CLKRST HP_USB_CLKRST_CTRL1 (`hal/esp32p4/include/hal/usb_utmi_ll.h`).
+4. A host on the other end of the cable, written in Rust: enumeration, then SCSI over bulk-only
+   transport, reading and writing the card the firmware presents.
 
-`--log-periph` lists every SDMMC register the driver touches that the model does not answer.
+The SD card side is ready for it: the card image the car writes through the firmware is the
+`--sd` image, and `--sd-rw` keeps what it wrote. Slot 1 (ESP-Hosted, milestone 4) takes an
+`SdDevice` at its own pins (`Peripherals::attach_sd`, "Slots and the socket"). In the oxidrive
+run ESP-Hosted's transport starts its task (`H_SDIO_DRV: sdio_data_to_rx_buf_task started`, as
+on the board) and then sends no command on slot 1 in 3 s (`ESP_EMU_DEBUG=sdmmc` on the test, or
+`--debug sdmmc`, prints every command: all of them go to slot 0). What it waits for first, its
+slave's reset, a delay or a semaphore, is where milestone 4 starts.
