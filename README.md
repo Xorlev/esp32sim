@@ -59,7 +59,8 @@ esp32sim/
                   board/: atech14 / waveshare-cam / waveshare-lcd4b / waveshare-amoled18-v2 / none
   cli/            the `esp32sim` command line, every chip (`--chip`); `esp32sim-c3` / `esp32sim-c6` are alias binaries
   ── ESP32-C3 and ESP32-C6 (RISC-V, single core) ──
-  riscv-rv32/     RV32IMAC decoder (sampled objdump checks), interpreter, disassembler
+  riscv-rv32/     RV32IMAC decoder (sampled objdump checks), interpreter, disassembler; RV32F
+                  (soft-float) and its lazy-FPU traps for the ESP32-P4, behind misa.F
   esp32c3/        the C3 SoC: memory map, interrupt matrix, cache controller, RNG;
                   peripheral models shared with esp32s3 where the IP is identical
   esp32c6/        the C6 SoC: unified memory map and MMU, interrupt matrix + PLIC/INTPRI, L1 cache,

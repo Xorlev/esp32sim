@@ -20,7 +20,8 @@ pub enum Op {
     Mul, Mulh, Mulhsu, Mulhu, Div, Divu, Rem, Remu,
     // RV32A (the C6); `imm` carries the aq/rl bits for the disassembler
     LrW, ScW, AmoSwapW, AmoAddW, AmoXorW, AmoAndW, AmoOrW, AmoMinW, AmoMaxW, AmoMinuW, AmoMaxuW,
-    // RV32F; `imm` carries the rm field (funct3) of the computational ones, rs3 stays in `raw`
+    // RV32F; `imm` carries the rm field (funct3) of the computational ones, rs3 stays in `raw`.
+    // Kept last: `is_f` compares discriminants.
     Flw, Fsw,
     FmaddS, FmsubS, FnmsubS, FnmaddS,
     FaddS, FsubS, FmulS, FdivS, FsqrtS,
@@ -265,7 +266,10 @@ fn decode_compressed(pc: u32, c: u32, f: bool) -> Insn {
         // ---- quadrant 2
         // RV32C shamt[5] = 1 belongs to custom extensions, not the standard shifts.
         (2, 0) if c & (1 << 12) == 0 => mk(Op::Slli, rd, rd, 0, rs2 as i32, Comp::Slli),
-        (2, 2) if rd != 0 => mk(Op::Lw, rd, 2, 0, lwsp_off(c), Comp::Lwsp),
+        (2, 2) if rd != 0 => {
+            let imm = ((((c >> 12) & 1) << 5) | (((c >> 4) & 7) << 2) | (((c >> 2) & 3) << 6)) as i32;
+            mk(Op::Lw, rd, 2, 0, imm, Comp::Lwsp)
+        }
         (2, 3) if f => mk(Op::Flw, rd, 2, 0, lwsp_off(c), Comp::Flwsp),   // f0 is a valid destination
         (2, 4) => match ((c >> 12) & 1, rd, rs2) {
             (0, 0, _) => Insn { raw: c, ..ILL2 },
@@ -275,12 +279,16 @@ fn decode_compressed(pc: u32, c: u32, f: bool) -> Insn {
             (1, _, 0) => mk(Op::Jalr, 1, rd, 0, 0, Comp::Jalr),
             (_, _, _) => mk(Op::Add, rd, rd, rs2, 0, Comp::Add),
         },
-        (2, 6) => mk(Op::Sw, 0, 2, rs2, swsp_off(c), Comp::Swsp),
+        (2, 6) => {
+            let imm = ((((c >> 9) & 0xf) << 2) | (((c >> 7) & 3) << 6)) as i32;
+            mk(Op::Sw, 0, 2, rs2, imm, Comp::Swsp)
+        }
         (2, 7) if f => mk(Op::Fsw, 0, 2, rs2, swsp_off(c), Comp::Fswsp),
         _ => Insn { raw: c, ..ILL2 }, // Includes the D forms, and the F forms on a core without F.
     }
 }
 
+/// C.FLWSP's offset, laid out as C.LWSP's; C.FSWSP's as C.SWSP's.
 #[inline(always)]
 fn lwsp_off(c: u32) -> i32 { ((((c >> 12) & 1) << 5) | (((c >> 4) & 7) << 2) | (((c >> 2) & 3) << 6)) as i32 }
 #[inline(always)]

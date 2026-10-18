@@ -1,6 +1,8 @@
 # ESP32-P4 — plan
 
-Status: planned, not started. Tracks [#215](https://github.com/mikroverk/esp32sim/issues/215).
+Status: in progress; the F extension and the lazy FPU traps are in `riscv-rv32`
+(`Cpu::new_esp32p4`), the rest of milestone 1 is not started. Tracks
+[#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:
 the real mask ROM, the real 2nd-stage bootloader and an unmodified ESP-IDF image, checked
@@ -41,10 +43,15 @@ ROM → bootloader → FreeRTOS on both HP cores → `app_main`.
 The CPU work is the bulk of it:
 
 - **F extension**, including the compressed FP loads and stores, which the ROM itself uses
-  (`setjmp`, `__mulsc3`). Gated on `misa`, so the C3 and C6 decode exactly as today.
+  (`setjmp`, `__mulsc3`). Gated on `misa`, so the C3 and C6 decode exactly as today. Done:
+  a soft-float on integers (`riscv-rv32/src/softfloat.rs`), checked against the host and a
+  round-to-odd reference in every rounding mode.
 - **Lazy FPU traps.** IDF switches FP context lazily: an FP instruction with `mstatus.FS` = Off
   must raise an illegal instruction with `mtval` = the instruction and the reason in CSR 0x7F0.
-  Executing it instead does not crash; FreeRTOS silently stops saving FP registers.
+  Executing it instead does not crash; FreeRTOS silently stops saving FP registers. Done, with
+  0x7F0 bit 0 set for the computational instructions only: the P4 does not flag FLW/FSW
+  (`SOC_CPU_HAS_FPU_EXT_ILL_BUG`, ESP-IDF v5.5.3 `soc_caps.h`), and IDF decodes `mtval` for
+  those and for the FP CSR accesses.
 - **CLIC**, per core at `0x20800000` (the other core's at `+0x10000`): 48 IDs, IDF's CPU lines
   0–31 at IDs 16–47, 3 priority bits, hardware vectoring through `mtvt` (needs a bus read on
   trap entry), `mcause` carrying the previous level, `mret` restoring it. The ROM uses the
