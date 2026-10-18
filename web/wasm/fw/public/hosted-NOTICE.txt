@@ -2,7 +2,12 @@ Licences of the ESP-Hosted firmware in this directory
 =====================================================
 
 Files: p4-hosted-bootloader.bin, p4-hosted-ptable.bin, p4-hosted-station.bin,
-       c6-hosted-bootloader.bin, c6-hosted-ptable.bin, c6-hosted-otadata.bin, c6-hosted-slave.bin
+       p4-hosted-rawtp-rx.bin, p4-hosted-rawtp-tx.bin,
+       c6-hosted-bootloader.bin, c6-hosted-ptable.bin, c6-hosted-otadata.bin, c6-hosted-slave.bin,
+       c6-hosted-rawtp-slave.bin
+
+The rawtp images are the same two examples built with ESP-Hosted's raw throughput test
+configured on (examples/esp-hosted-p4/README.md, "Raw throughput"); their licences are the same.
 
 Source and build recipe: examples/esp-hosted-p4. The p4-hosted images are ESP-IDF v5.5.3's
 wifi/getting_started/station example (Unlicense OR CC0-1.0) for the ESP32-P4, linked with the

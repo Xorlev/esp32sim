@@ -36,3 +36,31 @@ follows on stdout with `[c6] ` in front; see ../../docs/esp32p4.md, "The co-proc
 
 `stub=bb_init=0` skips the C6 PHY's baseband calibration, as for every C6 WiFi run here
 (../../docs/esp32c6.md); the golden gives its address, `0x420bac5c`, since it ships no ELF.
+
+## Raw throughput
+
+ESP-Hosted's own transport test (RawTP) sends 1460-byte packets as fast as the link takes them
+and reports the rate every second on both consoles. The images `p4-hosted-rawtp-rx.bin`,
+`p4-hosted-rawtp-tx.bin` and `c6-hosted-rawtp-slave.bin` are the two examples above built with it
+on, nothing else changed; they boot with the bootloaders, partition tables and OTA data above.
+For the host, these lines added to `station/sdkconfig.defaults`:
+
+    CONFIG_ESP_HOSTED_RAW_THROUGHPUT_TRANSPORT=y
+    CONFIG_ESP_HOSTED_RAW_THROUGHPUT_RX_FROM_SLAVE=y     # p4-hosted-rawtp-rx: the C6 sends
+    CONFIG_ESP_HOSTED_RAW_TP_REPORT_INTERVAL=1
+
+with `CONFIG_ESP_HOSTED_RAW_THROUGHPUT_TX_TO_SLAVE=y` in place of `..._RX_FROM_SLAVE` for
+`p4-hosted-rawtp-tx` (the P4 sends); for the slave, these added to its `sdkconfig.defaults`:
+
+    CONFIG_ESP_RAW_THROUGHPUT_TRANSPORT=y
+    CONFIG_ESP_RAW_TP_REPORT_INTERVAL=1
+
+Both sides wait 5 s after the data path opens before they send (`sleep(5)` in their `stats.c`),
+so traffic starts near 7.7 s. The goldens `hosted_rawtp_rx` and `hosted_rawtp_tx` run each pair
+for 10 s with the SD bus timed (`--sd-timing`); the slave's `bb_init` is at `0x420bb020` in this
+build:
+
+    ../../target/release/esp32sim-p4 --flash-mb 2 --bootloader $FW/p4-hosted-bootloader.bin \
+      --ptable $FW/p4-hosted-ptable.bin --app $FW/p4-hosted-rawtp-rx.bin --sd-timing \
+      --coproc c6:bootloader=$FW/c6-hosted-bootloader.bin,ptable=$FW/c6-hosted-ptable.bin,app=$FW/c6-hosted-rawtp-slave.bin,otadata=$FW/c6-hosted-otadata.bin,stub=0x420bb020=0 \
+      --wifi ssid=esp32sim,psk=esp32sim-pass --net none --max-seconds 10

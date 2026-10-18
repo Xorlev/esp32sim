@@ -485,6 +485,32 @@ fn hosted_p4() {
     expect_u64("hosted-p4.insns", r.insns);
 }
 
+/// ESP-Hosted's raw throughput test on the same pair (`examples/esp-hosted-p4`, "Raw
+/// throughput"), the SD bus timed at the slot's 4 lines and 40 MHz: `rx` the C6 sends, `tx` the P4
+/// does. Traffic starts near 7.7 s (both sides wait 5 s); the per-second reports pin the steady
+/// rate. The receive run carries about 40 MB, so PKT_LEN wraps at 2^20 dozens of times.
+fn hosted_rawtp(dir: &str, steady: &str) {
+    let (rom_p4, rom_c6) = (rom("esp32p4_rev0"), rom("esp32c6_rev0"));
+    let coproc = format!("c6:bootloader={FW}/c6-hosted-bootloader.bin,ptable={FW}/c6-hosted-ptable.bin,app={FW}/c6-hosted-rawtp-slave.bin,otadata={FW}/c6-hosted-otadata.bin,rom={},stub=0x420bb020=0", rom_c6.display());
+    let r = run(BIN_P4, &["--rom", rom_p4.to_str().unwrap(), "--flash-mb", "2", "--no-dump", "--sd-timing",
+        "--bootloader", &format!("{FW}/p4-hosted-bootloader.bin"), "--ptable", &format!("{FW}/p4-hosted-ptable.bin"), "--app", &format!("{FW}/p4-hosted-rawtp-{dir}.bin"),
+        "--coproc", &coproc, "--wifi", "ssid=esp32sim,psk=esp32sim-pass", "--net", "none,epoch=1767225600", "--max-seconds", "10"]);
+    assert!(r.stdout.contains(steady), "{}\n{}", r.stdout, r.stderr);
+    assert!(!r.stdout.contains("Guru Meditation") && !r.stdout.lines().any(|l| l.trim_start_matches("[c6] ").starts_with("E (")), "{}", r.stdout);
+    expect_text(&format!("hosted-rawtp-{dir}.console.txt"), &r.stdout);
+    let events = r.stderr.lines().find(|l| l.starts_with("[emu] stop:")).and_then(|l| l.rsplit_once("); ")).map_or("", |(_, e)| e);
+    let report: String = std::iter::once(events).chain(r.stderr.lines().filter(|l| l.starts_with("[c6]") || l.starts_with("[cosim]") || l.starts_with("[sdmmc]")))
+        .map(|l| format!("{l}\n")).collect();
+    expect_text(&format!("hosted-rawtp-{dir}.report.txt"), &report);
+    expect_u64(&format!("hosted-rawtp-{dir}.insns"), r.insns);
+}
+
+#[test] #[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn hosted_rawtp_rx() { hosted_rawtp("rx", "stats: 7-8 sec Tx:0 Rx:139518 Kbps"); }
+
+#[test] #[ignore = "needs the ESP32-P4 and ESP32-C6 mask ROM ELFs"]
+fn hosted_rawtp_tx() { hosted_rawtp("tx", "stats: 8-9 sec       Rx: 106283.44 Tx: 0.00 kbps"); }
+
 /// The guest controller owns the advertising schedule and handles every END IRQ.
 #[test] #[ignore = "needs the ESP32-C3 mask ROM ELF fetched by CI"]
 fn ble_advertiser_c3() {

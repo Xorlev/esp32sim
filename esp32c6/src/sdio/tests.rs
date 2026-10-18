@@ -353,3 +353,37 @@ fn cmd52_into_the_fifo_moves_packet_bytes() {
     assert_eq!(rd(&mut s, &mut ram, 1, FIFO_END - 1), 0, "nothing left: an underflow");
     assert_eq!(s.stats.underflows, 1);
 }
+
+/// Stream mode sends every queued packet in one chain, each ending with EOF, and PKT_LEN counts
+/// bytes cumulatively in 20 bits: the host takes the difference from the length it last saw,
+/// across the wrap at 2^20 (esp_hosted sdio_drv.c `sdio_get_len_from_slave`), and reads both
+/// packets in one CMD53.
+#[test]
+fn a_chain_of_packets_and_pkt_len_across_its_wrap() {
+    let (mut s, mut ram) = (SdioSlave::new(), Ram::new());
+    selected(&mut s, &mut ram);
+    Device::write(&mut s, SLC + slc::CONF0, slc::RX_AUTO_WRBACK);
+    Device::write(&mut s, SLC + slc::LEN_CONF, slc::LEN_WR | 0xf_ff00);
+    let seen = Device::read(&mut s, HOST + host::PKT_LEN);
+    for i in 0..500 { ram.0[0x1000 + i] = (i % 199) as u8; }
+    // packet 1: 300 bytes in two descriptors; packet 2: 200 bytes in one
+    ram.desc(BASE + 0x200, 256, 256, false, BASE + 0x1000, BASE + 0x210);
+    ram.desc(BASE + 0x210, 64, 44, true, BASE + 0x1000 + 256, BASE + 0x220);
+    ram.desc(BASE + 0x220, 256, 200, true, BASE + 0x1000 + 300, 0);
+    Device::write(&mut s, SLC + slc::RX_LINK_ADDR, BASE + 0x200);
+    Device::write(&mut s, SLC + slc::RX_LINK, slc::LINK_START);
+    s.run_dma(&mut ram.mem());
+    Device::write(&mut s, SLC + slc::LEN_CONF, slc::LEN_INC_MORE | 500);
+    let now = Device::read(&mut s, HOST + host::PKT_LEN);
+    assert_eq!(now, 0xf4, "0xfff00 + 500 wraps in 20 bits");
+    let len = if now >= seen { now - seen } else { (1 << 20) - seen + now };
+    assert_eq!(len, 500, "the host's difference across the wrap");
+    short(s.command(53, cmd53(false, 1, true, true, FIFO_END - len, 1), &mut ram.mem()));
+    let mut got = [0u8; 512];
+    s.read_data(&mut got, &mut ram.mem()).unwrap();
+    assert!(got[..500].iter().enumerate().all(|(i, &b)| b == (i % 199) as u8), "both packets, back to back");
+    assert!(got[500..].iter().all(|&b| b == 0));
+    for d in [0x200, 0x210, 0x220] { assert_eq!(ram.r32(BASE + d) >> 31, 0, "descriptor {d:#x} handed back"); }
+    assert_eq!(Device::read(&mut s, SLC + slc::INT_RAW) & sint::RX_EOF, sint::RX_EOF);
+    assert_eq!(s.stats.underflows, 0);
+}
