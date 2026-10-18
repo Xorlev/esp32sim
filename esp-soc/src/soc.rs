@@ -227,6 +227,11 @@ pub trait SocBus: Bus {
     /// Put an SD card holding `image` in the board's SD socket, in place of the one there; says
     /// where it went.
     fn attach_sd_card(&mut self, _image: Box<dyn esp_periph::sdmmc::SdStore>, _config: esp_periph::sdmmc::SdCardConfig) -> Result<String, String> { Err("this chip has no SD card host".into()) }
+    /// Plug a USB host into the chip's USB-OTG device port, in place of one there; host software
+    /// (`crate::usb_host`) drives it through `usb_link`. Unpowered until it asks for VBUS.
+    fn attach_usb_host(&mut self, _timing: esp_periph::usb_otg::UsbTiming) -> Result<(), String> { Err("this chip has no USB-OTG device port".into()) }
+    /// The cable `attach_usb_host` plugged in.
+    fn usb_link(&mut self) -> Option<&mut esp_periph::usb_otg::UsbLink> { None }
 }
 
 /// Attach and synchronize the shared host source bank without adding device-tick work.
