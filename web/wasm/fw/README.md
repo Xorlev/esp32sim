@@ -32,8 +32,10 @@ accompany them. They are native CI fixtures; no new browser manifest is required
 The classic ESP32 hello inputs are `public/classic-hello-*`, built from
 [`examples/hello_world-classic`](../../../examples/hello_world-classic/README.md).
 `classic-hello-NOTICE.txt` lists only linked firmware components.
-The ESP32-P4 goldens' inputs are `public/p4-hello*`, ESP-IDF v5.5.3's hello_world for one and for
-both cores, built from [`examples/hello_world-p4`](../../../examples/hello_world-p4/README.md).
+The ESP32-P4 goldens' inputs are `public/p4-hello*`, `p4-sdcard*` and `p4-sdsectors*`, ESP-IDF
+v5.5.3 examples built from [`examples/hello_world-p4`](../../../examples/hello_world-p4/README.md)
+(one and both cores), [`sd_card-p4`](../../../examples/sd_card-p4/README.md) and
+[`sd_card-p4-sectors`](../../../examples/sd_card-p4-sectors/README.md).
 
 `tdisplay-prices.json` is the LilyGO TTGO T-Display demo on the classic ESP32: stock MicroPython
 v1.29.0 (`ESP32_GENERIC-20260824-v1.29.0.bin`, MIT, fetched from micropython.org by

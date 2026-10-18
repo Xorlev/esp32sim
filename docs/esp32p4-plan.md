@@ -1,8 +1,9 @@
 # ESP32-P4 — plan
 
-Status: milestone 1 done, milestone 2 (the SD card) next. hello_world boots to `app_main` on one
+Status: milestones 1 and 2 done, milestone 3 (USB) next. hello_world boots to `app_main` on one
 and on both cores and reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr
-counters, CLIC mode and two harts ([esp32p4.md](esp32p4.md)). Tracks
+counters, CLIC mode and two harts. The SDMMC host and an SD card carry IDF's sdmmc example through
+a FAT32 mount ([esp32p4.md](esp32p4.md)). Tracks
 [#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:
@@ -89,7 +90,9 @@ initialisation, 4-bit at 40 MHz, single- and multi-block reads and writes throug
 Slot 1 of the same host carries ESP-Hosted in milestone 4, so the host is written for two slots.
 
 Done when IDF's sdmmc example mounts a FAT32 image at 4 bits, writes, renames and reads back a
-file, and long transfers refill the driver's DMA descriptors.
+file, and long transfers refill the driver's DMA descriptors. Done: the host in
+`esp-periph/src/sdmmc.rs`, the card in `sdmmc/card.rs`, `--sd`/`--sd-rw`, goldens `sdcard-p4`
+and `sdcard-sectors-p4` (esp32p4.md, "SD card").
 
 ### 3. USB device and the car
 
