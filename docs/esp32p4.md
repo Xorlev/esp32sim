@@ -98,7 +98,9 @@ instruction counts (the SD card's receipt is in "SD card" below):
 
 `--sd IMAGE` puts a card holding the image in the reference board's SD socket; `--sd-rw IMAGE`
 does the same and writes through to the file, where `--sd` keeps what the firmware writes in
-memory and never modifies the file. ESP-IDF v5.5.3's own sdmmc example
+memory and never modifies the file. `--sd-prg-us N` gives the card a programming time, and
+`--sd-serial HEX` its CID serial number. A card put in the socket again replaces the one there,
+which is how the browser build's load kind 8 swaps images. ESP-IDF v5.5.3's own sdmmc example
 (`examples/sd_card-p4`, golden `sdcard-p4`) mounts a FAT32 card through it, writes `hello.txt`,
 renames it, reads it back and unmounts:
 
@@ -125,6 +127,12 @@ FAT32 from LBA 2048), so its bytes are the same on every host; afterwards the te
 (the example does not format) and an empty socket in `ESP_ERR_TIMEOUT`, the card's commands
 timing out (`sd_card_p4_unformatted_and_absent`).
 
+The second golden, `sdcard-sectors-p4` (`examples/sd_card-p4-sectors`), adds raw transfers of 64
+and 128 sectors from DMA-capable buffers: CMD25 and CMD18 with the auto-stop, longer than the
+16 KiB the driver's four descriptors hold, so its interrupt handler refills them; a misaligned
+buffer the driver splits into CMD17s; a read past the end the driver refuses (0x104); and a card
+that programs for 2 ms, which the driver waits out polling CMD13 (`write 0x0 in 2039 us`).
+
 ### The host
 
 The SDMMC block (0x50083000) is Synopsys' DesignWare Mobile Storage Host with Espressif's
@@ -137,7 +145,10 @@ with them, `esp_driver_sdmmc/src/sdmmc_host.c` and `sdmmc_transaction.c`,
 
 A command runs to completion in the register write that starts it (the bus calls
 `Sdmmc::run` after any write that left one pending): the response, CMD_DONE, the whole data
-phase through the IDMAC, DATA_OVER and the auto-stop. Nothing on the bus takes emulated time.
+phase through the IDMAC, DATA_OVER and the auto-stop. Nothing on the bus takes emulated time;
+the devices see it (`Sdmmc::now_ns`, set before every SDMMC access from the device clock) for
+their own busy periods. A write's DATA_OVER comes when its last block is on the card, before the
+card has programmed it, as on the DesignWare core.
 
 | register | modelled |
 | --- | --- |
@@ -146,21 +157,27 @@ phase through the IDMAC, DATA_OVER and the auto-stop. Nothing on the bus takes e
 | CTYPE 0x18 | 1, 4 or 8 lines per slot; a data phase on other lines than the card drives fails every block's CRC (DCRC) |
 | BLKSIZ, BYTCNT | block and transfer size, 512 after reset |
 | INTMASK, MINTSTS, RINTSTS | MINTSTS is RINTSTS & INTMASK; RINTSTS is write-1-to-clear |
-| CMDARG, CMD 0x2C | START (31) stays set until the command is taken; a clock-update command (UPDATE_CLK_REG, 21) is taken at once without CMD_DONE; STOP_ABORT ends a transfer; SEND_AUTO_STOP sends CMD12 after the data |
+| CMDARG, CMD 0x2C | START (31) stays set until the command is taken; a clock-update command (UPDATE_CLK_REG, 21) is taken at once without CMD_DONE; CHECK_RESPONSE_CRC (8) asks for RCRC; STOP_ABORT ends a transfer, a suspended one too; SEND_AUTO_STOP sends CMD12 after the data |
 | RESP0-3 | a short response in RESP0, an R2 in RESP0-3 (bit 0 first), the auto-stop's in RESP1 |
-| STATUS 0x48 | FIFO empty, below the transmit watermark, command FSM idle, DAT3 high with a device on the slot, DATA_BUSY from the card, the index of the last response |
+| STATUS 0x48 | FIFO empty, below the transmit watermark, command FSM idle, DAT3 high with a device on the slot, DATA_BUSY from the card at the current time, the index of the last response; reading it changes neither the card nor its time |
 | CDETECT, WRTPRT 0x50, 0x54 | the GPIO matrix's card-detect and write-protect inputs of each slot (below) |
 | TCBCNT, TBBCNT | bytes moved to or from the card, and through the FIFO |
 | VERID, HCON | 0x5432270A and HCON's field reset values |
 | BMOD, PLDMND, DBADDR, IDSTS, IDINTEN, DSCADDR, BUFADDR | the IDMAC (below) |
-| CARDTHRCTL 0x100 | BUSY_CLR_INT_EN (1): BCI (RINTSTS 13) once the card that took a write releases DAT0 |
+| CARDTHRCTL 0x100 | BUSY_CLR_INT_EN (1): BCI (RINTSTS 13) at the first host access after the card that took a write releases DAT0 (the host keeps no clock to raise it at that moment); a STATUS read that raises it re-derives the interrupt line |
 | CLK_EDGE_SEL, RAW_INTS, DLL_CLK_CONF, DLL_CONF 0x800-0x80C | CLK_EDGE_SEL from its reset value; RAW_INTS reads RINTSTS (a guess: the header says only "raw ints"); DLL_CONF reports DLL_CAL_END |
 
-A command to a slot with nothing on it, or one the card does not answer, sets RTO with CMD_DONE.
-A data error sets its bit (DRTO when the card sends nothing, DCRC, EBE when a write gets no CRC
-status) and DATA_OVER after it, as the core reports data-over after a data error, and the
-IDMAC's CES. The interrupt is source 23 (`ETS_SDIO_HOST_INTR_SOURCE`, include/soc/interrupts.h):
-`(CTRL.INT_ENABLE && MINTSTS) || (IDSTS & IDINTEN)`.
+A device answers a command with a response or an `SdCmdError`: no response (RTO with CMD_DONE,
+also for a slot with nothing on it), a response with a bad CRC (RCRC when the command asks for
+the check) or a malformed one (RESP_ERR); after either error the data phase does not start. A
+data error is the device's `SdDataError`: a read that gets no data is DRTO, a block with a bad
+CRC either way DCRC (IDF: ESP_ERR_INVALID_CRC), a write that gets no CRC status EBE; DATA_OVER
+follows it, as the core reports data-over after a data error, with the IDMAC's CES. The
+auto-stop goes out after a data error as well. That is an assumption that only a board can
+settle, and IDF depends on it to get the card out of its data state. The interrupt is source
+23 (`ETS_SDIO_HOST_INTR_SOURCE`, include/soc/interrupts.h): `CTRL.INT_ENABLE && MINTSTS`, or
+TI/RI in IDSTS & IDINTEN with IDINTEN.NI, or FBE/DU/CES with IDINTEN.AI. IDF enables NI, RI and
+TI only, so a DU interrupts it through the RI before it.
 
 The IDMAC walks descriptors in memory (`sdmmc_desc_t`, sdmmc_struct.h): chained (CH, DES3) or in
 a ring (the next 16 bytes plus BMOD's skip length, back to DBADDR after ER), one or two buffers
@@ -181,8 +198,9 @@ through the GPIO matrix: it reaches a device whose clock pad is a GPIO (function
 `SD_CARD_CCLK_2_PAD_OUT_IDX` (gpio_sig_map.h). The `--sd` card sits on slot 0's pins, as on the
 reference board; IDF's example reaches it through slot 1 and the matrix (`SDMMC_HOST_DEFAULT()`
 is slot 1 on the P4), oxidrive through slot 0. ESP-Hosted's C6 (milestone 4) will be an
-`SdDevice` attached at CLK 18, CMD 19, D0-D3 14-17 (`Peripherals::attach_sd`), which slot 1
-reaches the same way; the trait already carries the SDIO interrupt (DAT1), unused so far.
+`SdDevice` attached at CLK 18, CMD 19, D0-D3 14-17 (`Peripherals::attach_sd`, which replaces a
+device already on those pins), which slot 1 reaches the same way; the trait already carries the
+SDIO interrupt (DAT1), unused so far.
 CDETECT and WRTPRT read `SD_CARD_DETECT_N_1/2` and `SD_CARD_WRITE_PRT_1/2` (signals 126, 127,
 130, 131) through FUNCn_IN_SEL: a pin's level or a constant, inverted if asked. The driver
 routes constant low to card detect and inverted constant high to write protect when the board
@@ -212,66 +230,81 @@ high, or 0x3E, constant low). Pin levels stay the shared model's 49.
   prg, dis and ina. An R1 shows CURRENT_STATE as the command found the card, READY_FOR_DATA
   cleared while programming (§4.10.1). A command that is not legal in the state, including the
   SDIO commands 5, 52 and 53, is not answered and sets ILLEGAL_COMMAND for the next response;
-  the error bits clear with the response that reports them.
+  the error bits clear with the response that reports them. A card deselected while programming
+  goes to dis and from there to stby when programming ends; selected again it returns to prg
+  only while it still programs.
 - **Identification** (§4.2): CMD0; CMD8 echoes its check pattern for 2.7-3.6 V and stays silent
   otherwise; CMD55 and ACMD41, busy for one poll, then ready with CCS. Without HCS, or without a
   CMD8 since the reset, the card stays busy, as a high capacity card must (§4.2.3). CMD2 and CMD10
   give the CID, CMD3 an RCA (R6), CMD9 the CSD, CMD7 selects and deselects (R1b), CMD4 and CMD15.
-- **Registers** (chapter 5): CID with MID 0, OID "ES", product "SIMSD", revision 1.0, a serial
-  number derived from the image size and 2024-01; CSD version 2.0 with C_SIZE from the image,
+- **Registers** (chapter 5): CID from `SdCardConfig`, by default MID 0, OID "ES", product
+  "SIMSD", revision 1.0, a serial number derived from the image size and 2024-01; CSD version 2.0
+  with C_SIZE from the image,
   TAAC 1 ms, CCC 0x535 (classes 0, 2, 4, 5, 8, 10), TRAN_SPEED 25 MHz or 50 MHz once high speed is
   switched on; both with their CRC7 (§4.5). SCR: SD 3.0x, security 2.00 (3.00 above 32 GiB),
   1 and 4 lines, CMD23. SD status (ACMD13, §4.10.2): bus width, speed class 10, AU 4 MiB. OCR
   2.7-3.6 V, no 1.8 V.
 - **Transfer** (§4.3): CMD6 check and switch (§4.3.10; group 1 offers default and high speed),
   ACMD6 bus width, CMD13, CMD16 (blocks stay 512 bytes), CMD17 and CMD18 reads, CMD24 and CMD25
-  writes, CMD12, CMD23 block count, ACMD22 written blocks, ACMD23 and ACMD42 accepted, CMD32, CMD33
-  and CMD38 erase (erased blocks read 0). A start address past the end answers OUT_OF_RANGE and
-  moves no data; a multi-block transfer that runs past it stops there.
-- **Time.** The card answers at once. ACMD41 reports busy once (`SdCard::init_polls`).
-  Programming after a write or an erase is instant; `SdCard::prg_polls` holds the card in prg
-  for that many status polls (CMD13 or the host's DAT0 check), for a test or a later timing
-  model.
+  writes, CMD12, CMD23 block count (for the next CMD18 or CMD25; any other read or write clears
+  it), ACMD22 written blocks, ACMD23 and ACMD42 accepted, CMD32, CMD33 and CMD38 erase (erased
+  blocks read 0). A start address past the end answers OUT_OF_RANGE and moves no data; a
+  multi-block transfer that runs past it stops there.
+- **Time.** The card answers at once. ACMD41 reports busy `SdCardConfig::init_polls` times (1).
+  After the last block of a write, after the CMD12 that ends a multi-block write, and after an
+  erase the card programs for `SdCardConfig::prg_ns` of emulated time (`--sd-prg-us`; 0 by
+  default): DAT0 busy, prg, not ready for data, and a read or write command meanwhile is illegal.
+  The driver's own writes wait for it with CMD13, but its write returns only after that, so a
+  read from another task can reach the card while it programs: no response (IDF:
+  `sdmmc_send_cmd returned 0x107`), then a CMD13 status of 0x400e00, ILLEGAL_COMMAND in prg,
+  which is what the reference board reported for reads made while its card took writes over USB.
 - **Image.** A card of the image's size rounded down to 512 KiB (C_SIZE's unit), from 512 KiB to
-  2 TiB, held by an `SdStore`: `FileStore` (copy-on-write or write-through) or `MemStore`. The
-  card stays in the socket through a chip reset, with its state; IDF's init resets it with CMD0.
+  2 TiB, held by an `SdStore`: `FileStore` (copy-on-write or write-through) or `MemStore`. It is
+  SDHC up to 32 GiB and SDXC above (SCR security 3.00); a card under 2 GB would be SDSC on
+  silicon, and this one is SDHC at every size (IDF prints `SDHC` for both). A copy-on-write
+  erase is kept as a range, not a block per address. The card stays in the socket through a chip
+  reset, with its state; IDF's init resets it with CMD0.
 - **Not modelled**: SDSC (byte addresses, CSD 1.0), UHS-I and CMD11, DDR, eMMC, lock and unlock,
-  write protection, the PIO data FIFO at 0x200, the card-detect interrupt, timing.
+  write protection, the PIO data FIFO at 0x200, the card-detect interrupt, the time a command or
+  a transfer takes on the bus.
 
 `--debug sdmmc` prints every command, its response and the card's state. The run's report adds
 the commands, the unanswered ones and the bytes moved.
 
 The SD card costs the other chips nothing: it is new code the P4 alone calls, plus a default
-method on `SocBus` and a load kind (8) for the browser build. Measured against b31a21de with
+method on `SocBus` and a load kind (8) for the browser build. Measured on the final tree against b31a21de with
 `cargo build --release --bins`, alternating runs, median `user` time, identical instruction
 counts:
 
 | demo | runs | b31a21de | this branch | instructions |
 | --- | --- | --- | --- | --- |
-| S3 `hello` (30 s) | 7 | 0.38 s | 0.38 s | 11,990,488 + 6,798,360 |
+| S3 `hello` (30 s) | 7 | 0.37 s | 0.37 s | 11,990,488 + 6,798,360 |
 | `c3-hello` (30 s) | 7 | 3.80 s | 3.79 s | 4,800,000,000 |
-| `c6-hello` (30 s) | 7 | 5.58 s | 5.53 s | 4,800,000,000 |
-| `p4-hello` (27 s) | 7 | 17.47 s | 17.36 s | 9,720,000,000 + 0 |
-| `p4-hello-smp` (27 s) | 7 | 18.41 s | 18.24 s | 9,720,000,000 + 9,713,148,105 |
-| pocket-tank (8 s) | 5 | 13.98 s | 13.99 s | 1,113,634,993 + 1,490,529,616 |
+| `c6-hello` (30 s) | 7 | 5.58 s | 5.58 s | 4,800,000,000 |
+| `p4-hello` (27 s) | 7 | 17.51 s | 17.38 s | 9,720,000,000 + 0 |
+| `p4-hello-smp` (27 s) | 7 | 18.42 s | 18.38 s | 9,720,000,000 + 9,713,148,105 |
+| pocket-tank (8 s) | 5 | 13.96 s | 13.93 s | 1,113,634,993 + 1,490,529,616 |
 
-The P4 runs pay one flag test per peripheral write and a few compares per GPIO and SDMMC
-access; nothing in the change makes them faster, so the 0.6-0.9% they gained is most likely
-code layout.
+The P4 runs pay one flag test per peripheral write, an address compare per peripheral read, and
+a few compares per GPIO and SDMMC access; nothing in the change makes them faster, so the
+0.2-0.7% they gained is most likely code layout. An earlier round, before the card's
+programming time and the read-side check, measured the same within 1%.
 
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,
 partition table and app as a board whose console was captured, with the bootloader's flash mode
 set to QIO as espflash wrote it, 32 MB of flash and 32 MB of PSRAM, both cores, and a FAT32 card
-in the socket: a 4 GiB image laid out as a card formatter lays out an SDHC card (MBR, FAT32 from
-LBA 2048, 32 KiB clusters). `external_oxidrive_console_matches_the_board` (`OXIDRIVE_DIR` names
-the images and the capture; the board's MAC comes from there, not from this repository)
-compares the two with timestamps stripped, line by line, picking the comparison up again after
-lines that differ. 67 of the board's 105 lines match, among them the twelve `hex_psram`
+in the socket: a sparse image of the board card's size, an SDXC card, laid out as a card
+formatter lays one out (MBR, FAT32 from LBA 2048, 32 KiB clusters), with the board card's serial
+number. `external_oxidrive_console_matches_the_board` (`OXIDRIVE_DIR` names the images and the
+capture; the board's MAC, the card's size and its serial number come from there, not from this
+repository) compares the two with timestamps stripped, line by line, picking the comparison up
+again after lines that differ. 68 of the board's 105 lines match, among them the twelve `hex_psram`
 mode-register lines, the MSPI timing tuning, `Found 32MB PSRAM device`, `cpu_start: Multicore
 app`, the application information, the heap regions, `spi_flash: flash io: qio`, the ESP-Hosted
-start-up and the firmware's own start-up lines. Three differ by construction, because the ECO0
+start-up, the firmware's own start-up lines and its card probe (size, serial, 4 data lines at
+40000 kHz). Three differ by construction, because the ECO0
 ROM stands in for the board's ECO2: the banner pair, and the heap region below the ROM's own
 data, whose length IDF takes from the ROM's `ets_rom_layout` (`_dram0_rtos_reserved_start` is
 0x4FF3FBA4 in the ECO0 ELF, and 12 bytes later on the board). Four blocks differ:
@@ -281,9 +314,7 @@ data, whose length IDF takes from the ROM's `ets_rom_layout` (`_dram0_rtos_reser
 - the firmware's free heap at start is 108 bytes lower than the board's (open; ESP-Hosted's
   SDIO link, which has no slave on slot 1 and sends it no command in this run, is the first
   place to look);
-- the card lines: the firmware probes the card through slot 0 at 4 data lines and 40000 kHz,
-  as the board does, and reports the image's size, serial number and FAT geometry, not the
-  board card's;
+- the card's FAT geometry, label and root directory: the image's, not the board card's;
 - the run then reaches USB-OTG: TinyUSB's `check_dwc2` reads 0 from GSNPSID and asserts, and the
   board's remaining 30 lines (the USB mass storage presentation onwards) do not come.
 
@@ -364,8 +395,11 @@ USB mass storage stack coming up on the high-speed port.
 4. A host on the other end of the cable, written in Rust: enumeration, then SCSI over bulk-only
    transport, reading and writing the card the firmware presents.
 
-The SD card side is ready for it: the card image the car writes through the firmware is the
-`--sd` image, and `--sd-rw` keeps what it wrote. Slot 1 (ESP-Hosted, milestone 4) takes an
+Timed transfers belong with it: a command's CMD_DONE and a transfer's DATA_OVER after the time
+the bytes take on the wire at the bus width and card clock, for which the host needs a clock and
+a deadline (`Device::clock`, `next_deadline`); today only the card's programming takes time. The
+SD card side is ready for it: the card image the car writes through the firmware is the `--sd`
+image, and `--sd-rw` keeps what it wrote. Slot 1 (ESP-Hosted, milestone 4) takes an
 `SdDevice` at its own pins (`Peripherals::attach_sd`, "Slots and the socket"). In the oxidrive
 run ESP-Hosted's transport starts its task (`H_SDIO_DRV: sdio_data_to_rx_buf_task started`, as
 on the board) and then sends no command on slot 1 in 3 s (`ESP_EMU_DEBUG=sdmmc` on the test, or
