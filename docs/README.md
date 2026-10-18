@@ -20,6 +20,8 @@ cover the RISC-V side.
 | [speed-plan.md](speed-plan.md) | Plan: performance roadmap — measured baselines, block interpreter, JIT, with the rejected ideas |
 | [esp32c3.md](esp32c3.md) | The ESP32-C3 (RISC-V) model: what boots, how to run it, and the bring-up gotchas |
 | [esp32c6.md](esp32c6.md) | The ESP32-C6 (RISC-V, RV32IMAC) model: the Waveshare LCD-1.47 bring-up, what silicon found, what is left for the board |
+| [esp32p4.md](esp32p4.md) | The ESP32-P4 rev < 3 (dual RISC-V) model, draft: hello_world on one and two cores, the CLIC and hart support in the core, a v1.0 board's console compared |
+| [esp32p4-plan.md](esp32p4-plan.md) | Plan: the P4 staged from boot to SD card, USB and the C6 co-processor |
 | [wasm.md](wasm.md) | How to build and run the emulator in the browser (WebAssembly): `tools/wasm-build.sh`, `?wasm`, manifests, what works, limits |
 | [wasm-plan.md](wasm-plan.md) | The plan the browser build followed, with the original measurements; status at the top |
 | [testing-plan.md](testing-plan.md) | Plan: test layers, CPU/SoC/board/firmware suites, CI tiers, milestones |
