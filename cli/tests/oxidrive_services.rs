@@ -69,7 +69,13 @@ const TSENS_OUT_25C: u32 = 104;
 
 /// The firmware, its card and both services, the pair joined: the C6's network forwards the
 /// two guest addresses nvs.csv names to the services, and refuses everything else.
-struct Rig { cs: CoSim, smb: Samba, mqtt: Mosquitto, card: std::path::PathBuf, id: String, lines: Vec<(u64, bool, String)> }
+struct Rig { cs: CoSim, smb: Samba, mqtt: Mosquitto, card: std::path::PathBuf, id: String, lines: Vec<(u64, bool, String)>, samples: Vec<Sample> }
+
+/// The air, the NAT and the CPUs every 100 ms: frames the station sent and received, bytes to
+/// the host and back, instructions each chip retired (one a cycle; a core waiting in WFI retires
+/// none).
+#[derive(Clone, Copy, Debug, Default)]
+struct Sample { ns: u64, tx_frames: u64, rx_frames: u64, to_host: u64, to_guest: u64, p4_insns: [u64; 2], c6_insns: u64 }
 
 fn rig(card_name: &str, card_bytes: u64, car: bool) -> Rig {
     let dir = oxidrive_board::dir();
@@ -84,6 +90,7 @@ fn rig(card_name: &str, card_bytes: u64, car: bool) -> Rig {
     let (off, size) = oxidrive_board::nvs_partition(&table).expect("an NVS partition in partition-table.bin");
     p4.write_flash(off, &oxidrive_board::nvs_image(&csv_path, size)).unwrap();
     emu_core::Bus::write32(&mut p4.bus, TSENS_CTRL, TSENS_OUT_25C).unwrap();
+    if std::env::var_os("ESP_EMU_DEBUG").is_some() { p4.set_debug(&esp_soc::DebugFlags::from_env()); }
     if car { esp_soc::SocBus::attach_usb_host(&mut p4.bus, Default::default()).unwrap(); }
     // the firmware's id: the factory MAC's last three bytes (its main.rs)
     let mac = oxidrive_board::board_mac(&board_log);
@@ -92,7 +99,7 @@ fn rig(card_name: &str, card_bytes: u64, car: bool) -> Rig {
     let forwards = vec![Forward { guest: smb_at.guest, host: smb.svc.addr() }, Forward { guest: mqtt_at.guest, host: mqtt.svc.addr() }];
     for f in &forwards { eprintln!("[oxidrive] forwarding {} to {}", f.guest, f.host); }
     let cs = CoSim::new(p4, hosted_slave(Nat::forward_only(log, forwards)), Config::default());
-    Rig { cs, smb, mqtt, card, id, lines: Vec::new() }
+    Rig { cs, smb, mqtt, card, id, lines: Vec::new(), samples: Vec::new() }
 }
 
 impl Rig {
@@ -106,8 +113,27 @@ impl Rig {
                 self.lines.push((t, c6, l));
             }
             r.map_err(|s| format!("the P4 stopped at {:.3} s: {s:?}", t as f64 / 1e9))?;
+            let c = self.cs.c6.borrow();
+            let link = &c.m.bus.periph.wifi_mac.link;
+            let nat = link.net().and_then(|n| n.nat.as_ref());
+            self.samples.push(Sample { ns: t, tx_frames: link.tx_frames(), rx_frames: link.rx_frames(),
+                                       to_host: nat.map_or(0, |n| n.bytes_to_host), to_guest: nat.map_or(0, |n| n.bytes_to_guest),
+                                       p4_insns: [0, 1].map(|i| self.cs.p4.cores.get(i).map_or(0, |k| k.retired_count)), c6_insns: c.m.cores.iter().map(|k| k.retired_count).sum() });
         }
         Ok(())
+    }
+
+    /// Rates between emulated milliseconds `from` and `to`, from the samples: frames a second
+    /// each way and MB/s each way.
+    fn rates(&self, from: u64, to: u64) -> String {
+        let at = |ms: u64| self.samples.iter().find(|s| s.ns >= ms * 1_000_000).copied().unwrap_or_default();
+        let (a, b) = (at(from), at(to));
+        let secs = (b.ns.saturating_sub(a.ns)) as f64 / 1e9;
+        let busy = |n: u64, hz: f64| n as f64 / (secs * hz) * 100.0;
+        format!("station {:.0} frames/s out, {:.0} in; NAT {:.2} MB/s to the host, {:.2} back; busy: P4 core 0 {:.0}%, core 1 {:.0}%, C6 {:.0}%",
+                (b.tx_frames - a.tx_frames) as f64 / secs, (b.rx_frames - a.rx_frames) as f64 / secs,
+                (b.to_host - a.to_host) as f64 / 1e6 / secs, (b.to_guest - a.to_guest) as f64 / 1e6 / secs,
+                busy(b.p4_insns[0] - a.p4_insns[0], 360e6), busy(b.p4_insns[1] - a.p4_insns[1], 360e6), busy(b.c6_insns - a.c6_insns, 160e6))
     }
     fn run_to(&mut self, ns: u64) { self.advance(ns).unwrap_or_else(|e| panic!("{e}")) }
     fn p4_has(&self, s: &str) -> bool { self.lines.iter().any(|(_, c6, l)| !c6 && l.contains(s)) }
@@ -189,9 +215,11 @@ fn external_oxidrive_archives_a_window() {
     use esp_soc::usb_host::{fat32::{mp4_bytes, write_clip, Fat32}, msc::{Msc, MscError}, UsbHost};
     let mut r = rig("oxidrive-window.img", 4 << 30, true);
     let mib = Rig::env_secs("OXIDRIVE_CLIP_MIB", 2);
+    // the newest of the first two is held back for one pass, so the window is the one to take it
+    let window_mib = Rig::env_secs("OXIDRIVE_WINDOW_CLIP_MIB", mib);
     let force = std::env::var("OXIDRIVE_FORCE_OPEN").is_ok_and(|v| v == "1");
     let deadline = Rig::env_secs("OXIDRIVE_SECONDS", 200) * 1_000_000_000;
-    let clips: Vec<Vec<u8>> = EVENTS.iter().map(|s| mp4_bytes(s, (mib << 20) as usize)).collect();
+    let clips: Vec<Vec<u8>> = EVENTS.iter().enumerate().map(|(i, s)| mp4_bytes(s, ((if i == 1 { window_mib } else { mib }) << 20) as usize)).collect();
     let gap_ns = 16_000_000;
     let (cmd, mqtt) = (format!("oxidrive/{}/cmd", r.id), r.mqtt.client.clone());
     let wall = std::time::Instant::now();
@@ -245,6 +273,12 @@ fn external_oxidrive_archives_a_window() {
     eprintln!("[oxidrive] the window: taken {took:?} ns, returned {returned:?} ns");
     for l in r.p4_lines().iter().filter(|l| l.contains("shared:") || l.contains("window") || l.contains("upload") || l.contains("supervisor") || l.contains("smb:")) { eprintln!("[oxidrive]   {l}"); }
     assert!(took.is_some() && returned.is_some(), "no window: the card was never taken and returned");
+    for u in upload_phases(&r.p4_lines()) {
+        let mb = |ms: u64| u.bytes as f64 / 1e3 / ms.max(1) as f64;
+        eprintln!("[oxidrive] upload {}: {} bytes written in {} ms ({:.2} MB/s), read back and renamed in {} ms ({:.2} MB/s)",
+                  u.path, u.bytes, u.written - u.begun, mb(u.written - u.begun), u.renamed - u.written, mb(u.renamed - u.written));
+        eprintln!("[oxidrive]   writing: {}; reading back: {}", r.rates(u.begun, u.written), r.rates(u.written, u.renamed));
+    }
     // the card: fsck, and every clip as the car wrote it
     let fsck = sd_image::fsck(&r.card).unwrap_or_else(|e| panic!("fsck: {e}"));
     eprintln!("[oxidrive] fsck: {}", fsck.trim().replace('\n', "; "));
@@ -268,4 +302,64 @@ fn external_oxidrive_archives_a_window() {
     eprintln!("[oxidrive] share: manifest {:?}", manifest);
     assert!(!uploaded.is_empty(), "nothing reached the share");
     assert!(uploaded.iter().all(|s| manifest.contains(s)), "the manifest lacks an upload");
+}
+
+/// One clip's way to the share, from the firmware's SMB log lines (`smb-> ...`), in its own
+/// milliseconds: `begin_part`, the `.part` size check that follows the last write, `finish`.
+struct Upload { path: String, bytes: u64, begun: u64, written: u64, renamed: u64 }
+
+fn upload_phases(lines: &[&str]) -> Vec<Upload> {
+    let ms = |l: &str| l.get(3..).and_then(|t| t.split(')').next()).and_then(|t| t.parse::<u64>().ok());
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let Some(path) = l.split("smb-> begin_part ").nth(1).and_then(|r| r.strip_suffix(" @0")) else { continue };
+        if path.starts_with('.') { continue; }
+        let after = &lines[i..];
+        let find = |pat: &str| after.iter().find(|x| x.ends_with(pat)).and_then(|x| ms(x));
+        let bytes = after.iter().take_while(|x| !x.contains("smb-> end_part")).filter_map(|x| x.split("smb-> write_part ").nth(1)?.strip_suffix(" bytes")?.parse::<u64>().ok()).sum();
+        if let (Some(begun), Some(written), Some(renamed)) = (ms(l), find(&format!("smb-> size_of {path}.part")), find(&format!("smb-> finish {path}"))) {
+            out.push(Upload { path: path.to_string(), bytes, begun, written, renamed });
+        }
+    }
+    out
+}
+
+/// CRC-32 (IEEE 802.3, reflected), as the update's manifest carries it.
+fn crc32(data: &[u8]) -> u32 {
+    !data.iter().fold(!0u32, |c, &b| (0..8).fold(c ^ b as u32, |c, _| if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 }))
+}
+
+/// Goal 4 of milestone 4b, the refusal half: an update fetched over the same SMB path, whose
+/// manifest names the image's true size, CRC-32 and SHA-256 but carries a signature no key made.
+/// oxidrive should take the card for the update, download and check the image, refuse it on the
+/// signature, and give the card back; the running image stays. A signed image needs the owner's
+/// private key, which no test uses. It does not pass yet: the firmware hashes the download with
+/// the SHA accelerator in DMA mode, which on the P4 goes through the AXI GDMA (not modelled), so
+/// SHA_BUSY (0x50091018) never clears and the update stops after taking the card.
+#[test]
+#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto; fails until the P4's AXI GDMA serves SHA's DMA mode"]
+fn external_oxidrive_refuses_an_unsigned_update() {
+    use esp_soc::usb_host::fat32::clip_bytes;
+    let mut r = rig("oxidrive-ota.img", 4 << 30, false);
+    let end = Rig::env_secs("OXIDRIVE_SECONDS", 60) * 1_000_000_000;
+    while r.cs.now_ns < end && !r.p4_has("session ready") { let t = r.cs.now_ns + 1_000_000_000; r.run_to(t); }
+    assert!(r.p4_has("session ready"), "no MQTT session");
+    let (version, file) = ("0.1.0-0000001", "oxidrive-0.1.0-0000001.bin");
+    let image = clip_bytes("not an image", 256 << 10);
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let sig = hex(&[sha256(b"r"), sha256(b"s")].concat());
+    let dir = r.smb.path().join("oxidrive-ota");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(file), &image).unwrap();
+    std::fs::write(dir.join("manifest"), format!("version={version}\nfile={file}\nsize={}\ncrc32={:08x}\nsha256={}\nsig={sig}\n", image.len(), crc32(&image), hex(&sha256(&image)))).unwrap();
+    r.mqtt.client.publish(&format!("oxidrive/{}/cmd", r.id), &format!("update {version}")).unwrap();
+    while r.cs.now_ns < end && !r.p4_has("signature did not verify") { let t = r.cs.now_ns + 1_000_000_000; r.run_to(t); }
+    let t = r.cs.now_ns + 3_000_000_000;
+    r.run_to(t);
+    for l in r.p4_lines().iter().filter(|l| l.contains("ota") || l.contains("supervisor")) { eprintln!("[oxidrive]   {l}"); }
+    r.report(10);
+    assert!(r.p4_has("supervisor: card taken for a firmware update"), "the update never took the card");
+    assert!(r.p4_has("signature did not verify"), "not refused on the signature (SHA's DMA mode on the P4 is not modelled)");
+    assert!(r.p4_has("supervisor: card returned to the car"), "the card did not come back");
+    assert_eq!(r.cs.summary.p4_resets, 0, "nothing booted");
 }
