@@ -30,6 +30,7 @@ fn csr_name(n: u32) -> String {
         0x340 => "mscratch", 0x341 => "mepc", 0x342 => "mcause", 0x343 => "mtval", 0x344 => "mip",
         0x7a0 => "tselect", 0x7a1 => "tdata1", 0x7a2 => "tdata2", 0x7a3 => "tdata3", 0x7a5 => "tcontrol",
         0xb00 => "mcycle", 0xb02 => "minstret", 0xb80 => "mcycleh", 0xb82 => "minstreth",
+        0xc00 => "cycle", 0xc01 => "time", 0xc02 => "instret", 0xc80 => "cycleh", 0xc81 => "timeh", 0xc82 => "instreth",
         0xf11 => "mvendorid", 0xf12 => "marchid", 0xf13 => "mimpid", 0xf14 => "mhartid",
         0x3a0..=0x3a3 => return format!("pmpcfg{}", n - 0x3a0),
         0x3b0..=0x3bf => return format!("pmpaddr{}", n - 0x3b0),
@@ -149,6 +150,8 @@ pub fn format_for(misa: u32, i: &Insn) -> String {
             let imm5 = i.rs1;
             match i.op {
                 Csrrw if i.rd == 0 => format!("csrw\t{},{}", n, rs1),
+                // GNU objdump's Zicntr aliases: rdcycle, rdtime, rdinstret and their high halves
+                Csrrs if i.rs1 == 0 && matches!(i.imm, 0xc00..=0xc02 | 0xc80..=0xc82) => format!("rd{}\t{}", n, rd),
                 Csrrs if i.rs1 == 0 => format!("csrr\t{},{}", rd, n),
                 Csrrs if i.rd == 0 => format!("csrs\t{},{}", n, rs1),
                 Csrrc if i.rd == 0 => format!("csrc\t{},{}", n, rs1),

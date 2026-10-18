@@ -202,17 +202,15 @@ fn hello_world_c6_reboot() {
 }
 
 /// hello_world for the ESP32-P4 rev < 3 from the ECO0 mask ROM (docs/esp32p4.md), with the
-/// default boot mode and console: the ROM banner, the bootloader's partition table, and the
-/// stop in bootloader_fill_random, which waits for the cycle CSR (0xC00) the core model does
-/// not have yet. esp32p4/tests/hello.rs runs on past it with a stand-in for that CSR.
+/// default boot mode and console: the bootloader loads the app, which starts at 360 MHz with the
+/// board's heap regions.
 #[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
 fn hello_world_p4() {
     let rom = rom("esp32p4_rev0");
     let args = ["--rom", rom.to_str().unwrap(), "--flash-mb", "2",
-        "--bootloader", &format!("{FW}/p4-hello-bootloader.bin"), "--ptable", &format!("{FW}/p4-hello-ptable.bin"), "--app", &format!("{FW}/p4-hello_world.bin"), "--max-seconds", "0.05"];
+        "--bootloader", &format!("{FW}/p4-hello-bootloader.bin"), "--ptable", &format!("{FW}/p4-hello-ptable.bin"), "--app", &format!("{FW}/p4-hello_world.bin"), "--max-seconds", "0.1"];
     let r = run(BIN_P4, &args);
-    assert!(r.stdout.contains("I (0) boot: End of partition table"), "the bootloader never listed the partitions:\n{}", r.stdout);
-    assert!(r.stderr.contains("bootloader_fill_random waits for `rdcycle` (CSR 0xC00)"), "the cycle-CSR stop was not reported:\n{}", r.stderr);
+    assert!(r.stdout.contains("cpu_start: cpu freq: 360000000 Hz"), "the app never started:\n{}", r.stdout);
     expect_text("hello-p4.console.txt", &r.stdout);
     expect_u64("hello-p4.insns", r.insns);
     let r2 = run(BIN, &[&["--chip", "p4"][..], &args[..]].concat());

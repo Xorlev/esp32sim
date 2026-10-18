@@ -39,9 +39,6 @@ pub mod src {
     }
 }
 
-/// Consecutive RNG_DATA reads after which the spin is reported.
-const RNG_SPIN_REPORT: u32 = 1 << 16;
-
 /// CLIC interrupt IDs: 0-15 are the core's own, IDF's CPU interrupt lines 0-31 are IDs 16-47
 /// (IDF v5.5.3 include/soc/clic_reg.h CLIC_EXT_INTR_NUM_OFFSET, hal/include/hal/interrupt_clic_ll.h).
 pub const CLIC_IDS: usize = 48;
@@ -441,8 +438,6 @@ pub struct Peripherals {
     /// WDEV_RND_REG = LP_SYSTEM_REG_RNG_DATA (0x501101A4) on rev < 3
     /// (IDF v5.5.3 register/hw_ver1/soc/wdev_reg.h:16, lp_system_reg.h:1251)
     pub rng: Rng,
-    /// RNG_DATA reads with no other register access between them
-    rng_spin: u32,
     /// register RAM behind unmodelled blocks, first-touch logging, pc attribution
     pub misc: Misc,
     pub spi_exec: bool,
@@ -493,15 +488,7 @@ impl DeviceSet for Peripherals {
     fn pre_access(&mut self, block: u32, off: u32, write: bool) {
         // INTR_STATUS_0..3 read the source state.
         if block == 0x500d6 && !write && (0x200..=0x20c).contains(&(off & 0x7ff)) { self.intmtx.status = self.source_status(); }
-        if block == 0x50110 && off == 0x1a4 && !write {
-            self.rng.now = self.clock.cycles() as u32;
-            self.rng_spin += 1;
-            // IDF v5.5.3 bootloader_support/src/bootloader_random.c:41-60 reads it until the cycle
-            // count (`rdcycle`) has advanced 1440 cycles; a cycle CSR that never moves spins here.
-            if self.rng_spin == RNG_SPIN_REPORT { eprintln!("[esp32p4] RNG_DATA read {} times with nothing else in between at pc {:#010x}: bootloader_fill_random waits for `rdcycle` (CSR 0xC00) to advance, and the core model returns 0 for it", RNG_SPIN_REPORT, self.misc.cur_pc); }
-        } else {
-            self.rng_spin = 0;
-        }
+        if block == 0x50110 && off == 0x1a4 && !write { self.rng.now = self.clock.cycles() as u32; }
     }
 }
 
@@ -516,7 +503,7 @@ impl Peripherals {
             efuse: efuse_p4(mac, wafer, (0, 3)),
             spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true), psram1: psram_controller(),
             sha: Sha::new(), intmtx: IntMatrix::new(), clic: Clic::default(), cache: Cache::new(), hp_sys: HpSys::default(), hp_clkrst: HpClkRst::new(),
-            lp: LpAon::new(), ana_mst: AnaMst::default(), assist_debug: AssistDebug::default(), rng: Rng::new(), rng_spin: 0,
+            lp: LpAon::new(), ana_mst: AnaMst::default(), assist_debug: AssistDebug::default(), rng: Rng::new(),
             misc: Misc::new(), spi_exec: false, psram_exec: false, clock: Self::new_clock(), last_status: [0; 4],
         }
     }
