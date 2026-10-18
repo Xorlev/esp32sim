@@ -153,7 +153,13 @@ pub enum CardState { #[default] Inactive, Init, Standby, Command }
 struct Xfer { write: bool, func: u8, addr: u32, incr: bool, left: u32, packet: u32 }
 
 #[derive(Clone, Copy, Default, Debug)]
-pub struct SdioStats { pub commands: u64, pub to_host: u64, pub from_host: u64, pub underflows: u64, pub overflows: u64 }
+pub struct SdioStats {
+    pub commands: u64, pub to_host: u64, pub from_host: u64, pub underflows: u64, pub overflows: u64,
+    /// host reads of INT_RAW showing RX_NEW_PACKET while PKT_LEN still held the length the host
+    /// last read: a packet announced before its length (a host PKT_LEN poll between the length
+    /// write and the INT_RAW read also counts, so this is an upper bound)
+    pub stale_new_packets: u64,
+}
 
 pub struct SdioSlave {
     cfg_data0: u32,
@@ -168,6 +174,10 @@ pub struct SdioSlave {
     tx: TxLink,
     /// an rx START or RESTART waits for the DMA to read the descriptor (`run_dma`)
     rx_kick: bool,
+    /// an rx START found a packet: the host's RX_NEW_PACKET waits for the length that follows
+    new_packet_armed: bool,
+    /// PKT_LEN as the host last read it
+    host_len: u32,
     slc: RegRam,
     host_raw: u32,
     host_ena: u32,
@@ -194,7 +204,7 @@ impl SdioSlave {
         slc.write(slc::RX_DSCR_CONF, 1 << 1 | 1 << 3);
         SdioSlave {
             cfg_data0: CFG_DATA0_RESET, cfg_data1: CFG_DATA1_RESET, hinf: RegRam::new(), conf0: 0, int_raw: 0, int_ena: 0, token: [0; 2], len: 0,
-            rx: RxLink::default(), tx: TxLink::default(), rx_kick: false, slc, host_raw: 0, host_ena: 0, host_ram: RegRam::new(),
+            rx: RxLink::default(), tx: TxLink::default(), rx_kick: false, new_packet_armed: false, host_len: 0, slc, host_raw: 0, host_ena: 0, host_ram: RegRam::new(),
             state: CardState::Inactive, rca: 0, ioe: 0, ien: 0, bus_ctrl: 0, ehs: false, blksz: [512; 3], xfer: None,
             stats: SdioStats::default(), log: false,
         }
@@ -219,21 +229,22 @@ impl SdioSlave {
     pub fn dma_pending(&self) -> bool { self.rx_kick }
 
     /// An rx START or RESTART: the DMA fetches the descriptor. One the hardware owns is a packet
-    /// to send: SLC0_RX_DONE once it is loaded, and the host's SLC0_RX_NEW_PACKET. The driver waits
-    /// for that RX_DONE with a one-byte descriptor and then clears the host interrupt it raised
-    /// (hal/sdio_slave_hal.c, `send_isr_invoker_enable`), which is what both are inferred from.
+    /// to send: SLC0_RX_DONE once it is loaded, which the driver waits for with a one-byte
+    /// descriptor (hal/sdio_slave_hal.c, `send_isr_invoker_enable`). The host's RX_NEW_PACKET
+    /// waits for the PKT_LEN write the driver makes after the START (`send_new_packet`): raised at
+    /// the START, the host's combined register read can see it with the old length. Guessed.
     pub fn run_dma(&mut self, mem: &mut dyn DmaMem) {
         if !std::mem::take(&mut self.rx_kick) || !self.rx.running { return; }
         if let Some(d) = Desc::load(mem, self.rx.cur) {
             if d.owned() {
                 self.int_raw |= sint::RX_DONE;
-                self.host_raw |= hint::NEW_PACKET;
+                self.new_packet_armed = true;
                 if self.log { eprintln!("[sdio] rx link at {:#010x}: {} bytes{}", self.rx.cur, d.length(), if d.eof() { ", EOF" } else { "" }); }
             }
         }
     }
 
-    fn reset_rx(&mut self) { self.rx = RxLink::default(); self.rx_kick = false; }
+    fn reset_rx(&mut self) { self.rx = RxLink::default(); self.rx_kick = false; self.new_packet_armed = false; }
     fn reset_tx(&mut self) { self.tx = TxLink::default(); }
 
     /// The I/O reset (CCCR RES, §4.4): every function back to its power-on state, CMD5 needed
@@ -282,8 +293,8 @@ impl SdioSlave {
         if func as u32 > IO_FUNCTIONS { return R5_CMD | R5_FUNCTION; }
         let out = if write {
             self.io_write(func, addr, data, mem);
-            if raw { self.io_read(func, addr) } else { data }
-        } else { self.io_read(func, addr) };
+            if raw { self.host_read(func, addr) } else { data }
+        } else { self.host_read(func, addr) };
         R5_CMD | out as u32
     }
 
@@ -311,7 +322,7 @@ impl SdioSlave {
             x.packet -= take as u32;
             self.stats.to_host += got as u64;
         } else {
-            for b in buf[..n].iter_mut() { *b = self.io_read(x.func, x.addr); if x.incr { x.addr += 1; } }
+            for b in buf[..n].iter_mut() { *b = self.host_read(x.func, x.addr); if x.incr { x.addr += 1; } }
             buf[n..].fill(0);
         }
         x.left -= n as u32;
@@ -398,6 +409,15 @@ impl SdioSlave {
         self.int_raw |= sint::TX_DONE | if eof { sint::TX_SUC_EOF } else { 0 };
         if self.log { eprintln!("[sdio] tx buffer {:#010x}: {} bytes{}", self.tx.cur, self.tx.fill, if eof { ", EOF" } else { "" }); }
         (self.tx.last, self.tx.cur, self.tx.fill) = (self.tx.cur, d.next, 0);
+    }
+
+    /// A byte the host reads, with the bookkeeping behind `SdioStats::stale_new_packets`.
+    fn host_read(&mut self, func: u8, addr: u32) -> u8 {
+        if func == 1 {
+            if addr == host::INT_RAW + 2 && self.host_raw & hint::NEW_PACKET != 0 && self.len == self.host_len { self.stats.stale_new_packets += 1; }
+            if addr == host::PKT_LEN { self.host_len = self.len; }
+        }
+        self.io_read(func, addr)
     }
 
     /// A byte of a function's register space.
@@ -527,7 +547,7 @@ impl SdioSlave {
             slc::INT_ENA => self.int_ena = v,
             slc::INT_CLR => self.int_raw &= !v,
             slc::RX_LINK => {
-                if v & slc::LINK_STOP != 0 { self.rx.running = false; }
+                if v & slc::LINK_STOP != 0 { self.rx.running = false; self.new_packet_armed = false; }
                 if v & slc::LINK_START != 0 { self.rx = RxLink { running: true, cur: self.slc.read(slc::RX_LINK_ADDR), off: 0 }; self.rx_kick = true; }
                 if v & slc::LINK_RESTART != 0 && self.rx.running { self.rx_kick = true; }
                 self.slc.write(off, v);
@@ -551,6 +571,9 @@ impl SdioSlave {
                 if v & slc::LEN_WR != 0 { self.len = wdata; }
                 if v & slc::LEN_INC != 0 { self.len = (self.len + 1) & 0xf_ffff; }
                 if v & slc::LEN_INC_MORE != 0 { self.len = (self.len + wdata) & 0xf_ffff; }
+                if v & (slc::LEN_WR | slc::LEN_INC | slc::LEN_INC_MORE) != 0 && std::mem::take(&mut self.new_packet_armed) {
+                    self.host_raw |= hint::NEW_PACKET;
+                }
             }
             _ => self.slc.write(off, v),
         }

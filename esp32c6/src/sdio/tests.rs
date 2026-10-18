@@ -166,7 +166,7 @@ fn slave_to_host_descriptors_go_back_at_eof() {
     assert!(s.dma_pending());
     s.run_dma(&mut ram.mem());
     assert_eq!(Device::read(&mut s, SLC + slc::INT_RAW) & sint::RX_DONE, sint::RX_DONE, "the invoker's RX_DONE");
-    assert_eq!(Device::read(&mut s, HOST + host::INT_RAW), hint::NEW_PACKET);
+    assert_eq!(Device::read(&mut s, HOST + host::INT_RAW), 0, "no length follows the invoker: no RX_NEW_PACKET");
     Device::write(&mut s, SLC + slc::RX_LINK, slc::LINK_STOP);
     Device::write(&mut s, HOST + host::INT_CLR, hint::NEW_PACKET);
     Device::write(&mut s, SLC + slc::INT_CLR, sint::RX_DONE);
@@ -181,6 +181,7 @@ fn slave_to_host_descriptors_go_back_at_eof() {
     s.run_dma(&mut ram.mem());
     Device::write(&mut s, SLC + slc::LEN_CONF, 700 | 1 << 20);
     assert_eq!(Device::read(&mut s, HOST + host::PKT_LEN), 700);
+    assert_eq!(Device::read(&mut s, HOST + host::INT_RAW), hint::NEW_PACKET);
     short(s.command(53, cmd53(false, 1, true, true, FIFO_END - 700, 2), &mut ram.mem()));
     let mut got = vec![0u8; 1024];
     for chunk in got.chunks_mut(512) { s.read_data(chunk, &mut ram.mem()).unwrap(); }
@@ -253,11 +254,49 @@ fn a_link_start_through_the_bus_reads_the_descriptor_at_once() {
     b.write32(0x6001_7040, at).unwrap();
     b.write32(0x6001_703c, slc::LINK_START).unwrap();
     assert_eq!(b.read32(0x6001_7004).unwrap() & sint::RX_DONE, sint::RX_DONE);
-    assert_eq!(b.read32(0x6001_8050).unwrap(), hint::NEW_PACKET, "SLCHOST INT_RAW");
+    assert_eq!(b.read32(0x6001_8050).unwrap(), 0, "SLCHOST INT_RAW: RX_NEW_PACKET waits for the length");
+    b.write32(0x6001_70f4, slc::LEN_WR | 1).unwrap();
+    assert_eq!(b.read32(0x6001_8050).unwrap(), hint::NEW_PACKET);
     b.periph.refresh_lines();
     assert_eq!(b.periph.source_status()[2] & 1, 0, "SLC0 masked");
     b.write32(0x6001_700c, sint::RX_DONE).unwrap();
     b.periph.refresh_lines();
     assert_eq!(b.periph.source_status()[2] & 1, 1, "source 64 asserted");
     assert_eq!(b.sdio_command(5, 0), Ok(SdResponse::Short(1 << 31 | 2 << 28 | 0xff8000)));
+}
+
+/// `send_new_packet` stops, resets and starts the link, then writes PKT_LEN. The host's combined
+/// register read (INT_RAW to PKT_LEN in one CMD53, esp_hosted sdio_drv.c `sdio_read_regs`) between
+/// the START and the length must not announce a packet whose length it cannot see yet.
+#[test]
+fn a_packet_is_announced_with_its_length() {
+    let (mut s, mut ram) = (SdioSlave::new(), Ram::new());
+    selected(&mut s, &mut ram);
+    let regs = |s: &mut SdioSlave, ram: &mut Ram| {
+        short(s.command(53, cmd53(false, 1, false, true, host::INT_RAW, 20), &mut ram.mem()));
+        let mut b = [0u8; 20];
+        s.read_data(&mut b, &mut ram.mem()).unwrap();
+        (u32::from_le_bytes(b[0..4].try_into().unwrap()), u32::from_le_bytes(b[16..20].try_into().unwrap()))
+    };
+    ram.desc(BASE + 0x200, 64, 64, true, BASE + 0x1000, 0);
+    Device::write(&mut s, SLC + slc::RX_LINK_ADDR, BASE + 0x200);
+    Device::write(&mut s, SLC + slc::RX_LINK, slc::LINK_START);
+    s.run_dma(&mut ram.mem());
+    assert_eq!(regs(&mut s, &mut ram), (0, 0), "between START and the length: nothing announced");
+    Device::write(&mut s, SLC + slc::LEN_CONF, slc::LEN_WR | 64);
+    assert_eq!(regs(&mut s, &mut ram), (hint::NEW_PACKET, 64), "announced with its length");
+    assert_eq!(s.stats.stale_new_packets, 0);
+    Device::write(&mut s, HOST + host::INT_CLR, hint::NEW_PACKET);
+    // a STOP between them takes the announcement back
+    Device::write(&mut s, SLC + slc::RX_LINK, slc::LINK_START);
+    s.run_dma(&mut ram.mem());
+    Device::write(&mut s, SLC + slc::RX_LINK, slc::LINK_STOP);
+    Device::write(&mut s, SLC + slc::LEN_CONF, slc::LEN_WR | 128);
+    assert_eq!(regs(&mut s, &mut ram).0, 0);
+    // the counter: a length write that leaves PKT_LEN where the host last read it
+    Device::write(&mut s, SLC + slc::RX_LINK, slc::LINK_START);
+    s.run_dma(&mut ram.mem());
+    Device::write(&mut s, SLC + slc::LEN_CONF, slc::LEN_WR | 128);
+    assert_eq!(regs(&mut s, &mut ram), (hint::NEW_PACKET, 128));
+    assert_eq!(s.stats.stale_new_packets, 1, "RX_NEW_PACKET with the length the host already had");
 }
