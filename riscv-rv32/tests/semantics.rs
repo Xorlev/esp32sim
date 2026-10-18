@@ -1,9 +1,11 @@
 //! Hermetic tests of the RV32IMC core on a flat RAM: arithmetic and memory through a loop,
 //! `step` against `Core::run`, vectored interrupts through the C3's `mtvec` mode, `ecall`,
-//! `ebreak`, `mret`. Programs assembled with `riscv32-esp-elf-as -march=rv32imc_zicsr`.
+//! `ebreak`, `mret`; RV32A on the C6 core and RV32F with its lazy-FPU traps on the P4 core.
+//! Programs assembled with `riscv32-esp-elf-as -march=rv32imc_zicsr` (`rv32imac_zicsr`,
+//! `rv32imafc_zicsr` for the A and F programs).
 use emu_core::Core;
-use riscv_rv32::state::csr;
-use riscv_rv32::{decode, disasm, step, Cpu, FlatRam, Trap};
+use riscv_rv32::state::{csr, mstatus, MISA_RV32IMAFC};
+use riscv_rv32::{decode, decode_for, disasm, step, Cpu, FlatRam, Trap};
 
 const BASE: u32 = 0x4038_0000;
 
@@ -14,12 +16,14 @@ fn asm(listing: &str) -> Vec<u8> {
     out
 }
 
-fn machine(prog: &[u8], first: &str) -> (Cpu, FlatRam) {
+fn machine(prog: &[u8], first: &str) -> (Cpu, FlatRam) { machine_on(Cpu::new(), prog, first) }
+
+fn machine_on(mut cpu: Cpu, prog: &[u8], first: &str) -> (Cpu, FlatRam) {
     let mut ram = FlatRam::new(BASE, 64 * 1024);
     ram.mem[..prog.len()].copy_from_slice(prog);
-    let mut cpu = Cpu::new(); cpu.pc = BASE;
+    cpu.pc = BASE;
     let mut b = [0u8; 4]; b.copy_from_slice(&ram.mem[..4]);
-    assert_eq!(disasm::format(&decode(BASE, b)).replace('\t', " "), first, "the pasted program does not start with the expected instruction");
+    assert_eq!(disasm::format_for(cpu.misa, &decode_for(cpu.misa, BASE, b)).replace('\t', " "), first, "the pasted program does not start with the expected instruction");
     (cpu, ram)
 }
 
@@ -110,4 +114,170 @@ fn atomics_reserve_swap_and_combine() {
     assert_eq!(d(0x18c526af), "sc.w a3,a2,(a0)");
     assert_eq!(cpu.read_csr(csr::MISA), 0x4000_1104, "the default core still reports RV32IMC");
     assert_eq!(riscv_rv32::Cpu::new_rv32imac().read_csr(csr::MISA), 0x4000_1105, "the C6 core reports RV32IMAC");
+}
+
+/// RV32F on the P4 core, through instructions: static and dynamic rounding, accrued flags, the
+/// canonical NaN, -0 in fmin/fmax, conversions that clip, quiet and signaling compares, fclass,
+/// the fused multiply-adds (the n-forms negate the product, so -(+0) + +0 is +0), FS = Dirty.
+const FARITH: &str = "000022b7 3002a073 3f800537 f0050553 00300593 d005f5d3 18b57653 18b516d3 18b53753 00215073 18b577d3 00102673 00101073 \
+    f0000053 180570d3 18007153 e00106d3 00102773 200011d3 28300253 280192d3 c000f7d3 c0117853 c00638d3 00101073 a0212953 001029f3 \
+    a0a11a53 00102af3 e0019b53 00200313 d0037353 50b37443 50b374c7 50b3794b 50b379cf 00205073 00a07a43 00a07acb 00a07b4f 5805fbd3 \
+    20352c53 c01c1bd3 00302c73 30002cf3 0000006f";
+
+#[test]
+fn f_arithmetic_rounds_flags_and_canonicalises() {
+    let n = asm(FARITH).len() / 4 - 1;
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &asm(FARITH), "lui t0,0x2");
+    for _ in 0..n { step(&mut cpu, &mut ram).unwrap(); }
+    let (f, x) = (cpu.f, cpu.x);
+    assert_eq!(cpu.pc, BASE + 4 * n as u32, "parked on the final j");
+    assert_eq!((f[12], f[13], f[14], f[15]), (0x3eaa_aaab, 0x3eaa_aaaa, 0x3eaa_aaab, 0x3eaa_aaaa), "1/3 in dyn (RNE), rtz, rup, dyn (RDN)");
+    assert_eq!(x[12], 0x01, "1/3 is inexact");
+    assert_eq!((f[1], f[2], x[13], x[14]), (0x7f80_0000, 0x7fc0_0000, 0x7fc0_0000, 0x18), "1/0 = +inf (DZ), 0/0 = the canonical NaN (NV)");
+    assert_eq!((f[3], f[4], f[5]), (0x8000_0000, 0x8000_0000, 0), "fneg, fmin(+0,-0) = -0, fmax(-0,+0) = +0");
+    assert_eq!((x[15], x[16], x[17]), (0x7fff_ffff, 0xffff_ffff, 1), "fcvt.w.s(+inf), fcvt.wu.s(NaN), fcvt.w.s(1/3, rup)");
+    assert_eq!((x[18], x[19], x[20], x[21]), (0, 0, 0, 0x10), "feq of a quiet NaN raises nothing, flt raises NV");
+    assert_eq!(x[22], 1 << 3, "fclass(-0)");
+    assert_eq!((f[8], f[9], f[18], f[19]), (0x40e0_0000, 0x40a0_0000, 0xc0a0_0000, 0xc0e0_0000), "fmadd 7, fmsub 5, fnmsub -5, fnmadd -7");
+    assert_eq!((f[20], f[21], f[22]), (0, 0, 0x8000_0000), "+0 sums: fmadd +0, fnmsub +0, fnmadd -0");
+    assert_eq!((f[23], f[24], x[23]), (0x3fdd_b3d7, 0xbf80_0000, 0), "sqrt 3, fsgnjx(1,-0) = -1, fcvt.wu.s(-1) clips to 0");
+    assert_eq!(x[24], 0x11, "fcsr: frm RNE, NV from flt and fcvt.wu.s, NX from sqrt");
+    assert_eq!(x[25], 0x8000_7800, "mstatus: SD, FS = Dirty, MPP = M");
+    // the same program through Core::run leaves the same state
+    let (mut b, mut rb) = machine_on(Cpu::new_esp32p4(), &asm(FARITH), "lui t0,0x2");
+    let mut left = n as u32;
+    while left > 0 { let (used, t) = b.run(&mut rb, left); assert_eq!(t, None); left -= used; }
+    assert_eq!((b.x, b.f, b.fcsr, b.mstatus, b.pc), (cpu.x, cpu.f, cpu.fcsr, cpu.mstatus, cpu.pc));
+}
+
+/// The lazy FPU contract ESP-IDF v5.5.3 relies on (`components/riscv/vectors.S`, `_panic_handler`):
+/// with FS = Off every F instruction and FP CSR access is an illegal instruction with mtval = its
+/// bits; EXT_ILL (0x7F0) bit 0 is set for the computational instructions only, and reads and
+/// clears with `csrrw a2,0x7f0,zero`.
+#[test]
+fn fs_off_traps_with_the_instruction_and_its_ext_ill_reason() {
+    let prog = asm("00c5f553 e00505d3 00052507 003025f3 7f001673 e15c 6022");
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &prog, "fadd.s fa0,fa1,fa2");
+    assert_eq!(cpu.mstatus & mstatus::FS, 0, "FS is Off at reset");
+    cpu.mtvec = BASE + 0x400;
+    cpu.x[10] = BASE + 0x800; cpu.x[2] = BASE + 0x900;
+    // (offset, raw, EXT_ILL after the trap)
+    let traps = [(0, 0x00c5_f553, 1), (8, 0x0005_2507, 0), (12, 0x0030_25f3, 0), (20, 0xe15c, 0), (22, 0x6022, 0), (4, 0xe005_05d3, 1)];
+    for (k, &(off, raw, ext)) in traps.iter().enumerate() {
+        if k == 1 {
+            cpu.pc = BASE + 16;
+            step(&mut cpu, &mut ram).unwrap();                     // csrrw a2,0x7f0,zero needs no FP state
+            assert_eq!((cpu.x[12], cpu.ext_ill), (1, 0), "EXT_ILL read and cleared");
+        }
+        cpu.pc = BASE + off;
+        assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Exception(2)), "{raw:08x}");
+        assert_eq!((cpu.mcause, cpu.mtval, cpu.mepc, cpu.pc), (2, raw, BASE + off, BASE + 0x400), "{raw:08x}");
+        assert_eq!(cpu.ext_ill, ext, "EXT_ILL after {raw:08x}");
+    }
+    assert_eq!((cpu.f, cpu.fcsr, cpu.mstatus & (mstatus::FS | mstatus::SD)), ([0; 32], 0, 0), "a trapped F instruction changes no FP state");
+    // with the unit on, the same instructions run
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::FS_INITIAL);
+    for off in [0, 4, 8, 12] { cpu.pc = BASE + off; step(&mut cpu, &mut ram).unwrap(); }
+}
+
+/// `rv_utils_enable_fpu` (ESP-IDF v5.5.3 `riscv/include/riscv/rv_utils.h`) sets FS = Initial,
+/// writes fcsr and clears bit 13, then requires FS = Clean; FreeRTOS reads bit 13 as the dirty bit.
+/// A store reads FP state and leaves it Clean, a load makes it Dirty, clearing both bits turns it Off.
+#[test]
+fn fs_follows_the_idf_enable_sequence() {
+    let prog = asm("000027b7 3007a073 00100713 00371073 3007b073 30002573 00a12027 300025f3 00012587 30002673 000066b7 3006b073 300026f3 0000006f");
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &prog, "lui a5,0x2");
+    cpu.x[2] = BASE + 0x800;
+    for _ in 0..13 { step(&mut cpu, &mut ram).unwrap(); }
+    assert_eq!(cpu.x[10], 0x5800, "FS = Clean after the enable sequence, SD clear");
+    assert_eq!(cpu.fcsr, 1, "the fcsr write landed");
+    assert_eq!(cpu.x[11], 0x5800, "fsw leaves FS Clean");
+    assert_eq!(cpu.x[12], 0x8000_7800, "flw makes it Dirty, with SD");
+    assert_eq!(cpu.x[13], 0x1800, "csrc mstatus,0x6000 turns it Off and clears SD");
+    cpu.write_csr(csr::MSTATUS, 0x8000_1800);
+    assert_eq!(cpu.read_csr(csr::MSTATUS), 0x1800, "SD is read-only");
+}
+
+/// C.FLW, C.FSW, C.FLWSP and C.FSWSP move bits unchanged, a signaling NaN included, and f0 is a
+/// valid C.FLWSP destination.
+#[test]
+fn compressed_fp_loads_and_stores_move_bits() {
+    let prog = asm("615c fdfc 7ffe e07e 6012 a001");
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &prog, "flw fa5,4(a0)");
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::FS_INITIAL);
+    cpu.x[10] = BASE + 0x800; cpu.x[11] = BASE + 0x900; cpu.x[2] = BASE + 0xa00;
+    let put = |ram: &mut FlatRam, off: usize, v: u32| ram.mem[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    put(&mut ram, 0x804, 0x7f80_0001); put(&mut ram, 0xafc, 0xdead_beef); put(&mut ram, 0xa04, 0x3f80_0000);
+    for _ in 0..5 { step(&mut cpu, &mut ram).unwrap(); }
+    let get = |ram: &FlatRam, off: usize| u32::from_le_bytes(ram.mem[off..off + 4].try_into().unwrap());
+    assert_eq!((cpu.f[15], get(&ram, 0x900 + 124)), (0x7f80_0001, 0x7f80_0001), "c.flw/c.fsw keep a signaling NaN's bits");
+    assert_eq!((cpu.f[31], get(&ram, 0xa00)), (0xdead_beef, 0xdead_beef), "c.flwsp 252(sp), c.fswsp 0(sp)");
+    assert_eq!(cpu.f[0], 0x3f80_0000, "c.flwsp into f0");
+    assert_eq!(cpu.pc, BASE + 10);
+    assert_eq!(cpu.fcsr, 0, "moves raise no flags");
+}
+
+/// Reserved rounding modes trap as illegal instructions, static (5, 6) or through frm (5, 6, 7),
+/// and are not an FPU-off reason: EXT_ILL stays clear, so ESP-IDF panics instead of re-enabling the
+/// FPU and retrying forever.
+#[test]
+fn reserved_rounding_modes_are_illegal() {
+    let prog = asm("00c5d553 5805e553 0022d073 00c5f553 0023d073 d0057553 00225073 00c5f553");
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &prog, "fadd.s fa0,fa1,fa2,unknown");
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::FS_DIRTY);
+    cpu.mtvec = BASE + 0x400;
+    for (off, raw) in [(0, 0x00c5_d553), (4, 0x5805_e553), (12, 0x00c5_f553), (20, 0xd005_7553)] {
+        if off >= 12 { cpu.pc = BASE + off - 4; step(&mut cpu, &mut ram).unwrap(); }   // fsrmi 5, then 7
+        cpu.pc = BASE + off;
+        assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Exception(2)), "{raw:08x}");
+        assert_eq!((cpu.mtval, cpu.mepc, cpu.ext_ill), (raw, BASE + off, 0), "{raw:08x}");
+    }
+    cpu.pc = BASE + 24;
+    step(&mut cpu, &mut ram).unwrap();                             // fsrmi 4: RMM is valid
+    step(&mut cpu, &mut ram).unwrap();
+    assert_eq!(cpu.pc, BASE + 32);
+}
+
+/// The C3 and C6 cores have no F: its encodings, compressed ones included, stay illegal with mtval
+/// = the instruction, and mstatus, fcsr's number and 0x7F0 keep behaving as plain CSRs, as before
+/// F was added.
+#[test]
+fn cores_without_f_treat_f_as_illegal() {
+    for core in [Cpu::new(), Cpu::new_rv32imac()] {
+        let prog = asm("00c5f553 615c 00052507 003025f3 00371073 003025f3 7f001673");
+        let (mut cpu, mut ram) = machine_on(core, &prog, "unimp");
+        cpu.mtvec = BASE + 0x400;
+        cpu.x[10] = BASE + 0x800;
+        for (off, raw) in [(0, 0x00c5_f553), (4, 0x615c), (6, 0x0005_2507)] {
+            cpu.pc = BASE + off;
+            assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Exception(2)), "{raw:08x}");
+            assert_eq!((cpu.mcause, cpu.mtval, cpu.mepc), (2, raw, BASE + off), "{raw:08x}");
+        }
+        cpu.pc = BASE + 10;
+        cpu.x[14] = 0x1234;
+        for _ in 0..4 { step(&mut cpu, &mut ram).unwrap(); }
+        assert_eq!((cpu.x[11], cpu.x[12]), (0x1234, 0), "fcsr's number reads back what was written, 0x7F0 is unmodelled");
+        assert_eq!((cpu.f, cpu.fcsr, cpu.ext_ill), ([0; 32], 0, 0));
+        cpu.write_csr(csr::MSTATUS, 0x8000_7800);
+        assert_eq!(cpu.read_csr(csr::MSTATUS), 0x8000_7800, "mstatus keeps whatever was written");
+        let d = |w: u32| cpu.disasm(BASE, w.to_le_bytes());
+        assert_eq!((d(0x00c5_f553), d(0x615c), d(0x0030_25f3)), ("unimp".into(), "unimp".into(), "csrr a1,fcsr".into()));
+    }
+    let p4 = Cpu::new_esp32p4();
+    let d = |w: u32| p4.disasm(BASE, w.to_le_bytes());
+    assert_eq!((d(0x00c5_f553), d(0x615c), d(0x0030_25f3)), ("fadd.s fa0,fa1,fa2".into(), "flw fa5,4(a0)".into(), "frcsr a1".into()));
+}
+
+/// A chip reset keeps the core's ISA and EXT_ILL, and resets the FP state with FS = Off.
+#[test]
+fn reset_keeps_the_p4_configuration() {
+    let mut cpu = Cpu::new_esp32p4();
+    cpu.write_csr(csr::MSTATUS, mstatus::FS_DIRTY);
+    cpu.f[3] = 5; cpu.fcsr = 0x1f; cpu.ext_ill = 1;
+    cpu.reset();
+    assert_eq!((cpu.read_csr(csr::MISA), cpu.misa, cpu.has_ext_ill), (0x4000_1125, MISA_RV32IMAFC, true));
+    assert_eq!((cpu.mstatus, cpu.f[3], cpu.fcsr, cpu.ext_ill), (0x1800, 0, 0, 0));
+    let mut c3 = Cpu::new();
+    c3.reset();
+    assert_eq!((c3.misa, c3.has_ext_ill), (0x4000_1104, false));
 }
