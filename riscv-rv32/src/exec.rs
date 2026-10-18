@@ -35,23 +35,23 @@ pub const CLIC_IRQ_SHV: u32 = 1 << 16;
 /// IDF's CPU lines 0-31 are CLIC IDs 16-47 (ESP-IDF v5.5.3 riscv/include/esp_private/interrupt_clic.h:40-41).
 pub const CLIC_EXT_OFFSET: u32 = 16;
 
-/// Take a CLIC interrupt (CLIC specification, "CLIC Interrupt Operation"): one strictly above
-/// the current level, with MIE set and `mtvec` in mode 3. mcause gets the ID and the previous
-/// level, the level becomes the interrupt's, and an SHV interrupt jumps through `mtvt + 4*id`,
-/// a memory read made with MINHV set; the rest enter at the 64-byte-aligned `mtvec` base.
+/// Take a CLIC interrupt (CLIC specification, "CLIC Interrupt Operation"), once the caller has
+/// seen it is strictly above the current level with MIE set and `mtvec` in mode 3. mcause gets
+/// the ID and the previous level, the level becomes the interrupt's, and an SHV interrupt jumps
+/// through `mtvt + 4*id`, a memory read made with MINHV set; the rest enter at the 64-byte-
+/// aligned `mtvec` base. A fault on that read is taken as an instruction access fault at the
+/// table entry with MINHV left set; the specification's resumption of the table fetch by `mret`
+/// is not modelled (IDF's table is in mapped RAM).
 #[cold]
 #[inline(never)]
-fn clic_take<B: Bus>(cpu: &mut Cpu, bus: &mut B, irq: u32, pc: u32) -> Option<StepOutcome> {
+fn clic_take<B: Bus>(cpu: &mut Cpu, bus: &mut B, irq: u32, pc: u32) -> StepOutcome {
     use crate::state::{mcause, mstatus};
     let level = (irq >> CLIC_IRQ_LEVEL_SHIFT) & 0xff;
-    // A presented interrupt ends a WFI even when it cannot be taken: the privileged ISA allows
-    // a WFI to resume for any reason, and a core left asleep could not be woken by a lower one.
-    cpu.waiting = false;
-    if level <= cpu.mil || !cpu.mie_enabled() || !cpu.clic_mode() { return None; }
     let (line, id) = (irq & 0x1f, (irq & 0x1f) + CLIC_EXT_OFFSET);
     cpu.insn_count += 1; cpu.cycle_count += 1;
     cpu.mepc = pc;
     cpu.mtval = 0;
+    cpu.reservation = None;
     let mpie = if cpu.mstatus & mstatus::MIE != 0 { mstatus::MPIE } else { 0 };
     cpu.mstatus = (cpu.mstatus & !(mstatus::MIE | mstatus::MPIE)) | mpie | mstatus::MPP;
     cpu.mcause = mcause::INTERRUPT | cpu.mil << mcause::MPIL_SHIFT | id;
@@ -63,13 +63,13 @@ fn clic_take<B: Bus>(cpu: &mut Cpu, bus: &mut B, irq: u32, pc: u32) -> Option<St
             Err(_) => {
                 cpu.trap(exc::INSN_ACCESS_FAULT, entry, entry);
                 cpu.mcause |= mcause::MINHV;
-                return Some(StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Exception(exc::INSN_ACCESS_FAULT)), control: None });
+                return StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Exception(exc::INSN_ACCESS_FAULT)), control: None };
             }
         }
     } else {
         cpu.pc = cpu.mtvec & !0x3f;
     }
-    Some(StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Interrupt(line)), control: None })
+    StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Interrupt(line)), control: None }
 }
 
 /// Execute one slow-path event and retain its exact fetch window and trap timing.
@@ -80,7 +80,14 @@ pub fn step_outcome<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> StepOutcome {
     if cpu.waiting || cpu.mie_enabled() {
         if let Some(line) = cpu.irq {
             if cpu.clic {
-                if let Some(o) = clic_take(cpu, bus, line, pc) { return o; }
+                // In mtvec modes 0 and 1 (CLINT mode) interrupts are mie/mip's, not the CLIC's,
+                // and nothing raises mip on this chip; the ROM runs there with mie = 0.
+                if cpu.clic_mode() {
+                    // any presented interrupt ends a WFI: the privileged ISA lets WFI resume for
+                    // any reason, and a core left asleep could not be woken by a lower one
+                    cpu.waiting = false;
+                    if cpu.mie_enabled() && (line >> CLIC_IRQ_LEVEL_SHIFT) & 0xff > cpu.mil { return clic_take(cpu, bus, line, pc); }
+                }
             } else {
                 cpu.waiting = false;
                 if cpu.mie_enabled() {

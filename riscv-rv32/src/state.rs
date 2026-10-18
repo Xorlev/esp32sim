@@ -198,7 +198,7 @@ impl Cpu {
             MTVEC => self.mtvec,
             MSCRATCH => self.mscratch,
             MEPC => self.mepc,
-            MCAUSE if self.clic => self.clic_mcause(),
+            MCAUSE if self.clic_mode() => self.clic_mcause(),
             MCAUSE => self.mcause,
             MTVAL => self.mtval,
             MTVT if self.clic => self.mtvt,
@@ -240,7 +240,7 @@ impl Cpu {
             MSCRATCH => self.mscratch = v,
             MEPC => self.mepc = v & !1,
             // MPP and MPIE are mstatus's own bits seen through mcause (CLIC specification, "mcause")
-            MCAUSE if self.clic => {
+            MCAUSE if self.clic_mode() => {
                 self.mcause = v & (mcause::INTERRUPT | mcause::MINHV | mcause::MPIL | mcause::CODE);
                 self.mstatus = (self.mstatus & !(mstatus::MPP | mstatus::MPIE)) | ((v & mcause::MPP) >> 17) | ((v & mcause::MPIE) >> 20);
             }
@@ -271,6 +271,9 @@ impl Cpu {
     /// while exceptions always enter at the base. In CLIC mode an exception enters at the
     /// 64-byte-aligned base and records the current level in MPIL; the level does not change.
     pub fn trap(&mut self, cause: u32, tval: u32, epc: u32) {
+        // An SC after the handler returns must not succeed over the handler's own stores; the
+        // P4's IDF vectors issue no SC to break the reservation, so the trap does.
+        if self.clic { self.reservation = None; }
         self.mepc = epc;
         self.mcause = if self.clic_mode() { (cause & (mcause::INTERRUPT | mcause::CODE)) | self.mil << mcause::MPIL_SHIFT } else { cause };
         self.mtval = tval;
@@ -288,7 +291,7 @@ impl Cpu {
     /// `mret`: restore the interrupt-enable bit and jump back; with a CLIC the level comes back
     /// from mcause.MPIL.
     pub fn mret(&mut self) {
-        if self.clic { self.mil = (self.mcause & mcause::MPIL) >> mcause::MPIL_SHIFT; }
+        if self.clic_mode() { self.mil = (self.mcause & mcause::MPIL) >> mcause::MPIL_SHIFT; }
         let mpie = self.mstatus & mstatus::MPIE != 0;
         self.mstatus = (self.mstatus & !mstatus::MIE) | if mpie { mstatus::MIE } else { 0 } | mstatus::MPIE;
         self.pc = self.mepc;

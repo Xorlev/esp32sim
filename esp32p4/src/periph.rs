@@ -83,8 +83,9 @@ impl Device for IntMatrix {
 /// CTL[7:5], the unimplemented low bits reading as ones. IDF v5.5.3 include/soc/clic_reg.h.
 /// A level-triggered ID's IP follows its matrix input. An edge-triggered ID's IP latches the
 /// rising edge, clears when the core takes it hardware-vectored (CLIC specification) and when
-/// software writes 1 to it, which is how IDF acknowledges one (riscv/include/esp_private/
-/// interrupt_clic.h:321-324, `rv_utils_intr_edge_ack`).
+/// software writes 1 to it without changing the rest of the word, which is how IDF acknowledges
+/// one (riscv/include/esp_private/interrupt_clic.h:321-324, `rv_utils_intr_edge_ack`, "clearing
+/// its pending flag" in esp_hw_support/include/hal/interrupt_controller_hal.h:226).
 #[derive(Clone)]
 pub struct ClicCore {
     /// CLIC_INT_CONFIG.MNLBITS (bits 4:1); NVBITS reads 1
@@ -147,8 +148,13 @@ impl ClicCore {
             0x8 => self.thresh = (self.thresh & !mask) | (v & mask & 0xff00_0000),
             0x1000..=0x10bc => {
                 let id = ((off - 0x1000) / 4) as usize;
+                let before = self.ctrl[id];
                 self.ctrl[id] = (self.ctrl[id] & !mask) | (v & mask & 0xff07_0100) | 3 << 22;
-                if lanes & 1 != 0 && v & 1 != 0 && self.edge(id) { self.ip_latch &= !(1 << id); }
+                // IDF acknowledges an edge with a 32-bit REG_SET_BIT of IP (interrupt_clic.h:321-324)
+                // and reconfigures SHV and TRIG with the same read-modify-write (interrupt_clic_ll.h:
+                // 99-102, esp_rom/patches/esp_rom_clic.c), which writes a pending IP back as 1: only a
+                // write that changes nothing else is the acknowledge.
+                if lanes & 1 != 0 && v & 1 != 0 && self.edge(id) && self.ctrl[id] == before { self.ip_latch &= !(1 << id); }
             }
             _ => {}
         }
@@ -626,7 +632,15 @@ mod tests {
         assert_eq!(c.candidate(), Some((e, 0x7f)));
         c.write(0x1000 + 4 * e as u32, 1 << 8, 0x2);                         // IE byte alone keeps IP
         assert_eq!(c.candidate(), Some((e, 0x7f)));
-        c.write(0x1000 + 4 * e as u32, 1, 0x1);                              // IDF's acknowledge: IP = 1
+        let word = c.read(0x1000 + 4 * e as u32);
+        c.write(0x1000 + 4 * e as u32, word | 1 << 16, 0xf);                 // set SHV by read-modify-write
+        assert_eq!(c.candidate(), Some((e, 0x7f)), "a reconfiguring RMW keeps the pending edge");
+        let word = c.read(0x1000 + 4 * e as u32);
+        assert_eq!(word & 1, 1);
+        c.write(0x1000 + 4 * e as u32, word, 0xf);                           // IDF's acknowledge: REG_SET_BIT(IP)
+        assert_eq!(c.candidate(), None);
+        c.set_input(1 << e); c.set_input(0);
+        c.write(0x1000 + 4 * e as u32, 1, 0x1);                              // a byte write of IP = 1
         assert_eq!(c.candidate(), None);
         c.set_input(1 << e);
         c.write(0x1000 + 4 * e as u32, 1 << 16 | 1 << 17, 0x4);              // hardware-vectored

@@ -369,27 +369,48 @@ mod tests {
         assert_eq!(b.read32(PSRAM_LOW + 4).unwrap(), 0x5a6b_7c8d);
     }
 
-    /// Two harts on one bus: a store by the other hart to the reserved word makes the SC fail,
-    /// a store elsewhere or by the same hart does not (RISC-V unprivileged ISA, "Zalrsc").
+    /// Two harts on one bus: any store by the other hart to the reserved word makes the SC fail
+    /// (word, half and byte stores, an AMO, the other hart's own successful SC); a store elsewhere
+    /// or by the same hart does not (RISC-V unprivileged ISA, "Zalrsc").
     #[test]
     fn a_store_from_the_other_hart_breaks_a_reservation() {
         use riscv_rv32::{step, Cpu};
+        #[derive(Clone, Copy)]
+        enum Store { None, Word(usize, u32), Half(u32), Byte(u32), Amo, Sc }
         let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
-        let (prog, data) = (L2MEM_LOW + 0x100, L2MEM_LOW + 0x200);
-        for (k, w) in [0x1005_a52fu32, 0x18d5_a62f].iter().enumerate() { b.write32(prog + 4 * k as u32, *w).unwrap(); }   // lr.w a0,(a1); sc.w a2,a3,(a1)
-        let sc_after = |b: &mut SocBus, store: Option<(usize, u32)>| {
+        let (prog, other, data) = (L2MEM_LOW + 0x100, L2MEM_LOW + 0x180, L2MEM_LOW + 0x200);
+        // lr.w a0,(a1); sc.w a2,a3,(a1)
+        for (k, w) in [0x1005_a52fu32, 0x18d5_a62f].iter().enumerate() { b.write32(prog + 4 * k as u32, *w).unwrap(); }
+        // amoadd.w a4,a3,(a1); lr.w a5,(a1); sc.w a4,a3,(a1)
+        for (k, w) in [0x00d5_a72fu32, 0x1005_a7af, 0x18d5_a72f].iter().enumerate() { b.write32(other + 4 * k as u32, *w).unwrap(); }
+        let sc_after = |b: &mut SocBus, store: Store| {
             let mut c = Cpu::new_esp32p4();
             c.pc = prog; c.x[11] = data; c.x[13] = 0x55;
             b.cur_core = 0;
             step(&mut c, b).unwrap();
-            if let Some((hart, addr)) = store { b.cur_core = hart; b.write32(addr, 7).unwrap(); b.cur_core = 0; }
+            b.cur_core = 1;
+            let mut h1 = Cpu::new_esp32p4();
+            h1.hartid = 1; h1.x[11] = data; h1.x[13] = 3;
+            match store {
+                Store::None => {}
+                Store::Word(hart, addr) => { b.cur_core = hart; b.write32(addr, 7).unwrap(); }
+                Store::Half(addr) => b.write16(addr, 7).unwrap(),
+                Store::Byte(addr) => b.write8(addr, 7).unwrap(),
+                Store::Amo => { h1.pc = other; step(&mut h1, b).unwrap(); }
+                Store::Sc => { h1.pc = other + 4; step(&mut h1, b).unwrap(); step(&mut h1, b).unwrap(); assert_eq!(h1.x[14], 0, "hart 1's own SC succeeds"); }
+            }
+            b.cur_core = 0;
             step(&mut c, b).unwrap();
             c.x[12]
         };
-        assert_eq!(sc_after(&mut b, None), 0);
-        assert_eq!(sc_after(&mut b, Some((1, data))), 1, "core 1 stored to the word");
-        assert_eq!(sc_after(&mut b, Some((1, data + 4))), 0);
-        assert_eq!(sc_after(&mut b, Some((0, data))), 0, "the same hart's store");
+        assert_eq!(sc_after(&mut b, Store::None), 0);
+        assert_eq!(sc_after(&mut b, Store::Word(1, data)), 1, "core 1 stored to the word");
+        assert_eq!(sc_after(&mut b, Store::Half(data + 2)), 1, "a halfword of it");
+        assert_eq!(sc_after(&mut b, Store::Byte(data + 3)), 1, "a byte of it");
+        assert_eq!(sc_after(&mut b, Store::Amo), 1, "an AMO");
+        assert_eq!(sc_after(&mut b, Store::Sc), 1, "core 1's SC");
+        assert_eq!(sc_after(&mut b, Store::Word(1, data + 4)), 0, "the next word");
+        assert_eq!(sc_after(&mut b, Store::Word(0, data)), 0, "the same hart's store");
         b.cur_core = 1;
         b.reserve(data);
         b.cur_core = 0;

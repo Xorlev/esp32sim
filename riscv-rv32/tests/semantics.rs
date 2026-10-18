@@ -363,7 +363,7 @@ fn clic_mode_is_the_p4_cores_alone() {
     let (mut p4, mut ram) = machine_on(Cpu::new_esp32p4(), &asm("00000073"), "ecall");
     p4.write_csr(csr::MTVEC, BASE + 0x101);
     assert_eq!(step(&mut p4, &mut ram), Err(Trap::Exception(11)));
-    assert_eq!((p4.pc, p4.mcause), (BASE + 0x100, 11));
+    assert_eq!((p4.pc, p4.mcause, p4.read_csr(csr::MCAUSE)), (BASE + 0x100, 11, 0xb), "mcause reads the bare cause outside CLIC mode");
     let mut c6 = Cpu::new_rv32imac();
     c6.write_csr(csr::MTVT, 0x1234);
     c6.write_csr(csr::MINTSTATUS_P4, 0x55);
@@ -381,4 +381,95 @@ fn mhartid_survives_reset() {
     c.reset();
     assert_eq!((c.read_csr(csr::MHARTID), c.clic, c.user_counters), (1, true, true));
     assert_eq!(Cpu::new_rv32imac().read_csr(csr::MHARTID), 0);
+}
+
+fn clic_irq(line: u32, level: u32, shv: bool) -> Option<u32> {
+    use riscv_rv32::exec::{CLIC_IRQ_LEVEL_SHIFT, CLIC_IRQ_SHV};
+    Some(line | level << CLIC_IRQ_LEVEL_SHIFT | if shv { CLIC_IRQ_SHV } else { 0 })
+}
+
+/// In mtvec modes 0 and 1 the P4 core takes no CLIC candidate, even with MIE set, does not wake
+/// from WFI for it and does not count it as pending; mcause reads as written there.
+#[test]
+fn clint_mode_takes_no_clic_candidate() {
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &asm("0001 0001 10500073 0001"), "nop");
+    cpu.write_csr(csr::MTVEC, BASE + 0x101);
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+    cpu.set_irq(clic_irq(2, 0x3f, false));
+    assert!(!cpu.irq_pending());
+    for _ in 0..3 { assert_eq!(step(&mut cpu, &mut ram), Ok(())); }   // nop, nop, wfi
+    assert!(cpu.waiting);
+    assert_eq!(Core::step(&mut cpu, &mut ram).kind, emu_core::StepKind::Idle, "the WFI goes on");
+    cpu.write_csr(csr::MCAUSE, 0x8000_0000 | 3 << 28 | 0x12);
+    assert_eq!(cpu.read_csr(csr::MCAUSE), 0x8000_0000 | 3 << 28 | 0x12, "no MPP/MPIE alias outside CLIC mode");
+    cpu.write_csr(csr::MTVEC, BASE + 0x103);
+    assert!(cpu.irq_pending());
+}
+
+/// MIE alone blocks a take; a WFI ends for any presented candidate, takeable or not.
+#[test]
+fn clic_mie_blocks_and_wfi_wakes() {
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &asm("10500073 0001 0001 0001"), "wfi");
+    cpu.write_csr(csr::MTVEC, BASE + 0x203);
+    cpu.set_irq(clic_irq(1, 0x3f, false));
+    let mut core = |cpu: &mut Cpu| Core::step(cpu, &mut ram);
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::Retired);       // wfi
+    assert!(cpu.waiting);
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::Retired, "MIE = 0: woken, nothing taken, the nop runs");
+    assert!(!cpu.waiting);
+    cpu.mil = 0x3f;
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+    cpu.pc = BASE;
+    cpu.set_irq(None);
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::Retired);
+    assert!(cpu.waiting);
+    cpu.set_irq(clic_irq(1, 0x3f, false));                            // at the current level
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::Retired, "woken, not taken: it resumes after the wfi");
+    assert_eq!(cpu.pc, BASE + 6);
+    cpu.mil = 0;
+    assert_eq!(core(&mut cpu).kind, emu_core::StepKind::TrapBefore(Trap::Interrupt(1)));
+    assert_eq!(cpu.pc, BASE + 0x200);
+}
+
+/// An interrupt between LR and SC breaks the P4 core's reservation, so the SC cannot overwrite
+/// what the handler stored there (the RISC-V unprivileged ISA allows an SC to fail at any time).
+/// The C6 core keeps its reservation across a trap, as before.
+#[test]
+fn a_trap_breaks_the_p4_cores_reservation() {
+    // lr.w a0,(a1); sc.w a2,a3,(a1)
+    let prog = asm("1005a52f 18d5a62f");
+    let handler = asm("c194 30200073");                               // sw a3,0(a1); mret
+    for (cpu, sc_result) in [(Cpu::new_esp32p4(), 1), (Cpu::new_rv32imac(), 0)] {
+        let (mut cpu, mut ram) = machine_on(cpu, &prog, "lr.w a0,(a1)");
+        ram.mem[0x200..0x200 + handler.len()].copy_from_slice(&handler);
+        cpu.x[11] = BASE + 0x100; cpu.x[13] = 0x55;
+        cpu.write_csr(csr::MTVEC, BASE + 0x200 + if cpu.clic { 3 } else { 0 });
+        step(&mut cpu, &mut ram).unwrap();
+        cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+        cpu.set_irq(if cpu.clic { clic_irq(4, 0x3f, false) } else { Some(4) });
+        assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Interrupt(4)));
+        cpu.set_irq(None);
+        cpu.x[13] = 0x66;
+        step(&mut cpu, &mut ram).unwrap();                            // the handler's store
+        step(&mut cpu, &mut ram).unwrap();                            // mret
+        cpu.x[13] = 0x77;
+        step(&mut cpu, &mut ram).unwrap();                            // sc.w
+        assert_eq!(cpu.x[12], sc_result, "SC result on the {} core", if cpu.clic { "P4" } else { "C6" });
+        assert_eq!(ram.mem[0x100], if sc_result == 1 { 0x66 } else { 0x77 });
+    }
+}
+
+/// A fault on the hardware-vectoring table read is an instruction access fault at the table
+/// entry with MINHV set; `mret`'s resumption of the fetch is not modelled.
+#[test]
+fn clic_vector_table_fault_is_an_access_fault() {
+    let (mut cpu, mut ram) = machine_on(Cpu::new_esp32p4(), &asm("0001 0001"), "nop");
+    cpu.write_csr(csr::MTVEC, BASE + 0x203);
+    cpu.write_csr(csr::MTVT, 0x2000_0000);                            // outside the RAM
+    cpu.write_csr(csr::MSTATUS, cpu.mstatus | mstatus::MIE);
+    cpu.set_irq(clic_irq(5, 0x3f, true));
+    assert_eq!(step(&mut cpu, &mut ram), Err(Trap::Exception(1)));
+    let entry = 0x2000_0000 + 4 * 21;
+    assert_eq!((cpu.pc, cpu.mepc, cpu.mtval), (BASE + 0x200, entry, entry));
+    assert_eq!(cpu.read_csr(csr::MCAUSE) & (1 << 30 | 0xfff), 1 << 30 | 1, "MINHV and the access-fault code");
 }
