@@ -43,14 +43,10 @@ pub struct Dwc2Config {
 pub const GSNPSID_4_20A: u32 = 0x4F54_420A;
 
 impl Dwc2Config {
-    /// The ESP32-P4's HS instance. GSNPSID 4.30a: usb_dwc_struct.h ("the High Speed v4.30a
-    /// instance") and CORE_REG_GSNPSID_4_30a in hal/usb_dwc_hal.c. GHWCFG1-4 as TinyUSB
-    /// 0.21.0~2 recorded them from silicon (src/portable/synopsys/dwc2/dwc2_info.py, `ESP32-P4`);
-    /// their architecture (internal DMA), PHY (UTMI+), 15 device endpoints besides EP0, 8 IN
-    /// endpoints, dedicated TX FIFOs and FIFO queue depths agree with
-    /// soc/esp32p4/register/hw_ver1/soc/usb_dwc_cfg.h. The counter widths are usb_dwc_cfg.h's
-    /// OTG20_TRANS_COUNT_WIDTH 17 and OTG20_PACKET_COUNT_WIDTH 8, and the FIFO RAM its
-    /// OTG20_DFIFO_DEPTH 1024 (TinyUSB's dwc2_esp32.h uses the same 1024 words).
+    /// The ESP32-P4's HS instance: GSNPSID 4.30a (usb_dwc_struct.h, hal/usb_dwc_hal.c), GHWCFG1-4
+    /// as TinyUSB 0.21.0~2 recorded them from silicon (dwc2_info.py, `ESP32-P4`), the counter
+    /// widths and FIFO RAM of soc/esp32p4/register/hw_ver1/soc/usb_dwc_cfg.h (OTG20_TRANS_COUNT_WIDTH
+    /// 17, OTG20_PACKET_COUNT_WIDTH 8, OTG20_DFIFO_DEPTH 1024). See docs/esp32p4.md, "USB".
     pub const fn esp32p4_hs(hz: u64) -> Self {
         Dwc2Config { gsnpsid: 0x4F54_430A, ghwcfg: [0, 0x215F_FFD0, 0x0380_5EB5, 0xDFF1_A030], eps: 16, xfer_bits: 17, pkt_bits: 8,
                      fifo_words: 1024, high_speed: true, hz }

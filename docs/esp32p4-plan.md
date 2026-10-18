@@ -1,11 +1,12 @@
 # ESP32-P4 — plan
 
-Status: milestone 2 done, milestone 3 next. hello_world boots to `app_main` on one and on both
+Status: milestone 3 done, milestone 4 next. hello_world boots to `app_main` on one and on both
 cores and reboots through the ROM; the core has F with the lazy FPU traps, the Zicntr counters,
 CLIC mode and two harts. The SDMMC host and an SD card carry IDF's sdmmc example through a FAT32
-mount, and oxidrive probes its card at 4 bits and 40 MHz, logs its geometry and stops at USB-OTG
-([esp32p4.md](esp32p4.md), which lists where its console still differs from the board's). Tracks
-[#215](https://github.com/mikroverk/esp32sim/issues/215).
+mount. The high-speed USB-OTG core presents the card to a host written in Rust, which records a
+clip on it like a car; oxidrive enumerates to that car and the clip lands intact, then its WiFi
+bring-up stops at ESP-Hosted's SDIO link ([esp32p4.md](esp32p4.md), which lists where its console
+still differs from the board's). Tracks [#215](https://github.com/mikroverk/esp32sim/issues/215).
 
 The P4 is a dual-core RISC-V SoC with no radio. This plan brings it up the way the C6 came up:
 the real mask ROM, the real 2nd-stage bootloader and an unmodified ESP-IDF image, checked
@@ -99,8 +100,13 @@ the other end of the cable written in Rust: enumeration, then SCSI over bulk-onl
 record like a car (clip-sized writes, FAT updates, idle gaps), hold the drive, and see what the
 device reports while it has the card away.
 
-Done when oxidrive enumerates, the scripted car writes a clip, and an archive window takes the
-card and gives it back with the car's next writes landing intact.
+Done when IDF's own tusb_msc example enumerates to the host, which reads the capacity, reads and
+writes blocks, mounts FAT32 and writes and reads a file, as a golden with the card's contents
+checked afterwards; and oxidrive enumerates, the scripted car writes a clip, and the clip is on
+the card intact. Archive windows, which take the card from the car and give it back, need WiFi
+and the NAS and are milestone 4's. Done: the core in `esp-periph/src/usb_otg.rs`, the host in
+`esp-soc/src/usb_host/`, `--usb-host`, golden `usbmsc-p4`, the oxidrive car test
+(esp32p4.md, "USB").
 
 ### 4. The co-processor
 
@@ -110,7 +116,9 @@ that steps both machines in lock-step the way `--cooja` steps 802.15.4 nodes. Th
 joins the virtual access point with the unmodified WiFi blob, so the P4 reaches MQTT and SMB on
 the host's network through the existing NAT.
 
-Done when an oxidrive archive window uploads a clip to an SMB server on the host.
+Done when an oxidrive archive window takes the card from the car (which sees MEDIUM NOT
+PRESENT meanwhile), uploads a clip to an SMB server on the host, and gives the card back with the
+car's next writes landing intact.
 
 BLE is not modelled (see the roadmap); firmware that uses it must tolerate a controller that
 never answers.

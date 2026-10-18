@@ -9,7 +9,7 @@ board's: the card on slot 1 through the GPIO matrix at CLK 43, CMD 44, D0-D3 39-
 powered by on-chip LDO channel 4; TinyUSB on the high-speed port (rhport 1) in DMA mode, an
 8 KiB MSC buffer; the console on UART0.
 
-The bootloader, partition table and app are committed as `web/wasm/fw/public/p4-usbmsc-*.bin`
+The bootloader, partition table and app are committed as `web/wasm/fw/public/p4-usbmsc*.bin`
 (licences in `p4-usbmsc-NOTICE.txt`). They are the input of the `usbmsc-p4` golden, which runs
 them on a FAT32 card image the test builds (`tests/sd_image.rs`) with a car on the USB port
 (`car.txt`) and a few lines typed at the console (`console.txt`):

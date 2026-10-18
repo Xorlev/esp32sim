@@ -3,8 +3,9 @@
 The fourth chip, and the first with two RISC-V cores: silicon **rev < 3** (v0.x, v1.x), as on the
 Waveshare ESP32-P4-WIFI6 (v1.0) the plan targets ([esp32p4-plan.md](esp32p4-plan.md), milestone 1).
 Unmodified ESP-IDF firmware boots from the real mask ROM, through the real 2nd-stage bootloader,
-into FreeRTOS on one or both cores, and reaches an SD card in the board's socket through the
-SDMMC host (milestone 2, "SD card" below).
+into FreeRTOS on one or both cores, reaches an SD card in the board's socket through the SDMMC
+host (milestone 2, "SD card" below), and presents it as a USB mass-storage device to a host on
+the high-speed USB-OTG port, a car written in Rust (milestone 3, "USB" below).
 
 ```sh
 cargo build --release
@@ -150,6 +151,21 @@ the devices see it (`Sdmmc::now_ns`, set before every SDMMC access from the devi
 their own busy periods. A write's DATA_OVER comes when its last block is on the card, before the
 card has programmed it, as on the DesignWare core.
 
+With `--sd-timing` (`SdCardConfig::timed_bus`) the bus takes its time. The data still moves
+through the IDMAC in the write that starts the command, but CMD_DONE comes when the command and
+its response are through (48 bits, NCR 2, 48 or 136 bits, NCC 8 card clocks; an unanswered one
+after the 64-clock response timeout), DATA_OVER when every block is (a start bit, the block's
+bits over the slot's width, CRC16 and an end bit on each line, a write's CRC status token, two
+clocks between blocks: SD Physical Layer Simplified Specification v9.10 §3.6.1, §4.12), ACD after
+the auto-stop's own command, and a write's card programs from the end of its data on, BCI
+following when it is done. The card clock is the one IDF computes in `sdmmc_host_get_real_freq`:
+HP_SYS_CLKRST PERI_CLK_CTRL01.REG_SDIO_LS_CLK_SRC_SEL (PLL_F160M or the 200 MHz SDIO PLL), divided
+by PERI_CLK_CTRL02's SDIO_LS EDGE_L + 1, then by the slot's CLKDIV divider (CLKSRC picks it; n
+divides by 2n). The deferred interrupts are raised from the device ticks at their time
+(`Sdmmc::next_event_ns`, `advance`), which bound the bus's deadline. The card's read access time
+and the IDMAC's pace through the descriptors are not timed: a long transfer's descriptors come
+back at once, its DATA_OVER at the end.
+
 | register | modelled |
 | --- | --- |
 | CTRL 0x00 | controller, FIFO and DMA reset (bits 0-2) clear at once; the controller and DMA resets abort a transfer; INT_ENABLE (4) gates the controller's interrupt; DMA_ENABLE, USE_INTERNAL_DMA (25) read back |
@@ -265,8 +281,8 @@ high, or 0x3E, constant low). Pin levels stay the shared model's 49.
   erase is kept as a range, not a block per address. The card stays in the socket through a chip
   reset, with its state; IDF's init resets it with CMD0.
 - **Not modelled**: SDSC (byte addresses, CSD 1.0), UHS-I and CMD11, DDR, eMMC, lock and unlock,
-  write protection, the PIO data FIFO at 0x200, the card-detect interrupt, the time a command or
-  a transfer takes on the bus.
+  write protection, the PIO data FIFO at 0x200, the card-detect interrupt, and (without
+  `--sd-timing`) the time a command or a transfer takes on the bus.
 
 `--debug sdmmc` prints every command, its response and the card's state. The run's report adds
 the commands, the unanswered ones and the bytes moved.
@@ -290,6 +306,235 @@ a few compares per GPIO and SDMMC access; nothing in the change makes them faste
 0.2-0.7% they gained is most likely code layout. An earlier round, before the card's
 programming time and the read-side check, measured the same within 1%.
 
+## USB
+
+`--usb-host FILE` plugs a host into the high-speed USB-OTG port and runs FILE's commands
+([cli.md](cli.md), "USB host"). ESP-IDF v5.5.3's own tusb_msc example (`examples/usb_msc-p4`,
+golden `usbmsc-p4`), built for SD card storage, presents the card in the socket over USB mass
+storage through TinyUSB 0.21.0~2 and esp_tinyusb 2.4.0; the car in `car.txt` enumerates it,
+records a clip on its FAT32 volume and reads it back, ejects it and polls it while the example's
+application owns the card:
+
+```sh
+./target/release/esp32sim-p4 --flash-mb 4 --bootloader $FW/p4-usbmsc-bootloader.bin \
+    --ptable $FW/p4-usbmsc-ptable.bin --app $FW/p4-usbmsc.bin --sd-rw card.img \
+    --script examples/usb_msc-p4/console.txt --usb-host examples/usb_msc-p4/car.txt --max-seconds 2
+```
+
+```
+[usb-host] t=0.190625 port reset: High speed
+[usb-host] t=0.203250 device 303a:4002, USB 2.00, class ef/02/01, EP0 64 bytes, 1 configuration(s)
+[usb-host] t=0.203750 interface 0: class 08/06/50, endpoints 01 (512 bytes) 81 (512 bytes)
+[usb-host] t=0.206375 READ CAPACITY: 131072 blocks of 512 bytes (64 MiB)
+[usb-host] t=0.566250 fat-write CLIP0001.MP4: 1048576 bytes in 16 chunks of 64 KiB, 0.355 s, 2.95 MB/s
+[usb-host] t=0.609500 fat-read CLIP0001.MP4: 1048576 bytes, hash 208645dd266d37e6, 24.24 MB/s, matches what was written
+[usb-host] t=0.611125 ejected
+[usb-host] t=0.611750 TEST UNIT READY: sense 2/3a/00 (MEDIUM NOT PRESENT)
+[usb-host] t=1.517000 TEST UNIT READY passed after 4 failed polls
+[usb-host] t=1.518875 root: CLIP0001.MP4 (1048576), README.MD (379)
+```
+
+When the host configures the device, esp_tinyusb takes the card from the application and
+exposes it; the eject (START STOP UNIT with LoEj) gives it back, the example's console writes
+README.MD on it and `expose` hands it to USB again. The golden pins the console, the host's log
+with its emulated times and the instruction count, then reads the clip, README.MD and the raw
+blocks the car wrote back from the image.
+
+### The core
+
+The DWC2 core (Synopsys DesignWare Hi-Speed USB 2.0 OTG) is modelled once, in
+`esp-periph/src/usb_otg.rs`, as a device with buffer DMA; what differs between instances is
+`Dwc2Config` (the S3's full-speed core would be a second configuration, not wired). Sources: IDF
+v5.5.3 `soc/esp32p4/include/soc/usb_dwc_struct.h` (the v4.30a HS instance),
+`soc/esp32p4/register/hw_ver1/soc/usb_dwc_cfg.h`, `hal/esp32p4/include/hal/usb_dwc_ll.h`; the bit
+names and what the driver expects of them: TinyUSB 0.21.0~2 `src/portable/synopsys/dwc2/`
+`dwc2_type.h`, `dwc2_common.c`, `dcd_dwc2.c`. It is the P4's block 0x50000 as an optional
+device-table entry, so it is ticked and asked for deadlines only while a host is plugged in. The
+interrupt is source 93 (`ETS_USB_OTG_INTR_SOURCE`, include/soc/interrupts.h): GAHBCFG.GINT and
+an unmasked GINTSTS bit. LP_CLKRST HP_USB_CLKRST_CTRL1.RST_EN_USB_OTG20 (0x50111048 bit 2,
+lp_clkrst_reg.h) resets its registers, which `usb_new_phy` does through
+`_usb_utmi_ll_reset_register`; a chip reset keeps the cable. Its DMA reaches L2MEM and PSRAM like
+the SDMMC IDMAC (`SOC_PSRAM_DMA_CAPABLE`).
+
+| register | modelled |
+| --- | --- |
+| GOTGCTL 0x000 | the VBUS, A- and B-valid overrides and the HNP bits read back; CIDSTS 1 (a B-device); BSESVLD from VBUS or the B-valid override, ASVLD from the A-valid override |
+| GOTGINT 0x004 | write 1 to clear; SEDET when VBUS goes |
+| GAHBCFG, GUSBCFG 0x008, 0x00C | read back; GINT gates the interrupt; GUSBCFG.FHMOD keeps D+ released |
+| GRSTCTL 0x010 | AHBIDL reads 1; CSRST is a core soft reset: from 4.20a CSRST stays set until software clears it and CSRSTDONE is write 1 to clear (`usb_dwc_ll_grstctl_core_soft_reset`), before it CSRST clears itself; RXFFLSH, TXFFLSH, FCRST and HSRST clear at once, TXFNUM reads back |
+| GINTSTS, GINTMSK 0x014, 0x018 | the latched bits are write 1 to clear; OTGINT follows GOTGINT, GINAKEFF and BOUTNAKEFF the global NAKs, IEPINT and OEPINT DAINT & DAINTMSK, SOF the (micro)frames since the last clear; CURMOD 0 |
+| GRXSTSR, GRXSTSP 0x01C, 0x020 | 0: slave mode is not modelled |
+| GRXFSIZ, GNPTXFSIZ, DIEPTXF1-15, GDFIFOCFG | read back, from the configuration's FIFO depths; an IN endpoint enabled with a TX FIFO smaller than its packets NAKs and counts a FIFO size error |
+| GNPTXSTS 0x02C | four free queue entries, the FIFO empty |
+| GSNPSID, GHWCFG1-4 0x040-0x050 | 0x4F54430A and 0, 0x215FFFD0, 0x03805EB5, 0xDFF1A030 (below) |
+| DCFG 0x800 | read back; DSPD 0 makes the next reset end at high speed |
+| DCTL 0x804 | SDIS releases D+ (the host sees a disconnect); SGINAK/CGINAK and SGONAK/CGONAK set and clear GINSTS/GONSTS at once; RWUSIG signals remote wakeup |
+| DSTS 0x808 | SUSPSTS, ENUMSPD (0 high, 1 full speed), SOFFN counting microframes at high speed |
+| DIEPMSK, DOEPMSK, DAINT, DAINTMSK, DIEPEMPMSK | a DAINT bit is set while the endpoint's interrupt register has a bit its mask lets through; DAINTMSK does not gate it |
+| DIEPCTLn, DOEPCTLn | MPS, USBAEP, DPID, NAKSTS, EPTYP, STALL, TXFNUM; EPENA is set by software and cleared by the core at the end of a transfer and at SETUP done; EPDIS disables an enabled endpoint (EPDISD); SNAK (and INEPNE), CNAK, SD0PID, SD1PID; control endpoint 0 takes DIEPCTL0's packet size both ways, a SETUP clears its STALL and sets NAK on both, control OUT 0 cannot be disabled |
+| DIEPINTn, DOEPINTn | write 1 to clear; TXFE reads 1 |
+| DIEPTSIZn, DOEPTSIZn | XferSize and PktCnt count down by packet (17 and 8 bits, OTG20_TRANS_COUNT_WIDTH and OTG20_PACKET_COUNT_WIDTH; 7 and 2 or 1 on endpoint 0), STUPCNT on control OUT 0 |
+| DIEPDMAn, DOEPDMAn | the DMA address, advancing with the data |
+| DTXFSTSn | the TX FIFO's depth: it is empty between transactions |
+| PCGCCTL 0xE00 | read back |
+| the rest | register RAM, as are the UTMI PHY (0x5009C000), USB_WRAP and the clock gates the driver sets (HP_SYS_CLKRST SOC_CLK_CTRL1.REG_USB_OTG20_SYS_CLK_EN, LP_CLKRST HP_USB_CLKRST_CTRL1's PHY reference clock, HP_SYSTEM USBOTG20_CTRL); the clock gate is not checked |
+
+A transaction is what the host asks of the core and is answered at once from the endpoint
+registers:
+
+- **SETUP** (always acknowledged, USB 2.0 §8.5.3): written by DMA at DOEPDMA0, which advances 8
+  bytes, STUPCNT counting down from the 3 TinyUSB arms, Setup Packet Received set; past three
+  back-to-back SETUPs the last slot is written again with B2BSTUP. The token after them ends the
+  setup phase: SETUP (DOEPINT0 bit 3) and control OUT 0 handed back (EPENA cleared), so the driver
+  finds the last SETUP at DOEPDMA0 - 8 (`handle_epout_dma`). A SETUP that comes while control OUT
+  0 is not enabled waits, as in the RxFIFO, until it is.
+- **IN**: NAK unless the endpoint is enabled, not NAKing and no global IN NAK holds; STALL if set;
+  otherwise min(XferSize, MPS) bytes from DIEPDMA with the endpoint's data PID, and the transfer
+  ends (XFRC, EPENA cleared) on its last packet. A zero XferSize sends a zero-length packet.
+- **OUT**: NAK and STALL the same way; a packet with the wrong data PID is acknowledged and dropped
+  (§8.6.4); otherwise written by DMA at DOEPDMA, XferSize counts down by its length, and a short
+  packet or the last of PktCnt ends the transfer (XFRC, EPENA cleared, NAK set). More than XferSize
+  is cut at XferSize with BBLEERR.
+- A DMA access the memory map refuses is AHBERR and a NAK.
+
+Bus events come from the link: VBUS on sets SRQINT, VBUS off SEDET (TinyUSB reports the unplug);
+a bus reset sets USBRST and clears USBActEP but on endpoint 0, its end ENUMDNE at the speed the
+chirp allowed; SOFs count from enumeration; early suspend (ESUSP) and suspend (USBSUSP, SUSPSTS),
+then resume (WKUINT). `--debug usb_otg` prints every transaction and bus event.
+
+**Identity.** GSNPSID is 4.30a: `usb_dwc_struct.h` describes "the High Speed v4.30a instance"
+and `hal/usb_dwc_hal.c` accepts 4.00a and 4.30a. GHWCFG1-4 are the values TinyUSB 0.21.0~2
+recorded from silicon (`dwc2_info.py`, `ESP32-P4`): internal DMA, a UTMI+/ULPI HS PHY, 15 device
+endpoints besides endpoint 0, 16 host channels, dynamic FIFOs, per-endpoint interrupts, FIFO
+queue depths of 4, 8 IN endpoints, one control endpoint, dedicated TX FIFOs, descriptor DMA, all
+as `usb_dwc_cfg.h` configures the instance; TinyUSB reads the PHY type, the endpoint count, the
+DMA architecture and the PHY width from them. The open points are listed below.
+
+### The host
+
+The host is two layers, the host controller on the cable and the software that drives it.
+
+`esp_periph::usb_otg::UsbLink` (`usb_otg/link.rs`) is the host controller, owned by the core it
+is plugged into and running in device time: one request at a time from host software (power,
+reset, suspend, resume, a control or a bulk transfer), carried out as the transactions and bus
+states a controller puts on the wire, each at its own time, against the device side
+(`UsbFunction`, which the core implements). Its timing model, in CPU cycles:
+
+- A transaction takes its payload plus a fixed protocol overhead at the line rate: 55 bytes at
+  480 Mbit/s at high speed, 13 at 12 Mbit/s at full speed (USB 2.0 §5.8.4, the bulk protocol
+  overhead). The transactions of a transfer follow back to back, and none crosses a (micro)frame
+  boundary, so a high-speed bulk transfer moves at most 13 packets of 512 bytes in a 125 µs
+  microframe (53 MB/s). `UsbTiming::frame_budget` (`rate` in a script) caps the payload per
+  microframe below that.
+- A NAKed transaction is tried again at the start of the next microframe (the next frame at full
+  speed): what an EHCI controller does once a queue head's NAK counter runs out, and how a
+  high-speed bulk OUT is paced by PING (§8.5.1). A NAK costs a retry a microframe, not a stream of
+  them, so a waiting endpoint is cheap to emulate.
+- SOFs every 125 µs from the end of the bus reset while the port is enabled and not suspended
+  (§8.4.3); the core counts them from when they start rather than receiving each one, and asks
+  for a deadline only while its SOF interrupt is unmasked.
+- A bus reset holds SE0 for 50 ms (TDRSTR from a root port, §7.1.7.5) and ends in the speed the
+  device's chirp allows (high speed while DCFG.DSPD is 0); resume drives K for 20 ms (TDRSMDN,
+  §7.1.7.7). With SOFs stopped the core sees early suspend after 3 ms and suspend 125 µs later
+  (§7.1.7.6).
+- One device hangs on the cable: tokens reach it whatever its address.
+
+Its next event is the core's device deadline, so idle cores sleep through a transfer to the
+packet that wakes them, and the bus runs what is due after the device ticks of a round.
+
+`esp_soc::usb_host` is the host software, written against a `UsbPort` (the link, and a way to let
+emulated time run to a given nanosecond, which `Machine` implements by running to that exact
+cycle). `UsbHost` learns that a request finished at the next microframe boundary after it did
+(the one-microframe interrupt threshold Linux's EHCI driver programs) and submits the next one
+there, so the firmware runs between the transfers of a command:
+
+- `enumerate`: VBUS, waiting for the pull-up, the 100 ms connect debounce (TATTDB, §7.1.7.3), the
+  port reset, 10 ms of reset recovery (§9.2.6.2), the device descriptor's first 64 bytes at address
+  0, SET_ADDRESS and its 2 ms recovery (§9.2.6.3), the device and configuration descriptors, the
+  strings, SET_CONFIGURATION (§9.1.2, §9.4); control transfers time out after 5 s.
+- `msc::Msc`: SCSI over bulk-only transport (BOT 1.0): CBW and CSW with tags, the CSW checked
+  for validity and meaning (§6.3), a STALLed data stage cleared and the CSW read, a STALLed CSW
+  cleared and read once more, phase errors and untrustworthy CSWs ending in reset recovery
+  (Bulk-Only Mass Storage Reset and CLEAR_FEATURE(ENDPOINT_HALT) on both endpoints, §5.3.4), REQUEST
+  SENSE after CHECK CONDITION; INQUIRY, TEST UNIT READY, READ CAPACITY(10), MODE SENSE(6), PREVENT
+  ALLOW MEDIUM REMOVAL, START STOP UNIT, READ(10) and WRITE(10) of any length in commands of 240
+  blocks at most (Linux usb-storage's default), SYNCHRONIZE CACHE(10); `wait_ready` polls TEST UNIT
+  READY as a car polls its drive. The LUN is a `fat32::BlockDevice`.
+- `fat32::Fat32` mounts a volume (an MBR's FAT32 partition, or from LBA 0), lists, reads and
+  writes 8.3 files in the root directory as Linux's vfat writes them: the directory entry at once,
+  the data a chunk at a time as it comes (one WRITE(10) per contiguous run of clusters), the FAT
+  sectors of each chunk's clusters in both FATs, then the entry's size and first cluster and
+  FSInfo. `FileWriter::fat_every` writes the FAT less often; `BlockDevice::pause_ns` is the idle
+  gap between chunks.
+- `script::Runner` runs a command file (`--usb-host`), each command logging what it did.
+
+A test drives the same API between runs of the machine:
+
+```rust
+esp_soc::SocBus::attach_usb_host(&mut m.bus, Default::default())?;
+let mut host = UsbHost::new(&mut m);              // the machine is the host's port
+host.enumerate(10_000_000_000)?;                  // connect timeout, ns
+let mut msc = Msc::open(host)?;
+msc.wait_ready(100_000_000, 10_000_000_000)?;     // TEST UNIT READY every 100 ms
+msc.read_capacity()?;
+let mut fs = Fat32::mount(&mut msc)?;
+let mut f = fs.create(&mut msc, "CLIP0001.MP4")?;
+f.write(&mut fs, &mut msc, &chunk)?;
+f.close(&mut fs, &mut msc)?;
+```
+
+`esp-soc/src/usb_host/tests.rs` runs the host against a mass-storage device written in Rust at
+the transaction level, with knobs for what BOT's host side must survive (MEDIUM NOT PRESENT, short
+data stages, STALLs, phase errors, wrong tags, NAKs); `esp-periph/src/usb_otg/tests.rs` drives
+the core with TinyUSB's register sequences against the link.
+
+**Throughput.** A car writing 4 MiB in 64 KiB chunks without gaps, then reading it back (FAT32,
+the card instant, programming time 0):
+
+| firmware | SD bus | write | read |
+| --- | --- | --- | --- |
+| tusb_msc example (8 KiB MSC buffer) | at once | 9.1 MB/s | 24.8 MB/s |
+| tusb_msc example | `--sd-timing`, 4 bits at 20 MHz | 4.4 MB/s | 6.8 MB/s |
+| oxidrive (32 KiB buffer) | at once | 19.7 MB/s | |
+| oxidrive | `--sd-timing`, 4 bits at 40 MHz | 11.0 MB/s | |
+
+oxidrive's board measured about 10.9 MB/s writing over USB. With 16 ms between chunks (a camera
+at 4 MB/s) oxidrive takes the clip at 3.5 MB/s, 3.0 MB/s with the bus timed.
+
+The USB port and the timed SD bus cost the other chips nothing and the P4 nothing while unused:
+the core is an optional device-table entry, the bus tests one flag per round for the link and
+one for a timed SD bus, whose work and deadline sit in cold functions (inlined, they cost the P4
+hello demos 0.9-1.0%). Measured against 6bc9b9cf with `cargo build --release --bins`,
+alternating runs, median `user` time, identical instruction counts; the P4 rows on the final
+tree, the others on the tree before the timed SD bus, which only the P4 runs:
+
+| demo | runs | 6bc9b9cf | this branch | instructions |
+| --- | --- | --- | --- | --- |
+| S3 `hello` (30 s) | 7 | 0.39 s | 0.39 s | 11,990,488 + 6,798,360 |
+| `c3-hello` (30 s) | 7 | 3.96 s | 4.00 s | 4,800,000,000 |
+| `c6-hello` (30 s) | 7 | 5.82 s | 5.75 s | 4,800,000,000 |
+| `p4-hello` (27 s) | 7 | 18.16 s | 18.09 s | 9,720,000,000 + 0 |
+| `p4-hello-smp` (27 s) | 7 | 19.18 s | 19.18 s | 9,720,000,000 + 9,713,148,105 |
+| pocket-tank (8 s) | 5 | 14.47 s | 14.42 s | 1,113,634,993 + 1,490,529,616 |
+
+The C3 and C6 run no code this branch changed; their ±1% is layout.
+
+**Open points**, each a guess where the sources disagree or say nothing:
+
+- GSNPSID: TinyUSB's `dwc2_info.py` lists 0x4F54400A (4.00a) for the P4, against IDF's 4.30a.
+  TinyUSB's own reset takes either path, and 4.30a's is the one modelled.
+- GHWCFG2 and GHWCFG3 differ from `usb_dwc_cfg.h` in single point (0 against
+  OTG20_SINGLE_POINT 1), the FS PHY type (3 against 2), the counter widths (16 and 7 bits against 17
+  and 8), synchronous reset and battery charger support; the registers keep TinyUSB's values, the
+  counters `usb_dwc_cfg.h`'s widths.
+- Reset values not in any header: DCTL.SDIS 1 (no pull-up until a driver connects), GUSBCFG's
+  USBTrdTim 5, the FIFO sizes from the configured depths; which registers a core soft reset keeps
+  (the PHY selection in GUSBCFG, DCFG.DSPD, DCTL.SDIS, PCGCCTL).
+- No XFRC with a SETUP, the fourth back-to-back SETUP rewriting the last slot, OUT babble cut at
+  XferSize, no NYET handshake, USB reset leaving DCFG.DevAddr to the driver.
+- The NAK retry at the next microframe is one controller's policy, not the specification's; a
+  controller that retries within the microframe would see a NAKing device sooner.
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,
@@ -300,25 +545,40 @@ formatter lays one out (MBR, FAT32 from LBA 2048, 32 KiB clusters), with the boa
 number. `external_oxidrive_console_matches_the_board` (`OXIDRIVE_DIR` names the images and the
 capture; the board's MAC, the card's size and its serial number come from there, not from this
 repository) compares the two with timestamps stripped, line by line, picking the comparison up
-again after lines that differ. 68 of the board's 105 lines match, among them the twelve `hex_psram`
+again after lines that differ. 76 of the board's 105 lines match, among them the twelve `hex_psram`
 mode-register lines, the MSPI timing tuning, `Found 32MB PSRAM device`, `cpu_start: Multicore
 app`, the application information, the heap regions, `spi_flash: flash io: qio`, the ESP-Hosted
-start-up, the firmware's own start-up lines and its card probe (size, serial, 4 data lines at
-40000 kHz). Three differ by construction, because the ECO0
-ROM stands in for the board's ECO2: the banner pair, and the heap region below the ROM's own
-data, whose length IDF takes from the ROM's `ets_rom_layout` (`_dram0_rtos_reserved_start` is
-0x4FF3FBA4 in the ECO0 ELF, and 12 bytes later on the board). Four blocks differ:
+start-up, the firmware's own start-up lines, its card probe (size, serial, 4 data lines at
+40000 kHz) and its USB mass-storage presentation: the device stack up on the high-speed port, the
+card presented, the DMA buffer in internal RAM, the USB link waiting for a host. Three differ by
+construction, because the ECO0 ROM stands in for the board's ECO2: the banner pair, and the heap
+region below the ROM's own data, whose length IDF takes from the ROM's `ets_rom_layout`
+(`_dram0_rtos_reserved_start` is 0x4FF3FBA4 in the ECO0 ELF, and 12 bytes later on the board).
+Eight blocks differ:
 
 - the board's flash held a core dump, the emulator's coredump partition is blank: one line
   where the board prints three;
-- the firmware's free heap at start is 108 bytes lower than the board's (open; ESP-Hosted's
-  SDIO link, which has no slave on slot 1 and sends it no command in this run, is the first
-  place to look);
+- the firmware's free heap at start, and its free internal RAM later, are 108 bytes lower than
+  the board's (open; ESP-Hosted's SDIO link, which has no slave on slot 1, is the first place to
+  look);
 - the card's FAT geometry, label and root directory: the image's, not the board card's;
-- the run then reaches USB-OTG: TinyUSB's `check_dwc2` reads 0 from GSNPSID and asserts, and the
-  board's remaining 30 lines (the USB mass storage presentation onwards) do not come.
+- the firmware's journal and configuration, which the board's NVS holds from earlier boots and
+  the emulator's blank flash does not: it reports a first boot, seeds a default and runs
+  unconfigured (four blocks);
+- the die temperature: the temperature sensor is register RAM here.
 
-The run is idle from there to the end of its 3 s.
+The board's lines from 93 on come through the C6 (WiFi, the clock, MQTT): milestone 4.
+
+`external_oxidrive_presents_the_card_to_a_car` boots the same images with VBUS from power-up and
+the card image written through. The car enumerates oxidrive at 0.27 s at high speed, the drive is
+ready at the first TEST UNIT READY, its FAT32 volume (32 KiB clusters) mounts, and a 4 MiB clip
+written in 64 KiB chunks 16 ms apart takes 1.2 s (3.5 MB/s; 19.7 MB/s without the gaps), reads
+back over USB unchanged and is on the image byte for byte afterwards. The firmware logs its USB
+link connected and mounted. It prints nothing about the car's writes in the 14 s of emulated time
+looked at: what it counts feeds the archive windows, which need WiFi and the NAS. Its WiFi
+bring-up then fails in ESP-Hosted's `esp_hosted_reconfigure` (`transport_drv_reconfigure()`
+returns ESP_FAIL, no slave answering on slot 1) and retries every 30 s, serving the card to the
+car meanwhile.
 
 ## What the bring-up found
 
@@ -341,7 +601,7 @@ The run is idle from there to the end of its 3 s.
 | CPU | two RV32IMAFC cores (`Cpu::new_esp32p4`, `misa` 0x40001125): F with the lazy FPU traps, EXT_ILL, Zicntr, CLIC mode, `mhartid`; core 1 held in reset until HP_SYS_CLKRST releases it. Xesppie and the hardware loops decode as illegal |
 | Memory | 128 KB mask ROM at 0x4FC00000 (reset vector), 768 KB L2MEM at 0x4FF00000 and its uncached alias at 0x8FF00000, 8 KB TCM at 0x30100000, LP ROM (empty) and 32 KB LP RAM; flash (0x40000000) and PSRAM (0x48000000) windows behind two 1024-entry MMUs of 64 KB pages, reached through SPI_MEM_C / SPI_MEM_S item registers, with their uncached aliases |
 | Interrupts | both interrupt matrices (128 sources, rev < 3) and both CLIC register blocks, delivered through the cores' CLIC mode |
-| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`); everything else is register RAM, listed by `--log-periph` |
+| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`); everything else is register RAM, listed by `--log-periph` |
 | Time base | 360 MHz, the rev < 3 application clock; one instruction is one cycle |
 
 The revision is a type parameter (`esp32p4::Revision`, `RevLt3`): rev >= 3 (its own ROM, the
@@ -351,8 +611,14 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 
 ## Not there yet
 
-- **USB-OTG, ESP-Hosted, AXI-DMA, the LP core**: milestones 3 and 4 of the plan.
-  Xesppie's save and restore, which FreeRTOS runs only for a task that uses PIE.
+- **ESP-Hosted, AXI-DMA, the LP core**: ESP-Hosted is milestone 4 of the plan, the others are
+  out of scope. Xesppie's save and restore, which FreeRTOS runs only for a task that uses PIE.
+- **USB**: the full-speed OTG core (0x50040000) and USB_WRAP, host mode, the core's slave mode
+  (the data FIFOs), descriptor DMA, isochronous and interrupt endpoints, LPM, the
+  per-endpoint interrupt source (94), and the time a transaction takes inside the core: it
+  answers at once. The UTMI PHY is register RAM.
+- **SD timing** is off by default: a command and its data are done in the register write that
+  starts them. `--sd-timing` times the bus but not the card's read access time.
 - **GPIO** has the P4's register layout (`periph::GpioP4`), but pin levels, interrupts and edges
   are the shared model's 49 pins; the P4 has 55.
 - **`--boot app`** maps the image and jumps to it without the clocks and caches the bootloader
@@ -362,46 +628,50 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
   KEYMNG, UART2-4, TRACE0/1, LP_UART, LP_PERI, LP_GPIO and DSI, all configuration the firmware
   writes and reads back (`--log-periph` lists them). The watchdogs never fire.
 
-## Handoff: where milestone 3 starts
+## Handoff: where milestone 4 starts
 
-**Status.** Milestone 2 is done: the SDMMC host, its IDMAC and an SD card behind it carry IDF's
-own sdmmc example through mount, write, rename, read and unmount (golden `sdcard-p4`), and
-oxidrive probes its card at 4 bits and 40 MHz through slot 0 and logs the FAT32 geometry, as on
-the board ("Compared with a board").
+**Status.** Milestone 3 is done: the high-speed DWC2 core as a device with buffer DMA, a host on
+its port written in Rust (enumeration, SCSI over bulk-only transport, FAT32 written as Linux
+writes it, a command file for the CLI), IDF's tusb_msc example presenting the card to it (golden
+`usbmsc-p4`), and oxidrive enumerating to a car that records a clip which lands intact on the
+image ("Compared with a board"). Archive windows, in which oxidrive takes the card from the car
+and the car sees MEDIUM NOT PRESENT, need WiFi and the NAS and move to milestone 4; the car's side
+of them is what the golden's eject already shows.
 
-**Where oxidrive stops.** `OXIDRIVE_DIR=<images> ESP32SIM_ROM_DIR=<roms> cargo test --release -p
-esp32p4 --test oxidrive -- --ignored external_ --nocapture` reports 67 of 105 board lines
-matching and every divergent block. After the card the firmware brings up TinyUSB (0.21.0~1, the
-`espressif__tinyusb` managed component) on its high-speed port, rhport 1: the DWC2 core at
-0x50000000, interrupt source 93 (`ETS_USB_OTG_INTR_SOURCE`), 16 endpoints, a 1024-word FIFO,
-DMA mode (`src/portable/synopsys/dwc2/dwc2_esp32.h`). `dwc2_core_init` first checks GSNPSID
-(0x50000040) for a DWC2 ID (bits 31:16 0x4F54, `DWC2_OTG_ID` in `dwc2_type.h`); register RAM
-reads 0, so `check_dwc2`, `dwc2_core_init`, `dcd_init`, `tud_rhport_init` and `tusb_rhport_init`
-each print `ASSERT FAILED`, and the firmware goes on without USB. The board's next line is its
-USB mass storage stack coming up on the high-speed port.
+**Where oxidrive stops.** With the car attached (`external_oxidrive_presents_the_card_to_a_car`,
+`OXIDRIVE_DIR=<images>`), the firmware brings WiFi up through ESP-Hosted, whose host side talks
+SDIO to the C6 on slot 1 of the SDMMC host (CLK 18, CMD 19, D0-D3 14-17; `CONFIG_ESP_HOSTED_SDIO_SLOT=1`,
+4 bits, 40 MHz). Its card initialisation on slot 1 goes CMD52 (an I/O reset of CCCR 0x06),
+CMD0, CMD8, CMD5, then ACMD41 and CMD1, fifteen rounds of it in the first 14 s, every command
+unanswered, and `esp_hosted_reconfigure` fails (`transport_drv_reconfigure()`: ESP_FAIL); the
+firmware retries every 30 s and serves the card to the car meanwhile. `ESP_EMU_DEBUG=sdmmc` on
+the test prints each command.
 
-**What milestone 3 needs** ([esp32p4-plan.md](esp32p4-plan.md), "3. USB device and the car"):
+**What milestone 4 needs** ([esp32p4-plan.md](esp32p4-plan.md), "4. The co-processor"):
 
-1. The DWC2 core's identity: GSNPSID (IDF v5.5.3 `hal/esp32p4/include/hal/usb_dwc_ll.h` changes
-   its reset sequence from 4.20a, 0x4F54420A, upwards) and GHWCFG1-4 at 0x44-0x50
-   (`soc/esp32p4/include/soc/usb_dwc_struct.h`), which TinyUSB reads for the PHY type, endpoint
-   and FIFO counts.
-2. The core reset and FIFO flushes self-clearing (GRSTCTL CSFTRST, or CSFTRSTDONE from 4.20a,
-   AHBIDL, TXFFLSH/RXFFLSH), then device mode: the device registers, the endpoint registers and
-   the data FIFOs, with buffer DMA from L2MEM and PSRAM (the IDMAC's memory view in
-   `esp32p4/src/bus.rs` is the template).
-3. The UTMI PHY at 0x5009C000 and its clocks: HP_SYS_CLKRST SOC_CLK_CTRL1.REG_USB_OTG20_SYS_CLK_EN
-   and LP_AON_CLKRST HP_USB_CLKRST_CTRL1 (`hal/esp32p4/include/hal/usb_utmi_ll.h`).
-4. A host on the other end of the cable, written in Rust: enumeration, then SCSI over bulk-only
-   transport, reading and writing the card the firmware presents.
+1. An SDIO function on slot 1: an `SdDevice` attached at slot 1's pins
+   (`Peripherals::attach_sd`, "Slots and the socket") that answers CMD5 with an R4 (OCR, one I/O
+   function), CMD3, CMD7, CMD52 on the CCCR and FBR (SD Specifications Part E1, SDIO Simplified
+   Specification) and CMD53 byte and block transfers, and raises the SDIO interrupt on DAT1 (the
+   trait carries it; the host's SDIO interrupt path in `sdmmc.rs` is not written yet). What sits
+   behind it is the C6's SDIO slave controller as ESP-Hosted's slave firmware programs it.
+2. The C6 co-processor: a second machine, `esp32c6`, running unmodified ESP-Hosted slave firmware
+   built for it (ESP-Hosted 2.12.13 is what oxidrive links on the host side), with an SDIO slave
+   model of the C6's HINF and SLC blocks (IDF v5.5.3 `soc/esp32c6/register/soc/sdio_hinf_reg.h`,
+   `sdio_slc_reg.h`, `sdio_slc_host_reg.h`), the slave's
+   reset on the host's GPIO 54, and the C6's WiFi joining the virtual access point as it already
+   does.
+3. Lock-step co-simulation: both machines stepped in emulated time the way `--cooja` steps
+   802.15.4 nodes (`cli/src/cooja.rs`), SDIO transactions handed across at the cycle they start.
+   The P4 is multi-core, so `Machine::run_until_cycle` (core 0 only) is not the tool; a run to an
+   exact cycle through `max_cycles`, as `usb_host::UsbPort` does for the USB host, works on both
+   cores.
+4. Then the archive window: the NAS as an SMB server on the host behind the NAT, oxidrive taking
+   the card from the car (TEST UNIT READY: MEDIUM NOT PRESENT), uploading a clip, giving it back,
+   and the car's next writes landing intact.
 
-Timed transfers belong with it: a command's CMD_DONE and a transfer's DATA_OVER after the time
-the bytes take on the wire at the bus width and card clock, for which the host needs a clock and
-a deadline (`Device::clock`, `next_deadline`); today only the card's programming takes time. The
-SD card side is ready for it: the card image the car writes through the firmware is the `--sd`
-image, and `--sd-rw` keeps what it wrote. Slot 1 (ESP-Hosted, milestone 4) takes an
-`SdDevice` at its own pins (`Peripherals::attach_sd`, "Slots and the socket"). In the oxidrive
-run ESP-Hosted's transport starts its task (`H_SDIO_DRV: sdio_data_to_rx_buf_task started`, as
-on the board) and then sends no command on slot 1 in 3 s (`ESP_EMU_DEBUG=sdmmc` on the test, or
-`--debug sdmmc`, prints every command: all of them go to slot 0). What it waits for first, its
-slave's reset, a delay or a semaphore, is where milestone 4 starts.
+**Timed SD transfers** are there (`--sd-timing`): with them oxidrive takes the car's writes at
+11.0 MB/s where its board measured about 10.9 MB/s ("USB", "Throughput"). The card's read access
+time and its programming time per block (`--sd-prg-us` is per write) are what is left; an archive
+window's reads of the card on slot 0 and ESP-Hosted's traffic on slot 1 will share the one host,
+so timing both slots matters there.
