@@ -8,8 +8,8 @@
 //! Shared IP (UART, USB-Serial/JTAG, systimer, timer groups, SPI flash controller, efuse) comes
 //! from `esp-periph`. Written here: the memory map, the interrupt matrices and CLIC register
 //! blocks, the cache controller, HP_SYSTEM, HP_SYS_CLKRST, the LP system blocks and the analog
-//! I2C master. The interrupt registers are modelled, but nothing is delivered to the core: its
-//! CLIC trap path is not there yet (`periph::Clic`).
+//! I2C master. Each core's CLIC candidate is presented to the core, whose CLIC mode takes it
+//! (`periph::Clic`, `riscv_rv32::exec::CLIC_IRQ_*`).
 pub mod bus;
 pub mod periph;
 pub mod soc;
