@@ -2,9 +2,11 @@
 
 The ESP-IDF v5.5.3 `get-started/hello_world` example for the ESP32-P4 silicon rev < 3 (v1.x),
 built with `idf.py set-target esp32p4 build`: single-core FreeRTOS from `sdkconfig.defaults`, and
-both cores with `idf.py -D SDKCONFIG_DEFAULTS=sdkconfig.defaults.smp build`. The bootloader,
-partition table and app are committed as `web/wasm/fw/public/p4-hello-*` (single-core) and
-`p4-hello-smp*` (the two cores; same partition table), the input of the `hello-p4` goldens.
+both cores with `idf.py -D SDKCONFIG_DEFAULTS=sdkconfig.defaults.smp build`. Both select rev < 3
+(`CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y`, `CONFIG_ESP32P4_REV_MIN_100=y`); without them IDF builds
+for rev ≥ 3, which the emulator refuses. The bootloader, partition table and app are
+`web/wasm/fw/public/p4-hello-*` (single-core, committed) and `p4-hello-smp*` (the two cores; same
+partition table; pinned by `tools/fetch-p4-firmware.sh`), the input of the `hello-p4` goldens.
 
     ../../target/release/esp32sim-p4 --flash-mb 2 \
       --bootloader build/bootloader/bootloader.bin --ptable build/partition_table/partition-table.bin \
