@@ -127,7 +127,7 @@ pub fn dir() -> String {
 /// partition table: 32-byte entries starting with the magic AA 50 (components/partition_table/
 /// gen_esp32part.py, `PartitionDefinition.to_binary`).
 pub fn nvs_partition(table: &[u8]) -> Option<(usize, usize)> {
-    table.chunks_exact(32).take_while(|e| e[..2] == [0xaa, 0x50]).find(|e| e[2] == 0x01 && e[3] == 0x02).map(|e| {
+    table.as_chunks::<32>().0.iter().take_while(|e| e[..2] == [0xaa, 0x50]).find(|e| e[2] == 0x01 && e[3] == 0x02).map(|e| {
         let word = |i: usize| u32::from_le_bytes(e[i..i + 4].try_into().unwrap()) as usize;
         (word(4), word(8))
     })
