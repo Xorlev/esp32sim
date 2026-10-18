@@ -31,6 +31,7 @@ pub mod rmt_compact;
 pub mod gpspi;
 pub mod rng;
 pub mod intmtx;
+pub mod sdmmc;
 
 pub use device::{Device, WriteEffect};
 pub use mmio::{DeviceSet, Dispatch, Misc, NO_SOURCE};
