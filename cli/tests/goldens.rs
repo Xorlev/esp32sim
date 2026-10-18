@@ -12,6 +12,7 @@ use common::*;
 const BIN: &str = env!("CARGO_BIN_EXE_esp32sim");
 const BIN_C3: &str = env!("CARGO_BIN_EXE_esp32sim-c3");
 const BIN_C6: &str = env!("CARGO_BIN_EXE_esp32sim-c6");
+const BIN_P4: &str = env!("CARGO_BIN_EXE_esp32sim-p4");
 const FW: &str = "web/wasm/fw/public";
 
 fn atech(extra: &[&str]) -> (Run, Vec<u8>) {
@@ -198,6 +199,24 @@ fn hello_world_c6_reboot() {
     assert!(r.stdout.contains("rst:0xc (SW_CPU)") && r.stdout.contains("Saved PC:0x4001975a"), "the second boot banner differs from silicon:\n{}", r.stdout);
     expect_text("hello-c6-reboot.console.txt", &r.stdout);
     expect_u64("hello-c6-reboot.insns", r.insns);
+}
+
+/// hello_world for the ESP32-P4 rev < 3 from the ECO0 mask ROM (docs/esp32p4.md), with the
+/// default boot mode and console: the ROM banner, the bootloader's partition table, and the
+/// stop in bootloader_fill_random, which waits for the cycle CSR (0xC00) the core model does
+/// not have yet. esp32p4/tests/hello.rs runs on past it with a stand-in for that CSR.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn hello_world_p4() {
+    let rom = rom("esp32p4_rev0");
+    let args = ["--rom", rom.to_str().unwrap(), "--flash-mb", "2", 
+        "--bootloader", &format!("{FW}/p4-hello-bootloader.bin"), "--ptable", &format!("{FW}/p4-hello-ptable.bin"), "--app", &format!("{FW}/p4-hello_world.bin"), "--max-seconds", "0.05"];
+    let r = run(BIN_P4, &args);
+    assert!(r.stdout.contains("I (0) boot: End of partition table"), "the bootloader never listed the partitions:\n{}", r.stdout);
+    assert!(r.stderr.contains("bootloader_fill_random waits for `rdcycle` (CSR 0xC00)"), "the cycle-CSR stop was not reported:\n{}", r.stderr);
+    expect_text("hello-p4.console.txt", &r.stdout);
+    expect_u64("hello-p4.insns", r.insns);
+    let r2 = run(BIN, &[&["--chip", "p4"][..], &args[..]].concat());
+    assert_eq!(r.stdout, r2.stdout); assert_eq!(r.insns, r2.insns);
 }
 
 /// The IEEE 802.15.4 energy scanner on the Waveshare ESP32-C6-LCD-1.47 (its owner's firmware,
