@@ -116,6 +116,18 @@ the SoC at its next existing bus tick.
 
 The energy-scan firmware and the run recipe: `examples/waveshare-c6-lcd147/`, [esp32c6.md](esp32c6.md).
 
+## `xiao-alarm` — Seeed XIAO ESP32C6 as a toy smoke alarm (ESP32-C6)
+
+| Device | Pins | Model |
+| --- | --- | --- |
+| TEST and MODE buttons | GPIO 0 (D0) and GPIO 1 (D1), active low | `press test 150`, `press mode 6000` |
+| Buzzer, red LED, green LED | GPIO 21, 22, 23 (D3, D4, D5), LEDC | `--pwm-log 21 --pwm-log 22 --pwm-log 23` is the timeline |
+| RF switch | GPIO 3 (enable), GPIO 14 (antenna select) | levels in the report |
+| BOOT button | GPIO 9 | `press boot 150` |
+| 802.15.4 radio | the C6's MAC | the firmware is a Zigbee sleepy end device; `--zigbee` gives it a coordinator |
+
+The firmware is the [Evan Alarm](https://github.com/xorlev/Smoke-Alarm) Rust port; `sim/` there has the run script and scenarios.
+
 ## `ttgo-tdisplay` — LilyGO TTGO T-Display (classic ESP32)
 
 | Device | Bus | Model |

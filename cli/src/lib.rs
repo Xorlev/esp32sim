@@ -8,6 +8,7 @@ use emu_core::{Bus, Core};
 use std::path::PathBuf;
 
 pub mod cooja;
+pub mod hosted;
 mod camera;
 
 fn usage(chip: &str) -> ! {
@@ -82,6 +83,10 @@ pub struct Opts {
     pub stubs: Vec<String>, pub trace_fns: Vec<String>, pub stop_exc: u64, pub log_periph: bool, pub no_jit: bool, pub debug: Vec<String>,
     /// `--cooja`: run as a Cooja-NG external mote over NDJSON on stdin/stdout (ESP32-C6 only)
     pub cooja: bool, pub cooja_slice_us: u64, pub cooja_verbose: bool, pub cooja_rx_at_end: bool,
+    /// `--zigbee [spec]`: a virtual Zigbee coordinator on the air (ESP32-C6 only)
+    pub zigbee: Option<String>,
+    /// `--pwm-log PIN`: print every change of a pin's LEDC frequency or duty, with its time
+    pub pwm_log: Vec<u8>,
 }
 
 pub fn parse(args: &[String], default_chip: &str) -> Opts {
@@ -146,6 +151,8 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--break" => o.breaks.push(hex(&next(), "break")),
             "--watch" => o.watch = Some(hex(&next(), "watch")),
             "--peek" => o.peeks.push(pair(&next(), 8)),
+            "--zigbee" => { let spec = args.get(i + 1).filter(|s| !s.starts_with("--")).cloned().unwrap_or_default(); if !spec.is_empty() { i += 1; } o.zigbee = Some(spec); }
+            "--pwm-log" => o.pwm_log.push(next().parse().unwrap_or_else(|_| usage_error("--pwm-log: expected a pin number in 0..255"))),
             "--pwm" => o.pwm_pins.push(next().parse().unwrap_or_else(|_| usage_error("--pwm: expected a pin number in 0..255"))),
             "--disasm" => o.disasms.push(pair(&next(), 16)),
             "--profile" => o.profile = true,
@@ -206,13 +213,35 @@ pub fn run_cli(default_chip: &str) {
     validate_timing(&o).unwrap_or_else(|e| usage_error(&e));
     if o.approximate_cache { cache_config().unwrap_or_else(|e| usage_error(&e)); }
     if o.cooja { return run_cooja(&mut o); }
+    if (o.zigbee.is_some() || !o.pwm_log.is_empty()) && !matches!(o.chip.as_str(), "c6" | "esp32c6") { usage_error("--zigbee and --pwm-log: only on the ESP32-C6"); }
     match o.chip.as_str() {
         "esp32" => { let m = setup_esp32(&o); run(m, &o) }
         "s3" | "esp32s3" => { let m = setup_s3(&o); run(m, &o) }
         "c3" | "esp32c3" => { let m = setup_c3(&o); run(m, &o) }
+        "c6" | "esp32c6" if o.zigbee.is_some() || !o.pwm_log.is_empty() => { let m = setup_c6(&o); run_hosted(m, &o) }
         "c6" | "esp32c6" => { let m = setup_c6(&o); run(m, &o) }
         c => { eprintln!("--chip {}: s3, c3 or c6", c); std::process::exit(2) }
     }
+}
+
+/// `--zigbee` / `--pwm-log`: the C6 with host models beside it (`hosted.rs`), set up, booted and
+/// reported exactly as a plain run; only the loop differs.
+fn run_hosted(mut m: esp32c6::Machine, o: &Opts) {
+    if o.approximate_timing { usage_error("--zigbee / --pwm-log: no approximate timing"); }
+    let cfg = o.zigbee.as_deref().map(|s| esp32c6::zigbee::Config::parse(s).unwrap_or_else(|e| usage_error(&e)));
+    let boot = prepare(&mut m, o);
+    if o.zigbee.is_none() {
+        if let Some((_, esp_soc::ScriptAction::Host(c))) = m.script.events.iter().find(|(_, a)| matches!(a, esp_soc::ScriptAction::Host(_))) { usage_error(&format!("script: `{c}` needs --zigbee")); }
+    }
+    for (_, a) in &m.script.events { if let esp_soc::ScriptAction::Host(c) = a { esp32c6::zigbee::Coordinator::check(c).unwrap_or_else(|e| usage_error(&format!("script: {e}"))); } }
+    if let Some(c) = &cfg { eprintln!("[zb] coordinator: PAN {:#06x}, extended PAN {}, channel {}, permit join {}", c.pan, esp32c6::zigbee::ieee_str(&c.ext_pan), c.channel, c.permit_join); }
+    let mut h = hosted::Hosted::new(cfg, o.pwm_log.clone());
+    let t0 = std::time::Instant::now();
+    m.web_restart = !o.no_reboot;
+    let stop = h.run(&mut m, !o.no_reboot && boot == "rom");
+    let dt = t0.elapsed().as_secs_f64();
+    report(&mut m, o, stop, dt);
+    for line in h.report() { eprintln!("{line}"); }
 }
 
 /// `--cooja`: the C6 as a Cooja-NG external mote. csim's `hello` comes first — its node id names
@@ -349,7 +378,7 @@ fn setup_c6(o: &Opts) -> esp32c6::Machine {
     m.bus.set_flash_size(o.flash_mb.unwrap_or(4) << 20);   // the JEDEC capacity follows the size
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
     let name = if o.board == "atech14" { "none" } else { o.board.as_str() };   // the S3 default means "bare module" here
-    match esp32c6::board::make_board(name) { Some(b) => m.bus.board = b, None => { eprintln!("--board {}: none or waveshare-c6-lcd147 on the C6", name); std::process::exit(2) } }
+    match esp32c6::board::make_board(name) { Some(b) => m.bus.board = b, None => { eprintln!("--board {}: none, waveshare-c6-lcd147 or xiao-alarm on the C6", name); std::process::exit(2) } }
     m.bus.attach_board_devices();
     if let Some(spec) = &o.wifi {
         let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"));

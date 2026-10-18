@@ -18,7 +18,10 @@ pub enum ScriptAction { Gpio(u8, bool), Serial(String), Uart(usize, String), Sto
     /// `waituart0 <timeout_s> <text>`: hold the rest of the script until UART0 prints `text` (or the
     /// timeout passes), then shift every later action by the time actually waited. Fields: text,
     /// timeout in cycles, the cycle the script placed it at.
-    WaitUart0(String, u64, u64) }
+    WaitUart0(String, u64, u64),
+    /// `zb ...` and other commands a host-side model (a virtual Zigbee coordinator, say) consumes:
+    /// queued in `Script::host_pending` at their time, for `Machine::take_host_actions`.
+    Host(String) }
 
 /// The stop conditions that are not observers.
 pub struct Debug { pub stop_on_unimplemented: bool, pub stop_after_exceptions: u64 }
@@ -38,6 +41,8 @@ pub struct Console {
 
 /// Host actions scheduled at emulated times (`--script`, and the UI's encoder detents).
 pub struct Script { pub events: Vec<(u64, ScriptAction)>, pub pos: usize, pub log: bool, knob_next: u64,
+                   /// `Host` actions that have come due and nothing has collected yet
+                   pub host_pending: Vec<(u64, String)>,
                    /// UART0 text seen so far (capped) and where the pending wait started looking
                    uart0_seen: Vec<u8>, wait_mark: Option<usize> }
 
@@ -153,7 +158,7 @@ impl<S: Soc> Machine<S> {
             dbg: Debug { stop_on_unimplemented: true, stop_after_exceptions: u64::MAX },
             observers: Vec::new(), probes: Wants::NONE, prev_irq: vec![0; S::CORES],
             exceptions: 0, interrupts: 0, irq_hist: vec![[0; 32]; S::CORES],
-            script: Script { events: Vec::new(), pos: 0, log: true, knob_next: 0, uart0_seen: Vec::new(), wait_mark: None }, max_cycles: u64::MAX,
+            script: Script { events: Vec::new(), pos: 0, log: true, knob_next: 0, host_pending: Vec::new(), uart0_seen: Vec::new(), wait_mark: None }, max_cycles: u64::MAX,
             console: Console { all: Vec::new(), usb: Vec::new(), uart0: Vec::new(), mask: 3, prefix: false, capture: false },
             camera_input: None, web: None, ws: WebState { last_push_cycles: 0, push_interval: 0, audio_sent: 0, ring_updates: 0, grid_updates: Vec::new(), px_pending: 0, px_sent: 0, px_deferred: false, cam_pushed: u64::MAX, cam_sent: false },
             rt: Realtime { enabled: false, wall_start: None, last_check: 0, behind: 0.0, resyncs: 0, speed: None, speed_mark: None, log: false, log_last: None, log_insns: (0, 0) },
@@ -973,6 +978,10 @@ impl<S: Soc> Machine<S> {
         }
     }
 
+    /// `Host` script actions that have come due since the last call, with the cycle each was
+    /// placed at. Nothing in the machine interprets them.
+    pub fn take_host_actions(&mut self) -> Vec<(u64, String)> { std::mem::take(&mut self.script.host_pending) }
+
     /// Re-derive the interrupt lines now, after the host changed a device (a frame injected
     /// between rounds), so the next instruction sees them.
     pub fn sync_irq(&mut self) { *self.bus.irq_dirty() = true; self.refresh_irq(); }
@@ -1052,6 +1061,7 @@ impl<S: Soc> Machine<S> {
                 }
                 ScriptAction::WaitUart0(..) => {}
                 ScriptAction::Ble(command) => { if let Err(error) = self.bus.ble_command(&command) { eprintln!("[ble] {error}"); } }
+                ScriptAction::Host(command) => self.script.host_pending.push((t, command)),
             }
         }
         stopped
@@ -1173,6 +1183,8 @@ impl<S: Soc> Machine<S> {
                     ev.push((c, ScriptAction::Ble(rest.to_string())));
                 },
                 "stop" => ev.push((c, ScriptAction::Stop)),
+                // host-model commands: checked by whoever runs the model, which is not here
+                "zb" => ev.push((c, ScriptAction::Host(after.to_string()))),
                 "waituart0" => { let mut p = rest.splitn(2, char::is_whitespace); let to: f64 = p.next().and_then(|x| x.parse().ok()).ok_or_else(|| format!("line {}: waituart0 <timeout_s> <text>", ln + 1))?;
                                  let text = p.next().unwrap_or("").trim().to_string(); if text.is_empty() { return Err(format!("line {}: waituart0 needs text", ln + 1)); }
                                  ev.push((c, ScriptAction::WaitUart0(text, (to * hz) as u64, c))); }

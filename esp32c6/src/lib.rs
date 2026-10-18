@@ -15,6 +15,7 @@ mod parlio;
 pub mod radio;
 pub mod soc;
 pub mod wifi;
+pub mod zigbee;
 
 pub use esp_soc::Stop;
 pub use soc::{machine, Machine, C6};

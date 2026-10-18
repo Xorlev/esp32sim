@@ -95,6 +95,12 @@ impl Gpio {
         if pin as usize >= self.pin.len() { return false; }
         self.input & (1u64 << pin) != 0
     }
+    /// The pins whose level-type interrupt condition holds right now (type 4: low, 5: high). The
+    /// status register shows them for as long as the level lasts, as the latched edge bits are
+    /// shown until cleared, so an ISR reading `PCPU_INT` finds the pin that woke it.
+    fn level_status(&self) -> u64 {
+        (0..49u8).filter(|&p| { let typ = (self.pin[p as usize] >> 7) & 7; (typ == 4 && !self.level(p)) || (typ == 5 && self.level(p)) }).fold(0, |m, p| m | (1u64 << p))
+    }
     pub fn irq(&self) -> bool {
         // level-type interrupts on current input, plus latched edge status, gated by INT_ENA (bits 13..17, bit 13 = core0)
         (0..49u8).any(|p| { let cfg = self.pin[p as usize]; let ena = (cfg >> 13) & 1 != 0; let typ = (cfg >> 7) & 7;
@@ -106,8 +112,8 @@ impl Gpio {
             0x20 => self.enable as u32, 0x2c => (self.enable >> 32) as u32,
             0x38 => self.strap,
             0x3c => self.input as u32, 0x40 => (self.input >> 32) as u32,
-            0x44 => self.status as u32, 0x50 => (self.status >> 32) as u32,
-            0x5c => self.status as u32, 0x68 => (self.status >> 32) as u32,     // PCPU_INT: interrupt status seen by core 0
+            0x44 => (self.status | self.level_status()) as u32, 0x50 => ((self.status | self.level_status()) >> 32) as u32,
+            0x5c => (self.status | self.level_status()) as u32, 0x68 => ((self.status | self.level_status()) >> 32) as u32,     // PCPU_INT: interrupt status seen by core 0
             0x74..=0x134 => self.pin[((off - 0x74) / 4) as usize],
             0x154..=0x550 => self.func_in_sel[((off - 0x154) / 4) as usize],
             0x554..=0x614 => self.func_out_sel[((off - 0x554) / 4) as usize],

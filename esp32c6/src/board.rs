@@ -8,6 +8,7 @@ pub fn make_board(name: &str) -> Option<Board> {
     match name {
         "none" | "bare" => Some(Box::new(NoBoard)),
         "waveshare-c6-lcd147" | "c6-lcd147" | "lcd147" => Some(Box::new(WaveshareC6Lcd147::new())),
+        "xiao-alarm" | "xiao-esp32c6" | "xiao" => Some(Box::new(XiaoAlarm::default())),
         _ => None,
     }
 }
@@ -82,5 +83,37 @@ impl BoardModel for WaveshareC6Lcd147 {
         let p = &self.panel;
         format!("[emu] lcd147: {} RAMWR, {} pixels, madctl={:#x} colmod={:#x} inverted={} on={} backlight={} bbox={:?}; led {:?} ({} updates); gpio events {}",
                 p.frames, p.pixels_written, p.madctl, p.colmod, p.inverted, p.on, self.backlight, p.bbox(), self.led.leds[0], self.led.updates, self.gpio_events)
+    }
+}
+
+/// A Seeed XIAO ESP32C6 wired as a toy smoke alarm: two buttons to ground on the LP-capable
+/// GPIO0 (TEST, silkscreen D0) and GPIO1 (MODE, D1), a buzzer on GPIO21 (D3) and a red and a
+/// green LED on GPIO22/23 (D4/D5), all three driven by LEDC. Nothing to model beyond names:
+/// the LEDs and the buzzer are read with `--pwm-log 21 --pwm-log 22 --pwm-log 23`, and the
+/// buttons are `press test 150` / `press mode 6000` in a script. The module's BOOT button is
+/// GPIO9. The RF switch (GPIO3 enable, GPIO14 select) is tracked for the report.
+#[derive(Default)]
+pub struct XiaoAlarm { pub rf_enable: bool, pub rf_select: bool, pub gpio_events: u64 }
+
+pub const XIAO_BTN_TEST: u8 = 0;
+pub const XIAO_BTN_MODE: u8 = 1;
+pub const XIAO_BUZZER: u8 = 21;
+pub const XIAO_LED_RED: u8 = 22;
+pub const XIAO_LED_GREEN: u8 = 23;
+
+impl BoardModel for XiaoAlarm {
+    fn name(&self) -> &'static str { "xiao-alarm" }
+    fn gpio_changes(&mut self, changes: &[(u8, bool)]) {
+        for &(pin, level) in changes {
+            self.gpio_events += 1;
+            match pin { 3 => self.rf_enable = level, 14 => self.rf_select = level, _ => {} }
+        }
+    }
+    fn gpio_events(&self) -> u64 { self.gpio_events }
+    fn named_pin(&self, name: &str) -> Option<u8> {
+        match name { "test" | "btn1" => Some(XIAO_BTN_TEST), "mode" | "btn2" => Some(XIAO_BTN_MODE), "boot" => Some(PIN_BOOT), "buzzer" => Some(XIAO_BUZZER), "red" => Some(XIAO_LED_RED), "green" => Some(XIAO_LED_GREEN), _ => None }
+    }
+    fn report(&self) -> String {
+        format!("[emu] xiao-alarm: RF switch enable={} select={} ({}); gpio events {}", self.rf_enable as u8, self.rf_select as u8, if self.rf_enable { "external antenna path" } else { "ceramic antenna" }, self.gpio_events)
     }
 }

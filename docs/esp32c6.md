@@ -292,6 +292,71 @@ busy second (boot) runs at ~160 M instructions/s. Inside csim (`configs/test-ext
 there: a Sky node, the C6 and a sniffer exchanging nullnet broadcasts for 20 s) the C6's
 broadcasts reach the Sky and the Sky's reach Contiki on the C6.
 
+## A Zigbee coordinator on the air: `--zigbee`
+
+The ESP Zigbee SDK's ZBOSS stack — two prebuilt binary components on top of `esp_ieee802154` —
+runs unmodified on the MAC model (with the same `--stub bb_init=0` as any radio firmware). On its
+own it scans the sixteen channels for a network forever. `--zigbee` puts one on the air: a
+virtual coordinator and trust centre, the host's side of the medium rather than another emulated
+node, written in `esp32c6/src/zigbee/`.
+
+It is a real Zigbee PRO network as far as the device can tell: it answers beacon requests with a
+beacon (PAN 0x1a62, extended PAN dd:…, channel 11 — Zigbee2MQTT's defaults, all of them
+`--zigbee chan=15,pan=…` settable), associates the device, acknowledges every frame at the
+12-symbol turnaround with the pending bit set when it holds traffic, and hands that traffic over
+when the sleepy device polls. Above the MAC it carries the network key in a Transport-Key secured
+with the key-transport key hashed from the default trust-centre link key, decrypts and encrypts
+NWK frames with AES-CCM*, answers the node descriptor request as a revision-22 trust centre and
+then does the R21 link-key exchange the device asks for (Request-Key, Transport-Key under the
+key-load key, Verify-Key, Confirm-Key), answers end-device timeout and rejoin requests, and
+speaks ZDO (descriptors, bind, device announce) and ZCL (read, write, configure reporting,
+Default Response, IAS Zone enrolment, reports and notifications decoded by type). The crypto is
+`zigbee/crypto.rs`: CCM* and the Matyas-Meyer-Oseas hash with its HMAC, checked against the
+values Wireshark derives for the default link key.
+
+Scripts drive it with `zb` commands ([cli.md](cli.md#zigbee-coordinator-commands)) and everything
+it does is one `[zb]` line; `--zigbee verbose` narrates every frame. With a ZBOSS end device
+(the XIAO alarm firmware the `xiao-alarm` board is for), the join from the first beacon request
+to the device announce takes 3.3 s of emulated time, the link-key exchange a further 0.8 s; a
+60 s scenario runs in about 4 s of wall time. Measured there: one beacon, 253 frames each way,
+no missed acknowledgements, no frame refused by the radio.
+
+```sh
+printf '2 press mode 6000\n14 zb interview\n16 zb cie 10\n22 zb write 11 0x0010 0x0055 bool 1\n' > join.txt
+./target/release/esp32sim-c6 --boot rom --flash-mb 4 --board xiao-alarm --console usb \
+    --bootloader $B/bootloader.bin --ptable $B/partition-table.bin --app $B/app.bin --elf $B/app.elf \
+    --stub bb_init=0 --zigbee --pwm-log 21 --pwm-log 22 --script join.txt --max-seconds 40
+```
+
+```
+[zb] t=8.589s beacon request on channel 11: beacon (PAN 0x1a62, permit join true)
+[zb] t=10.814s association request from dc:1e:d5:ff:fe:6e:8c:dc (capability 0x80, rx off when idle): short address 0x1234
+[zb] t=11.308s dc:1e:d5:ff:fe:6e:8c:dc joined as 0x1234: network key queued
+[zb] t=11.923s device announce: dc:1e:d5:ff:fe:6e:8c:dc is 0x1234 (capability 0x80)
+[zb] t=12.137s 0x1234 requested a trust-centre link key: a unique one queued under the key-load key
+[zb] t=12.633s verify key from 0x1234: hash matches the new link key; confirm key queued
+[zb] t=14.307s active endpoints: [10, 11, 12]
+[zb] t=14.773s endpoint 10: profile 0x0104 device 0x0402 v0; in [0x0000, 0x0003, 0x0001, 0x0500] out []
+[zb] t=15.089s read response ep 10 cluster 0x0000: 0x0004 = "Kiddo Toy Alarms" (string), 0x0005 = "Evan Alarm v1" (string)
+[zb] t=22.107s write response ep 11 cluster 0x0010: success
+[pwm] t=22.104s GPIO21: 3200.0 Hz 50.00%
+[zb] t=22.110s IAS zone status change from ep 10: 0x0009 [ALARM1 BATTERY] zone 0 ext 0x00 delay 0
+```
+
+The run loop behind both `--zigbee` and `--pwm-log` is `cli/src/hosted.rs`: `run_until_cycle`
+from deadline to deadline, so an acknowledgement goes on the air exactly 192 µs after the frame
+it acknowledges and a duty change is stamped within a millisecond. Not there: a second device,
+routers (every device is the coordinator's own child), APS fragmentation, install codes, green
+power, and the frame-pending table on the device side (the C6 is an end device here, so it never
+needs one).
+
+What bringing the alarm up found in the models: **a level-triggered GPIO interrupt did not show
+its pin in the status register.** The GPIO model raised the line for a low-level interrupt but
+set `STATUS`/`PCPU_INT` only for edge types, so IDF's ISR read no pending pin and called no
+handler — a button armed as a wake from sleep mode (`gpio_wakeup_enable`, a low-level interrupt)
+was never seen. The status register now shows the level-type pins whose condition holds, for as
+long as it holds.
+
 ## The board: `--board waveshare-c6-lcd147`
 
 The Waveshare ESP32-C6-LCD-1.47 wires an ST7789 172×320 panel to SPI2 (MOSI 6, SCLK 7, CS 14,

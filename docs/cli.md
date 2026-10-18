@@ -24,7 +24,7 @@ PSRAM and register presets.
 | `--serial TEXT` | bytes into the USB-Serial/JTAG console before the run |
 | `--elf F` (repeatable) | symbols for logs/profiles (app ELF, bootloader ELF) |
 | `--flash-mb N`, `--psram-mb N` | flash size (JEDEC follows it) and octal PSRAM size (default 8 / 2) |
-| `--board atech14\|waveshare-cam\|waveshare-lcd4b\|waveshare-amoled18-v2\|none` | board model (default atech14); on the C6: `waveshare-c6-lcd147` or `none`; on the classic ESP32: `ttgo-tdisplay` (alias `tdisplay`), `esp32dev-loopback` or `none`/`esp32dev` |
+| `--board atech14\|waveshare-cam\|waveshare-lcd4b\|waveshare-amoled18-v2\|none` | board model (default atech14); on the C6: `waveshare-c6-lcd147`, `xiao-alarm` or `none`; on the classic ESP32: `ttgo-tdisplay` (alias `tdisplay`), `esp32dev-loopback` or `none`/`esp32dev` |
 | `--strap HEX`, `--reset-cause HEX`, `--efuse-regs F`, `--regs-init F` | reproduce a real chip's boot state (used by the differential tests) |
 | `--no-reboot` | stop at the first chip reset instead of rebooting from ROM |
 | `--flash-at OFFSET=FILE` (repeatable) | write a file into flash at a hex offset — a data partition's contents (the panel's `demo` partition takes `energydata.json`) |
@@ -53,6 +53,8 @@ PSRAM and register presets.
 | `--cooja-slice-us N` | how long a busy guest runs before asking csim to step it again (default 100; `hello.args.slice_us` overrides). A transmission reaches csim's medium at the end of the slice it started in, so this bounds how late it is |
 | `--cooja-rx-timing start\|end` | what an `rx` at `t` is: the frame's start (default — csim hands a frame-consuming mote the frame when it starts: `t` is the first preamble byte, the SFD five byte times later, RX_DONE after the whole PPDU, the ACK 192 µs after that) or its end, complete at `t` |
 | `--cooja-verbose` | narrate the exchange on stderr |
+| `--zigbee [SPEC]` (C6) | a virtual Zigbee coordinator and trust centre on the air, for an unmodified Zigbee end device to join; `SPEC` is `chan=11,pan=0x1a62,epan=dddddddddddddddd,key=<32 hex>,tclk=<32 hex>,ieee=00124b0000000001,permit=1,verbose` (Zigbee2MQTT's defaults). Scripts drive it with `zb` commands (below); every event is a `[zb]` line. See [esp32c6.md](esp32c6.md#a-zigbee-coordinator-on-the-air---zigbee) |
+| `--pwm-log PIN` (C6, repeatable) | print every change of the pin's LEDC frequency or duty with its emulated time, sampled each millisecond: a timeline of an LED or a buzzer. `--pwm` is the end-of-run snapshot |
 
 The legacy name `--max-insns` counts scheduler work, not total retired instructions. The
 default scheduler charges one unit per core 0 instruction or idle cycle advanced; another
@@ -118,6 +120,25 @@ One action per line, `<seconds> <cmd> [args]`; buttons/encoder are active low.
 `hw/wsdrive.py [port] [seconds]` drives the same inputs over the UI's WebSocket and reports
 real-time keep-up (push gaps, lag, audio delivered); `hw/wsaudio.py [port] [seconds]` listens to the
 UI's audio stream and reports sample counts/peak (how to check sound without listening).
+
+### Zigbee coordinator commands
+
+With `--zigbee`, a script also speaks to the device through the coordinator. A command that
+needs a joined device waits for the join. Numbers take `0x`; attribute types are `bool u8 u16
+u32 i8 i16 i32 enum8 enum16 bitmap8 bitmap16 ieee string` or a ZCL type id.
+
+```
+14  zb interview                              # node descriptor, endpoints, simple descriptors, Basic attributes
+16  zb cie 10                                 # write our IEEE address as the IAS CIE of endpoint 10
+18  zb bind 10 0x0500                         # bind endpoint 10's IAS Zone cluster to us
+20  zb report 10 0x0001 0x0021 u8 60 3600 1   # configure reporting: attribute, type, min, max, change
+22  zb read 10 0x0500 0x0002,0x0010           # read attributes
+24  zb write 11 0x0010 0x0055 bool 1          # write an attribute
+26  zb cmd 10 0x0003 0x00 0500                # a cluster-specific command with a hex payload
+28  zb identify 10 5                          # Identify for 5 s
+30  zb permit 0                               # close the network to joins
+32  zb leave rejoin                           # ask the device to leave (and rejoin)
+```
 
 ### ADC inputs
 
