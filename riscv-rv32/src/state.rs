@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 
 pub mod csr {
+    /// The F extension's CSRs (RISC-V unprivileged ISA, F, "Floating-Point Control and Status Register").
+    pub const FFLAGS: u32 = 0x001; pub const FRM: u32 = 0x002; pub const FCSR: u32 = 0x003;
     pub const MSTATUS: u32 = 0x300; pub const MISA: u32 = 0x301; pub const MIE: u32 = 0x304;
     pub const MTVEC: u32 = 0x305; pub const MSCRATCH: u32 = 0x340; pub const MEPC: u32 = 0x341;
     pub const MCAUSE: u32 = 0x342; pub const MTVAL: u32 = 0x343; pub const MIP: u32 = 0x344;
@@ -15,6 +17,14 @@ pub mod csr {
     /// uses; the user-mode alias at 0x802 is what the ROM's `ets_delay_us` busy-waits on.
     pub const MPCER: u32 = 0x7E0; pub const MPCMR: u32 = 0x7E1; pub const MPCCR: u32 = 0x7E2;
     pub const PCER_U: u32 = 0x800; pub const PCMR_U: u32 = 0x801; pub const PCCR_U: u32 = 0x802;
+    /// ESP32-P4 EXT_ILL: why the last illegal-instruction trap was taken
+    /// (ESP-IDF v5.5.3 `components/riscv/vectors.S`, `EXT_ILL_CSR`).
+    pub const EXT_ILL: u32 = 0x7F0;
+}
+
+/// EXT_ILL reason bits (ESP-IDF v5.5.3 `components/riscv/vectors.S`, `EXT_ILL_RSN_*`).
+pub mod ext_ill {
+    pub const FPU: u32 = 1; pub const HWLP: u32 = 2; pub const PIE: u32 = 4;
 }
 
 pub mod exc {
@@ -29,6 +39,13 @@ pub mod mstatus {
     pub const MIE: u32 = 1 << 3;
     pub const MPIE: u32 = 1 << 7;
     pub const MPP: u32 = 3 << 11;
+    /// FP unit status, Off/Initial/Clean/Dirty, and SD = some state Dirty (RISC-V privileged ISA
+    /// v1.13, "Extension Context Status in mstatus Register"). Modelled only on a core with F.
+    pub const FS: u32 = 3 << 13;
+    pub const FS_INITIAL: u32 = 1 << 13;
+    pub const FS_CLEAN: u32 = 2 << 13;
+    pub const FS_DIRTY: u32 = 3 << 13;
+    pub const SD: u32 = 1 << 31;
 }
 
 /// Reset vector: the C3 and the C6 start executing in the mask ROM.
@@ -36,6 +53,11 @@ pub const RESET_VECTOR: u32 = 0x4000_0000;
 /// `misa` for the two cores: RV32IMC (bits I|M|C, MXL=1) and RV32IMAC.
 pub const MISA_RV32IMC: u32 = 0x4000_1104;
 pub const MISA_RV32IMAC: u32 = 0x4000_1105;
+/// `misa` bit F: the core decodes and executes RV32F and its compressed loads and stores.
+pub const MISA_F: u32 = 1 << 5;
+/// RV32IMAFC, the ESP32-P4's ISA without its custom extensions (ESP-IDF v5.5.3
+/// `tools/cmake/toolchain-esp32p4.cmake`). Whether silicon also sets X is not known.
+pub const MISA_RV32IMAFC: u32 = MISA_RV32IMAC | MISA_F;
 
 pub struct Cpu {
     pub pc: u32,
@@ -63,8 +85,17 @@ pub struct Cpu {
     pub waiting: bool,
     /// the line the SoC's interrupt controller wants taken, if any (`Core::set_irq`)
     pub irq: Option<u32>,
-    /// which ISA `misa` reports: IMC on the C3, IMAC on the C6 (execution accepts A on both)
+    /// which ISA `misa` reports: IMC on the C3, IMAC on the C6 (execution accepts A on both).
+    /// F here is what enables the F extension, so a core without it decodes F encodings as illegal.
     pub misa: u32,
+    /// the core has the ESP32-P4's EXT_ILL CSR (0x7F0); without it 0x7F0 is an unmodelled CSR
+    pub has_ext_ill: bool,
+    /// f0-f31 as binary32 bit patterns (FLEN = 32, so no NaN-boxing)
+    pub f: [u32; 32],
+    /// frm in bits 7:5, the accrued flags in bits 4:0; bits 31:8 read zero
+    pub fcsr: u32,
+    /// EXT_ILL's value, when `has_ext_ill`
+    pub ext_ill: u32,
     /// the address an `lr.w` reserved, until the next `sc.w`
     pub reservation: Option<u32>,
     /// pcs the machine intercepts (stubs, probes), as a bloom over `emu_core::pc_bit`: `run` stops there
@@ -83,22 +114,39 @@ impl Cpu {
             pc: RESET_VECTOR, x: [0; 32],
             mstatus: 0x1800,          // MPP = machine
             mtvec: 0, mepc: 0, mcause: 0, mtval: 0, mie: 0, mscratch: 0,
-            insn_count: 0, retired_count: 0, cycle_count: 0, cycle_base: 0, instret_base: 0, waiting: false, irq: None, misa: MISA_RV32IMC, reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
+            insn_count: 0, retired_count: 0, cycle_count: 0, cycle_base: 0, instret_base: 0, waiting: false, irq: None, misa: MISA_RV32IMC,
+            has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
         }
     }
     pub fn new_rv32imac() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAC; c }
+    /// An ESP32-P4 HP core: RV32IMAFC with EXT_ILL. Its custom extensions (Xesppie, hardware loops)
+    /// are not modelled and decode as illegal. FS is Off at reset, as on any core with F.
+    pub fn new_esp32p4() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAFC; c.has_ext_ill = true; c }
 
     pub fn reset(&mut self) {
         // `insn_count` is the emulator's own monotonic counter — it drives the run statistics and
         // the trace, so a chip reset must not rewind it (a reset that did made the browser UI
         // report a negative instruction rate). The architectural cycle counter is separately
         // monotonic and firmware reads its reset-relative value.
-        let (insns, retired, cycles, misa, bloom) = (self.insn_count, self.retired_count, self.cycle_count, self.misa, self.boundary_bloom);
+        let (insns, retired, cycles, misa, ext_ill, bloom) = (self.insn_count, self.retired_count, self.cycle_count, self.misa, self.has_ext_ill, self.boundary_bloom);
         *self = Cpu::new();
         self.insn_count = insns; self.retired_count = retired; self.cycle_count = cycles;
         self.cycle_base = cycles; self.instret_base = retired;
-        self.misa = misa; self.boundary_bloom = bloom;
+        self.misa = misa; self.has_ext_ill = ext_ill; self.boundary_bloom = bloom;
     }
+
+    #[inline(always)]
+    pub fn has_f(&self) -> bool { self.misa & MISA_F != 0 }
+    /// FS = Off: every F instruction and FP CSR access is illegal (privileged ISA v1.13,
+    /// "Extension Context Status in mstatus Register").
+    #[inline(always)]
+    pub fn fs_off(&self) -> bool { self.mstatus & mstatus::FS == 0 }
+    /// Any write to an f register or to fcsr makes the FP state Dirty, and SD follows.
+    #[inline(always)]
+    pub fn set_fs_dirty(&mut self) { self.mstatus |= mstatus::FS_DIRTY | mstatus::SD; }
+    /// OR exception flags into fflags; any raised flag is a write to fcsr.
+    #[inline(always)]
+    pub fn accrue_fflags(&mut self, flags: u32) { if flags != 0 { self.fcsr |= flags; self.set_fs_dirty(); } }
 
     #[inline(always)]
     pub fn get(&self, r: u8) -> u32 { self.x[r as usize] }
@@ -125,6 +173,10 @@ impl Cpu {
             MINSTRET => self.retired_count.wrapping_sub(self.instret_base) as u32,
             MINSTRETH => (self.retired_count.wrapping_sub(self.instret_base) >> 32) as u32,
             MVENDORID => 0, MARCHID => 0, MIMPID => 0, MHARTID => 0,
+            FFLAGS if self.has_f() => self.fcsr & 0x1f,
+            FRM if self.has_f() => (self.fcsr >> 5) & 7,
+            FCSR if self.has_f() => self.fcsr,
+            EXT_ILL if self.has_ext_ill => self.ext_ill,
             _ => self.csr_other.get(&n).copied().unwrap_or(0),
         }
     }
@@ -132,7 +184,17 @@ impl Cpu {
     pub fn write_csr(&mut self, n: u32, v: u32) {
         use csr::*;
         match n {
+            // FS is writable and SD read-only on a core with F; without F, mstatus keeps whatever
+            // was written, as it always has on the C3 and C6.
+            MSTATUS if self.has_f() => {
+                let sd = if v & mstatus::FS == mstatus::FS_DIRTY { mstatus::SD } else { 0 };
+                self.mstatus = (v & !mstatus::SD) | sd;
+            }
             MSTATUS => self.mstatus = v,
+            FFLAGS if self.has_f() => { self.fcsr = (self.fcsr & !0x1f) | (v & 0x1f); self.set_fs_dirty(); }
+            FRM if self.has_f() => { self.fcsr = (self.fcsr & 0x1f) | ((v & 7) << 5); self.set_fs_dirty(); }
+            FCSR if self.has_f() => { self.fcsr = v & 0xff; self.set_fs_dirty(); }
+            EXT_ILL if self.has_ext_ill => self.ext_ill = v,
             MIE => self.mie = v,
             MTVEC => self.mtvec = v,
             MSCRATCH => self.mscratch = v,

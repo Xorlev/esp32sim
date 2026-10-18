@@ -1,8 +1,8 @@
 //! The interpreter. One instruction per `step()`; 1 instruction = 1 cycle, as in the Xtensa core.
 
 use crate::bus::{Bus, Fault};
-use crate::decode::{decode, Insn, Op};
-use crate::state::{exc, Cpu};
+use crate::decode::{decode_for, Insn, Op};
+use crate::state::{csr, exc, Cpu};
 use emu_core::{CacheOperation, ControlEvent, ControlEventKind, StepKind, StepOutcome};
 
 pub use emu_core::Trap;
@@ -56,7 +56,7 @@ pub fn step_outcome<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> StepOutcome {
             return StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Exception(exc::INSN_ACCESS_FAULT)), control: None };
         }
     };
-    let i = decode(pc, bytes);
+    let i = decode_for(cpu.misa, pc, bytes);
     cpu.insn_count += 1; cpu.cycle_count += 1;
     let control = if i.op == Op::FenceI {
         Some(ControlEvent { kind: ControlEventKind::Cache(CacheOperation::FenceInstruction), address: 0 })
@@ -161,6 +161,12 @@ pub fn exec_insn<B: Bus>(cpu: &mut Cpu, bus: &mut B, i: &Insn, pc: u32) -> Resul
 
         Csrrw | Csrrs | Csrrc | Csrrwi | Csrrsi | Csrrci => {
             let n = immu;
+            // fflags/frm/fcsr are FP state: illegal with FS = Off. EXT_ILL does not flag these on the
+            // P4 (ESP-IDF v5.5.3 `components/riscv/vectors.S` decodes mtval for them instead).
+            if n.wrapping_sub(csr::FFLAGS) < 3 && cpu.has_f() && cpu.fs_off() {
+                cpu.trap(exc::ILLEGAL_INSN, i.raw, pc);
+                return Err(Trap::Exception(exc::ILLEGAL_INSN));
+            }
             let src = if matches!(i.op, Csrrwi | Csrrsi | Csrrci) { i.rs1 as u32 } else { a };
             // A read is only skipped for csrrw with rd = x0; a write only for set/clear with a
             // zero source operand — which is how firmware reads a CSR without disturbing it.
@@ -173,6 +179,10 @@ pub fn exec_insn<B: Bus>(cpu: &mut Cpu, bus: &mut B, i: &Insn, pc: u32) -> Resul
             if let Some(v) = write { cpu.write_csr(n, v); }
             cpu.set(i.rd, old);
         }
+
+        Flw | Fsw | FmaddS | FmsubS | FnmsubS | FnmaddS | FaddS | FsubS | FmulS | FdivS | FsqrtS
+        | FsgnjS | FsgnjnS | FsgnjxS | FminS | FmaxS | FcvtWS | FcvtWuS | FcvtSW | FcvtSWu | FmvXW | FmvWX
+        | FeqS | FltS | FleS | FclassS => return crate::fpu::exec(cpu, bus, i, pc),
     }
     cpu.pc = new_pc;
     Ok(())
