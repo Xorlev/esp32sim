@@ -98,7 +98,8 @@ The HS USB-OTG controller (DWC2 with a UTMI PHY, at `0x50000000`) as a device, a
 the other end of the cable written in Rust: enumeration, then SCSI over bulk-only transport
 (INQUIRY, TEST UNIT READY, READ CAPACITY, READ/WRITE(10)). The host is scripted, so a test can
 record like a car (clip-sized writes, FAT updates, idle gaps), hold the drive, and see what the
-device reports while it has the card away.
+device reports while it has the card away (MEDIUM NOT PRESENT, which the tusb_msc example shows
+after an eject; oxidrive's archive windows are the same from the car's side).
 
 Done when IDF's own tusb_msc example enumerates to the host, which reads the capacity, reads and
 writes blocks, mounts FAT32 and writes and reads a file, as a golden with the card's contents
