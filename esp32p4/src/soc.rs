@@ -134,6 +134,7 @@ impl esp_soc::SocBus for SocBus {
         self.mmu_flash_index = 0;
         self.mmu_psram_index = 0;
         self.undelivered = [0; 2];
+        self.core1_reported.set(false);
         for area in self.debug.iter() { esp_periph::Dispatch::debug(&mut self.periph, area, true); }
         self.periph.misc.log_all = self.debug.has("mmio");
         cause

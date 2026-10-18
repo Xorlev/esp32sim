@@ -45,7 +45,7 @@ fn hello_world_p4_with_cycle_csr_shim() {
     assert!(console.contains("heap_init: At 4FF40000 len 00060000 (384 KiB): RAM"), "{console}");
     // start_cpu0's `j .` after esp_startup_start_app returns (hello_world.elf of this build)
     assert_eq!(m.cores[0].pc(), 0x4000_0682);
-    assert_eq!(m.bus.periph.clic.core[0].candidate().map(|(id, _)| id), Some(17));
+    assert_eq!(m.bus.periph.clic.core[0].candidate().map(|(id, _)| id), Some(18));
     assert_eq!((m.exceptions, m.interrupts), (0, 0));
     expect_text("hello-p4-cycle-shim.console.txt", &console);
     expect_u64("hello-p4-cycle-shim.insns", m.insns());

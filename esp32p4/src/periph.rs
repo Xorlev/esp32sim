@@ -106,15 +106,16 @@ impl ClicCore {
     /// The 8-bit level of an ID: CTL with the bits below NLBITS read as ones.
     pub fn level(&self, id: usize) -> u32 { (self.ctrl[id] >> 24) | 0x1f }
     pub fn vectored(&self, id: usize) -> bool { self.ctrl[id] & (1 << 16) != 0 }
-    /// The highest-level enabled, pending ID above the threshold, lowest ID first on a tie: what
-    /// the core would take with `mstatus.MIE` set and no interrupt level of its own.
+    /// The highest-level enabled, pending ID above the threshold, the higher ID on a tie (the
+    /// RISC-V CLIC specification's rule): what the core would take with `mstatus.MIE` set and
+    /// no interrupt level of its own.
     pub fn candidate(&self) -> Option<(usize, u32)> {
         let thresh = self.thresh >> 24;
         let mut best: Option<(usize, u32)> = None;
         for id in 0..CLIC_IDS {
             if !self.enabled(id) || !self.pending(id) { continue; }
             let l = self.level(id);
-            if l > thresh && best.is_none_or(|(_, b)| l > b) { best = Some((id, l)); }
+            if l > thresh && best.is_none_or(|(_, b)| l >= b) { best = Some((id, l)); }
         }
         best
     }
