@@ -1,4 +1,4 @@
-//! ESP32-P4: two RISC-V HP cores, 768 KB of L2MEM (code and data in one space, an uncached alias
+//! ESP32-P4: two RISC-V HP cores (RV32IMAFC), 768 KB of L2MEM (code and data in one space, an uncached alias
 //! at +0x4000_0000), 8 KB of TCM, 32 KB of LP RAM, and separate flash and PSRAM windows, each
 //! behind its own 1024-entry MMU. No radio.
 //!

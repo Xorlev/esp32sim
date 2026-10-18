@@ -56,7 +56,8 @@ impl<R: Revision> Soc for Esp32p4<R> {
     const ROM_DATA_TABLE: &'static [&'static str] = &["_data_table_start"];
     const ROM_DATA_TABLE_END: &'static [&'static str] = &["_data_table_end"];
     const ROM_DATA_TABLE_STRIDE: u32 = 12;
-    fn new_core(_i: usize) -> Cpu { let mut c = Cpu::new_rv32imac(); c.pc = RESET_VECTOR; c }
+    /// RV32IMAFC with the P4's EXT_ILL CSR; Xesppie and the hardware loops decode as illegal.
+    fn new_core(_i: usize) -> Cpu { let mut c = Cpu::new_esp32p4(); c.pc = RESET_VECTOR; c }
     /// Both cores reset into the mask ROM. `mhartid` reads 0 on every core of this CPU model.
     fn reset_core(c: &mut Cpu, _i: usize) { Cpu::reset(c); c.pc = RESET_VECTOR; }
     fn boot_core(c: &mut Cpu, entry: u32) {

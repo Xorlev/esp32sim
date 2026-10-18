@@ -42,9 +42,10 @@ against it; the first two console lines are ECO0's, not the board's.
 | hello_world, with a stand-in for that CSR (`esp32p4/tests/hello.rs`, golden `hello-p4-cycle-shim`) | the scheduler start: `vTaskStartScheduler` returns and `start_cpu0` spins on its final `j .` (0x40000682) | CLIC mode: with `mtvec` = 0x4ff00003 (mode 3) and `mtvt` set, the first interrupts are CLIC ID 18 (SYSTIMER_TARGET0, CPU line 2) and ID 17 (FROM_CPU_INTR0, line 1, the first yield), both hardware-vectored, level 0x3f over threshold 0x1f. The core must take the highest level above `max(mintstatus.mil, CLIC_INT_THRESH[31:24])` with `mstatus.MIE` set (the higher ID on equal levels, as the CLIC specification has it; not checked on silicon), fetch the handler from `mtvt + 4 * id`, write `mcause` = 0x8000_0000 \| id with the previous level in bits 23:16 (MPIL), and `mret` must restore the level from `mcause.MPIL`; `mintstatus` is CSR 0x346 on rev < 3 |
 | dual-core hello_world and oxidrive, with the stand-in | `start_other_core`, waiting for core 1 (`ets_delay_us`) | a `mhartid` per hart (0 and 1, kept across a reset); HP_SYS_CLKRST releases core 1 at boot address 0x4ff003a6 (hello_world) and the chip holds it, because a second hart reading `mhartid` 0 would run the ROM as core 0 |
 
-The F extension is not on any of these paths: the run to the scheduler takes no exception, and the
-only FP instructions in hello_world are FreeRTOS's lazy save in `rtos_save_fpu_coproc`, reached
-from the illegal-instruction trap once tasks run.
+The cores are built with `Cpu::new_esp32p4()`: RV32IMAFC, `mstatus.FS` Off at reset with the lazy
+FPU traps, and the EXT_ILL CSR. None of the paths above executes an F instruction (the run to the
+scheduler takes no exception); the only ones in hello_world are FreeRTOS's lazy save in
+`rtos_save_fpu_coproc`, reached from the illegal-instruction trap once tasks run.
 
 The CLIC and the interrupt matrices are modelled as registers (`periph::Clic`, `periph::IntMatrix`):
 sources reach the per-core CLIC input through the matrix, IE, attributes, levels and the rev < 3
@@ -81,7 +82,7 @@ reports this comparison; it is not expected to pass yet.
 
 | | |
 | --- | --- |
-| CPU | the RV32IMAC core of the C3/C6, two instances; core 1 held in reset (see above). `misa` reads IMAC |
+| CPU | two RV32IMAFC cores (`Cpu::new_esp32p4`, `misa` 0x40001125, the EXT_ILL CSR); core 1 held in reset (see above). Xesppie and the hardware loops decode as illegal |
 | Memory | 128 KB mask ROM at 0x4FC00000 (reset vector), 768 KB L2MEM at 0x4FF00000 and its uncached alias at 0x8FF00000, 8 KB TCM at 0x30100000, LP ROM (empty) and 32 KB LP RAM; flash (0x40000000) and PSRAM (0x48000000) windows behind two 1024-entry MMUs of 64 KB pages, reached through SPI_MEM_C / SPI_MEM_S item registers, with their uncached aliases |
 | Interrupts | both interrupt matrices (128 sources, rev < 3) and both CLIC register blocks; not delivered (above) |
 | Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG; everything else is register RAM, listed by `--log-periph` |
@@ -94,8 +95,8 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 
 ## Not there yet
 
-- The core work above: `cycle`, the CLIC trap path, a second hart. Then F for FreeRTOS's FP
-  context, and Xesppie's save and restore.
+- The core work above: `cycle`, the CLIC trap path, a second hart. Then Xesppie's save and
+  restore, which FreeRTOS runs only for a task that uses PIE.
 - **GPIO** uses the shared model at the C6's register offsets; the P4's FUNCn_IN_SEL and
   FUNCn_OUT_SEL arrays sit 4 bytes higher and it has 55 pins. Configuration reads back, so the
   console is unaffected; pin-level boards need the layout parameter.
