@@ -15,6 +15,8 @@ pub trait BlockDevice {
     fn write_blocks(&mut self, lba: u64, data: &[u8]) -> Result<(), String>;
     /// Let time pass with nothing to do (a camera filling the next chunk).
     fn pause_ns(&mut self, _ns: u64) -> Result<(), String> { Ok(()) }
+    /// Emulated time, for pacing; a device without a clock stays at 0.
+    fn now_ns(&mut self) -> u64 { 0 }
 }
 
 /// A disk in memory.
@@ -32,6 +34,61 @@ impl BlockDevice for MemDisk {
         self.0.get_mut(o..o + data.len()).ok_or("write past the end")?.copy_from_slice(data);
         Ok(())
     }
+}
+
+/// What a clip written to a camera's schedule saw.
+#[derive(Clone, Debug, Default)]
+pub struct ClipStats {
+    pub bytes: u64,
+    pub chunks: usize,
+    pub elapsed_ns: u64,
+    /// how far the latest chunk started behind its due time, and which chunk that was
+    pub worst_late_ns: u64,
+    pub worst_chunk: usize,
+    /// chunks that started a whole gap or more behind: the car needed more than one chunk of buffer
+    pub behind: usize,
+    /// bytes over time from the start of the second half's first chunk to the close
+    pub second_half_mb_s: f64,
+}
+
+impl ClipStats {
+    pub fn mb_s(&self) -> f64 { self.bytes as f64 * 1e3 / self.elapsed_ns.max(1) as f64 }
+    /// Never a whole chunk behind the camera.
+    pub fn kept_up(&self, gap_ns: u64) -> bool { gap_ns == 0 || self.behind == 0 }
+    pub fn summary(&self, gap_ns: u64) -> String {
+        let pace = if gap_ns == 0 { "unpaced".to_string() } else {
+            format!("camera {:.2} MB/s, worst {:.1} ms late (chunk {}), {}", self.bytes as f64 * 1e3 / (self.chunks as u64 * gap_ns).max(1) as f64,
+                    self.worst_late_ns as f64 / 1e6, self.worst_chunk, if self.kept_up(gap_ns) { "kept up".to_string() } else { format!("fell behind on {} chunks", self.behind) })
+        };
+        format!("{} bytes in {} chunks, {:.3} s, {:.2} MB/s, second half {:.2} MB/s; {pace}", self.bytes, self.chunks, self.elapsed_ns as f64 / 1e9, self.mb_s(), self.second_half_mb_s)
+    }
+}
+
+/// Record `data` as a camera feeds it: chunk i is ready at t0 + i·gap, t0 taken before the file
+/// is created. The car writes a chunk as soon as it is ready and the previous one is done, and
+/// waits only for one not ready yet; a chunk that starts after its due time counts as late.
+pub fn write_clip(fs: &mut Fat32, dev: &mut dyn BlockDevice, name: &str, data: &[u8], chunk: usize, gap_ns: u64, fat_every: u32) -> Result<ClipStats, String> {
+    let chunk = chunk.max(fs.cluster_bytes()) / fs.cluster_bytes() * fs.cluster_bytes();
+    let t0 = dev.now_ns();
+    let mut st = ClipStats { chunks: data.len().div_ceil(chunk), ..Default::default() };
+    let (mut half_t, mut half_bytes) = (t0, 0u64);
+    let mut f = fs.create(dev, name)?;
+    f.fat_every = fat_every;
+    for (i, part) in data.chunks(chunk).enumerate() {
+        let due = t0 + i as u64 * gap_ns;
+        let now = dev.now_ns();
+        if due > now { dev.pause_ns(due - now)?; }
+        let late = now.saturating_sub(due);
+        if late > st.worst_late_ns { st.worst_late_ns = late; st.worst_chunk = i; }
+        if gap_ns > 0 && late >= gap_ns { st.behind += 1; }
+        if i == st.chunks / 2 { half_t = dev.now_ns(); half_bytes = (data.len() - i * chunk) as u64; }
+        f.write(fs, dev, part)?;
+    }
+    st.bytes = f.close(fs, dev)?;
+    let end = dev.now_ns();
+    st.elapsed_ns = (end - t0).max(1);
+    st.second_half_mb_s = half_bytes as f64 * 1e3 / (end - half_t).max(1) as f64;
+    Ok(st)
 }
 
 const EOC: u32 = 0x0fff_ffff;

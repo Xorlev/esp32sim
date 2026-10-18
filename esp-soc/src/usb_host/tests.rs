@@ -2,7 +2,7 @@
 //! answers like TinyUSB's MSC class, with knobs for the failures BOT's host side must handle.
 #[path = "../../../tests/sd_image.rs"]
 mod sd_image;
-use super::fat32::{clip_bytes, Fat32, MemDisk};
+use super::fat32::{clip_bytes, write_clip, Fat32, MemDisk};
 use super::msc::{op, sense, Dir, Msc, MscError, Recovery, Sense};
 use super::*;
 use emu_core::Fault;
@@ -436,4 +436,38 @@ fn a_zero_length_packet_before_the_csw_is_read_past_under_linux() {
         assert_eq!(m.stats.resets, u64::from(!ok));
         m.test_unit_ready().unwrap();
     }
+}
+
+/// A clip paced to a camera: chunk i is due at t0 + i·gap. A drive faster than the camera keeps
+/// up and the clip takes the camera's time; a camera faster than the drive leaves chunks a whole
+/// gap or more behind.
+#[test]
+fn a_clip_is_paced_to_the_camera_and_lateness_counted() {
+    let img = std::env::temp_dir().join(format!("usbhost-pace-{}.img", std::process::id()));
+    sd_image::fat32(&img, 64 << 20, 512, "").unwrap();
+    let mut dev = FakeMsc::new(0);
+    dev.disk = std::fs::read(&img).unwrap();
+    std::fs::remove_file(&img).ok();
+    let mut port = FakePort::new(dev);
+    let mut m = msc(&mut port);
+    m.read_capacity().unwrap();
+    let mut fs = Fat32::mount(&mut m).unwrap();
+    let clip = clip_bytes("A.MP4", 8 << 16);
+    let st = write_clip(&mut fs, &mut m, "A.MP4", &clip, 64 << 10, 16_000_000, 1).unwrap();
+    assert_eq!((st.bytes, st.chunks), (8 << 16, 8));
+    assert!(st.kept_up(16_000_000) && st.worst_late_ns < 16_000_000, "{st:?}");
+    assert!(st.elapsed_ns >= 7 * 16_000_000, "the last chunk is not ready before 112 ms: {st:?}");
+    assert!(st.summary(16_000_000).contains("kept up"));
+    let st = write_clip(&mut fs, &mut m, "B.MP4", &clip_bytes("B.MP4", 8 << 16), 64 << 10, 100_000, 1).unwrap();
+    assert!(!st.kept_up(100_000) && st.behind > 0 && st.worst_chunk > 0, "{st:?}");
+    assert_eq!(fs.read_file(&mut m, "A.MP4").unwrap(), clip);
+}
+
+#[test]
+fn script_lines_parse_with_their_tolerance_and_faults() {
+    use super::script::{parse, Cmd};
+    let c = parse("? uart0 status\nrecovery bot\ntimeout 5\ninject vbus-off 10\nport-reset # again\n? fat-write A.MP4 100 64 16").unwrap();
+    assert_eq!(c, vec![(1, Cmd::Tolerate(Box::new(Cmd::Uart0("status".into())))), (2, Cmd::Recovery(Recovery::Bot)), (3, Cmd::Timeout(5)), (4, Cmd::InjectVbusOff(10)), (5, Cmd::PortReset),
+                       (6, Cmd::Tolerate(Box::new(Cmd::FatWrite { name: "A.MP4".into(), bytes: 100, chunk: 64 << 10, gap_ms: 16, fat_every: 1 })))]);
+    assert!(parse("inject reset 5").is_err() && parse("recovery windows").is_err());
 }

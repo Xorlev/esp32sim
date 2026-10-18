@@ -130,18 +130,23 @@ fn external_oxidrive_console_matches_the_board() {
 
 /// oxidrive with a car on its USB port, as a car is when the board powers up with it: VBUS from
 /// the start. The car enumerates the drive, polls it until it is ready, mounts its FAT32 volume,
-/// records a 4 MiB clip in 64 KiB chunks 16 ms apart (a camera at 4 MB/s), reads it back, and
-/// idles polling the drive while oxidrive runs on. Afterwards the clip must be on the card image
-/// (written through) byte for byte. The firmware's console from the moment the car connected is
-/// printed: how it accounts for the car's writes. Archive windows, which take the card from the
-/// car, need WiFi and the NAS (milestone 4). `OXIDRIVE_CAR_GAP_MS` sets the gap between chunks,
-/// `OXIDRIVE_SD_TIMING=1` times the SD bus (`--sd-timing`).
+/// records a clip in 64 KiB chunks, one due every 16 ms (a 4.1 MB/s camera, `fat32::write_clip`),
+/// reads it back, and idles polling the drive while oxidrive runs on. Afterwards the clip must be
+/// on the card image (written through) byte for byte. The firmware's console from the moment the
+/// car connected is printed: how it accounts for the car's writes. Archive windows, which take the
+/// card from the car, need WiFi and the NAS (milestone 4). `OXIDRIVE_CLIP_MIB` sets the clip's
+/// size (4), `OXIDRIVE_CAR_GAP_MS` the camera's interval (16; 0 writes as fast as the drive
+/// takes it), `OXIDRIVE_SD_TIMING=1` times the SD bus (`--sd-timing`).
 #[test]
 #[ignore = "needs the oxidrive images under ~/Code/dlp/sim-fixtures"]
 fn external_oxidrive_presents_the_card_to_a_car() {
-    use esp_soc::usb_host::{fat32::{clip_bytes, BlockDevice, Fat32}, msc::Msc, UsbHost};
+    use esp_soc::usb_host::{fat32::{clip_bytes, write_clip, Fat32}, msc::Msc, UsbHost};
     let (mut m, _board_log, card) = boot("oxidrive-car.img", true);
-    m.max_cycles = 20 * esp32p4::periph::CPU_HZ;
+    // 64 KiB every 16 ms is a 4.1 MB/s camera; OXIDRIVE_CLIP_MIB=64 outlasts the drive's buffering
+    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
+    let mib = env("OXIDRIVE_CLIP_MIB", 4);
+    let gap_ns = env("OXIDRIVE_CAR_GAP_MS", 16) * 1_000_000;
+    m.max_cycles = (20 + mib / 2) * esp32p4::periph::CPU_HZ;
     esp_soc::SocBus::attach_usb_host(&mut m.bus, Default::default()).unwrap();
     let mut host = UsbHost::new(&mut m);
     host.log = true;
@@ -158,20 +163,10 @@ fn external_oxidrive_presents_the_card_to_a_car() {
     step("read the capacity", r.map(|(n, bs)| eprintln!("[oxidrive] car: {n} blocks of {bs} bytes")));
     let mut fs = Fat32::mount(&mut msc).unwrap_or_else(|e| panic!("[oxidrive] the car could not mount the volume: {e}"));
     eprintln!("[oxidrive] car: FAT32 {:?}, {} clusters of {} bytes", fs.label, fs.clusters, fs.cluster_bytes());
-    let clip = clip_bytes("CLIP0001.MP4", 4 << 20);
-    let gap_ns = std::env::var("OXIDRIVE_CAR_GAP_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(16) * 1_000_000;
-    let t0 = msc.host.now_ns();
-    let r = (|| {
-        let mut f = fs.create(&mut msc, "CLIP0001.MP4")?;
-        for (n, part) in clip.chunks(64 << 10).enumerate() {
-            if n > 0 && gap_ns > 0 { msc.pause_ns(gap_ns)?; }
-            f.write(&mut fs, &mut msc, part)?;
-        }
-        f.close(&mut fs, &mut msc).map(|_| ())
-    })();
-    let dt = msc.host.now_ns() - t0;
-    step("record a 4 MiB clip", r);
-    eprintln!("[oxidrive] car: the clip took {:.3} s, {:.2} MB/s", dt as f64 / 1e9, clip.len() as f64 * 1e3 / dt as f64);
+    let clip = clip_bytes("CLIP0001.MP4", (mib << 20) as usize);
+    let r = write_clip(&mut fs, &mut msc, "CLIP0001.MP4", &clip, 64 << 10, gap_ns, 1);
+    let st = r.map(|s| s.summary(gap_ns));
+    step(&format!("record a {mib} MiB clip"), st.map(|s| eprintln!("[oxidrive] car: {s}")));
     let back = fs.read_file(&mut msc, "CLIP0001.MP4");
     assert!(back.as_ref().is_ok_and(|b| *b == clip), "[oxidrive] the clip read back over USB differs: {:?}", back.map(|b| b.len()));
     let r = (|| { let end = msc.host.now_ns() + 2_000_000_000; while msc.host.now_ns() < end { msc.test_unit_ready().map_err(|e| e.to_string())?; msc.host.idle_ns(100_000_000).map_err(|e| e.to_string())?; } Ok(()) })();

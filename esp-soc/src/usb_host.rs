@@ -34,33 +34,43 @@ pub trait UsbPort {
 impl<S: Soc> UsbPort for Machine<S> {
     fn link(&mut self) -> Option<&mut UsbLink> { self.bus.usb_link() }
 
-    /// Runs in slices that end exactly at `t_ns` (`max_cycles`), taking a chip reset through the
-    /// ROM as a normal run does; the run's own time limit still holds.
+    /// A chip reset is taken through the ROM, as a normal run does; the run's time limit holds.
     fn run_until(&mut self, t_ns: u64) -> Result<(), String> {
-        let target = (t_ns as u128 * S::CPU_HZ as u128).div_ceil(1_000_000_000) as u64;
-        let limit = self.max_cycles;
-        while self.bus.cycles() < target {
-            if self.bus.cycles() >= limit { return Err(format!("the run's time limit ({:.3} s)", limit as f64 / S::CPU_HZ as f64)); }
-            let slice = target.min(limit);
-            self.max_cycles = slice;
-            let stop = self.run(u64::MAX);
-            let script_stop = self.max_cycles != slice;
-            self.max_cycles = limit;
-            if script_stop { self.max_cycles = 0; return Err("the script stopped the run".into()); }
-            match stop {
-                Stop::Halted | Stop::MaxInsns => {}
-                Stop::SwReset => {
-                    let cause = self.bus.reset_cause();
-                    eprintln!("[emu] chip reset at t={:.3}s: cause {:#x} ({})", self.seconds(), cause, esp_periph::reset_cause_name(cause));
-                    self.reboot();
-                }
-                s => return Err(format!("the run stopped: {s:?}")),
-            }
-        }
-        Ok(())
+        let mut insns = u64::MAX;
+        run_machine_until(self, t_ns, &mut insns, |m| { m.reboot(); Ok(()) })
     }
 
     fn console(&mut self, text: &str) { self.bus.uart_input(0, text.as_bytes()); }
+}
+
+/// Run `m` to `t_ns` of emulated time in slices that end exactly there (`max_cycles`), within
+/// the run's time limit and `insns` instructions (counted down). A chip reset goes to `reset`,
+/// which comes back up or says why the run ends.
+pub fn run_machine_until<S: Soc>(m: &mut Machine<S>, t_ns: u64, insns: &mut u64, mut reset: impl FnMut(&mut Machine<S>) -> Result<(), String>) -> Result<(), String> {
+    let target = (t_ns as u128 * S::CPU_HZ as u128).div_ceil(1_000_000_000) as u64;
+    let limit = m.max_cycles;
+    while m.bus.cycles() < target {
+        if m.bus.cycles() >= limit { return Err(format!("the run's time limit ({:.3} s)", limit as f64 / S::CPU_HZ as f64)); }
+        if *insns == 0 { return Err("the run's instruction limit".into()); }
+        let slice = target.min(limit);
+        m.max_cycles = slice;
+        let before = m.run_steps();
+        let stop = m.run(*insns);
+        *insns = insns.saturating_sub(m.run_steps().saturating_sub(before));
+        let script_stop = m.max_cycles != slice;
+        m.max_cycles = limit;
+        if script_stop { m.max_cycles = 0; return Err("the script stopped the run".into()); }
+        match stop {
+            Stop::Halted | Stop::MaxInsns => {}
+            Stop::SwReset => {
+                let cause = m.bus.reset_cause();
+                eprintln!("[emu] chip reset at t={:.3}s: cause {:#x} ({})", m.seconds(), cause, esp_periph::reset_cause_name(cause));
+                reset(m)?;
+            }
+            s => return Err(format!("the run stopped: {s:?}")),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

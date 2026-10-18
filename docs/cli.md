@@ -148,7 +148,11 @@ through the [host ADC API](peripherals.md#host-adc-inputs), with no CLI equivale
 
 `--usb-host FILE` plugs a host into the P4's high-speed USB-OTG port and runs FILE's commands in
 order, one a line (`#` starts a comment), each taking the emulated time it takes on the bus while
-the firmware runs. The first command that fails ends the file; the run goes on to its time limit.
+the firmware runs, within the run's `--max-insns` and `--max-seconds` and its reboot policy
+(`--no-reboot`, an app-mode Restart). The first command that fails ends the file, unless its line
+starts with `?`: then the failure is logged and the file goes on. A failure that leaves no device
+on the port drops the interface and the volume, as Linux's disconnect does. The run then goes on
+to its time limit.
 What each command did goes to stderr as `[usb-host] t=<seconds> ...`, and the end-of-run report
 adds a `[usb]` line with the core's and the host's counts.
 
@@ -156,20 +160,26 @@ adds a `[usb]` line with the core's and the host's counts.
 | --- | --- |
 | `attach [timeout_ms]` | VBUS on, wait for the device to connect (10 s), debounce 100 ms, port reset, GET_DESCRIPTOR, SET_ADDRESS, the configuration and strings, SET_CONFIGURATION |
 | `detach`, `reset` | VBUS off; reset and enumerate again |
+| `port-reset` | Linux's `usb_reset_device`: reset, GET_DESCRIPTOR(64), reset, SET_ADDRESS to the same address, the descriptors read and compared, SET_CONFIGURATION again |
 | `suspend`, `resume`, `idle MS` | stop SOFs; drive resume for 20 ms; let time pass |
 | `rate MBPS` | cap the host's bulk payload per microframe (a slower host) |
 | `msc` | open the bulk-only mass-storage interface: GET MAX LUN, INQUIRY |
+| `recovery linux`, `recovery bot` | how a transport error or a timed-out command is recovered: Linux v6.12 usb-storage's port reset, its class reset only if that fails (the default), or BOT 1.0's reset recovery |
+| `timeout MS` | how long a command may take before the host aborts it (30000, sd's SD_TIMEOUT) |
+| `inject vbus-off MS` | VBUS goes MS from now, whatever the host is doing then; a transfer in flight ends disconnected |
 | `ready INTERVAL_MS TIMEOUT_MS` | TEST UNIT READY until it passes, REQUEST SENSE after each failure |
-| `poll INTERVAL_MS MS` | TEST UNIT READY every interval for a while, as a car polls its drive |
+| `poll INTERVAL_MS MS` | TEST UNIT READY every interval for a while, as a car polls its drive; a NOT READY seen here or by `ready` drops the mounted volume |
 | `capacity`, `mode-sense`, `prevent`, `allow`, `sync`, `eject` | READ CAPACITY(10), MODE SENSE(6), PREVENT ALLOW MEDIUM REMOVAL, SYNCHRONIZE CACHE(10) (a refusal is logged, not an error), START STOP UNIT with LoEj |
 | `read LBA COUNT`, `write LBA COUNT BYTE`, `verify LBA COUNT BYTE` | READ(10) (its hash), WRITE(10) of one byte value (hex), READ(10) and compare |
 | `mount`, `ls` | mount the FAT32 volume on the LUN (an MBR's partition or from LBA 0); list its root directory |
-| `fat-write NAME BYTES CHUNK_KIB [GAP_MS] [FAT_EVERY]` | write an 8.3 file of test bytes into the root directory as Linux's vfat does: the directory entry, the data in chunks GAP_MS apart, the FAT sectors (both copies) after every FAT_EVERY chunks (1), then the entry's size and cluster and FSInfo |
+| `fat-write NAME BYTES CHUNK_KIB [GAP_MS] [FAT_EVERY]` | write an 8.3 file of test bytes into the root directory in a vfat-like order: the directory entry, the data in chunks, the FAT sectors (both copies) after every FAT_EVERY chunks (1), then the entry's size and cluster and FSInfo. Chunk i is due GAP_MS·i after the start, as a camera produces them; the log gives the rate overall and over the second half, the worst lateness against that schedule and whether the car kept up (never a whole chunk behind) |
 | `fat-read NAME` | read a file back; one this file wrote is compared with what it wrote |
 | `uart0 TEXT` | a line into the firmware's UART0 (its console) |
 
 `examples/usb_msc-p4/car.txt` is a car: it records a clip, ejects the drive, polls it while the
 example's application owns the card (MEDIUM NOT PRESENT) and takes it again.
+`examples/usb_msc-p4/faults.txt` is a car meeting faults: a command that times out mid-transfer,
+a port reset after an eject, and VBUS lost while a clip is being written.
 
 ## Virtual BLE
 

@@ -410,4 +410,5 @@ impl BlockDevice for Msc<'_> {
     }
     fn write_blocks(&mut self, lba: u64, data: &[u8]) -> Result<(), String> { self.write10(lba, data).map_err(|e| e.to_string()) }
     fn pause_ns(&mut self, ns: u64) -> Result<(), String> { self.host.idle_ns(ns).map_err(|e| e.to_string()) }
+    fn now_ns(&mut self) -> u64 { self.host.now_ns() }
 }

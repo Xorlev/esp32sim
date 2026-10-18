@@ -1,6 +1,6 @@
-# A car on the example's USB port (--usb-host): enumerate, take the card, record a clip the way
-# a Linux vfat driver writes it, give the card back (eject), poll it while the example's app owns
-# it, and take it again once the console has exposed it.
+# A car on the example's USB port (--usb-host): enumerate, take the card, record a clip in a
+# vfat-like order, give the card back (eject), poll it while the example's app owns it, and take
+# it again once the console has exposed it.
 attach
 msc
 ready 100 5000
@@ -12,7 +12,7 @@ write 131056 16 a5
 verify 131056 16 a5
 mount
 ls
-# a 1 MiB clip in 64 KiB chunks, 16 ms apart: a camera at 4 MB/s
+# a 1 MiB clip in 64 KiB chunks, one due every 16 ms: a 4.1 MB/s camera
 fat-write CLIP0001.MP4 1048576 64 16
 fat-read CLIP0001.MP4
 sync
@@ -21,6 +21,9 @@ allow
 eject
 poll 100 500
 ready 100 5000
+# Linux revalidates a medium it saw change: the capacity and the write protection again
+capacity
+mode-sense
 mount
 ls
 fat-read README.MD

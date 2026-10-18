@@ -1,26 +1,36 @@
 //! A command file for the host on the USB port (`--usb-host FILE`): one command a line, run in
 //! order, each in emulated time; `#` starts a comment. What each did goes to stderr as
-//! `[usb-host] t=<s> ...`. The first command that fails ends the script.
+//! `[usb-host] t=<s> ...`. The first command that fails ends the script, unless the line starts
+//! with `?`, which logs the failure and goes on. A failure that leaves the port without a device
+//! drops the interface and the volume, as Linux's disconnect does.
 //!
 //! ```text
 //! attach [connect_timeout_ms]     VBUS on, wait for the device, reset, enumerate, configure
 //! detach | reset                  VBUS off; reset and enumerate again
+//! port-reset                      usb_reset_device: reset, re-address, check, configure again
 //! suspend | resume | idle <ms>    stop SOFs; resume; let time pass
 //! rate <MB/s>                     cap the host's bulk payload per microframe
 //! msc                             open the mass-storage interface: GET MAX LUN, INQUIRY
+//! recovery linux | bot            after a transport error or timeout: Linux usb-storage's port
+//!                                 reset (the default), or BOT 1.0's reset recovery
+//! timeout <ms>                    how long a command may take before it is aborted (30000)
+//! inject vbus-off <ms>            VBUS goes that long from now, whatever the host is doing
 //! ready <interval_ms> <timeout_ms>  TEST UNIT READY until it passes, REQUEST SENSE after each failure
 //! poll <interval_ms> <ms>         TEST UNIT READY every interval for a while, as a car does
+//!                                 (a NOT READY seen by either drops the mounted volume)
 //! capacity | mode-sense | prevent | allow | sync | eject
 //! read <lba> <count>              READ(10), prints the data's hash
 //! write <lba> <count> <byte>      WRITE(10) of one byte value
 //! verify <lba> <count> <byte>     READ(10) and compare
 //! mount | ls                      the FAT32 volume on the LUN; its root directory
-//! fat-write <name> <bytes> <chunk_kib> [gap_ms] [fat_every]  a file of `clip_bytes`, written as Linux's vfat does
+//! fat-write <name> <bytes> <chunk_kib> [gap_ms] [fat_every]  a file of `clip_bytes`, a chunk due
+//!                                 every gap_ms from the start (`fat32::write_clip`)
 //! fat-read <name>                 read it back; compared with `clip_bytes` if this script wrote it
 //! uart0 <text>                    a line typed at the firmware's console
 //! ```
-use super::fat32::{clip_bytes, BlockDevice, Fat32};
-use super::msc::{Msc, MscError};
+use super::fat32::{clip_bytes, write_clip, Fat32};
+use super::msc::{Msc, MscError, Recovery};
+use esp_periph::usb_otg::LinkFault;
 use super::{UsbError, UsbHost, UsbPort};
 
 /// FNV-1a, to name what was read.
@@ -28,9 +38,12 @@ pub fn hash(data: &[u8]) -> u64 { data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cmd {
-    Attach(u64), Detach, Reset, Suspend, Resume, Idle(u64), Rate(f64), Msc, Ready(u64, u64), Poll(u64, u64), Capacity, ModeSense, Prevent(bool), Sync, Eject,
+    Attach(u64), Detach, Reset, PortReset, Suspend, Resume, Idle(u64), Rate(f64), Msc, Recovery(Recovery), Timeout(u64), InjectVbusOff(u64),
+    Ready(u64, u64), Poll(u64, u64), Capacity, ModeSense, Prevent(bool), Sync, Eject,
     Read(u64, u32), Write(u64, u32, u8), Verify(u64, u32, u8), Mount, Ls, FatWrite { name: String, bytes: usize, chunk: usize, gap_ms: u64, fat_every: u32 }, FatRead(String),
     Uart0(String),
+    /// `?`: a failure is logged and the script goes on
+    Tolerate(Box<Cmd>),
 }
 
 pub fn parse(text: &str) -> Result<Vec<(usize, Cmd)>, String> {
@@ -38,6 +51,7 @@ pub fn parse(text: &str) -> Result<Vec<(usize, Cmd)>, String> {
     for (n, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() { continue; }
+        let (tolerate, line) = match line.strip_prefix('?') { Some(l) => (true, l.trim_start()), None => (false, line) };
         let ln = n + 1;
         let mut w = line.split_whitespace();
         let cmd = w.next().unwrap();
@@ -50,10 +64,16 @@ pub fn parse(text: &str) -> Result<Vec<(usize, Cmd)>, String> {
         let byte = |i: usize| -> Result<u8, String> { let s = args.get(i).ok_or_else(|| format!("line {ln}: {cmd} needs a byte"))?; u8::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("line {ln}: byte {s}")) };
         let c = match cmd {
             "attach" => Cmd::Attach(opt(0, 10_000)?),
-            "detach" => Cmd::Detach, "reset" => Cmd::Reset, "suspend" => Cmd::Suspend, "resume" => Cmd::Resume,
+            "detach" => Cmd::Detach, "reset" => Cmd::Reset, "port-reset" => Cmd::PortReset, "suspend" => Cmd::Suspend, "resume" => Cmd::Resume,
             "idle" => Cmd::Idle(num(0, "milliseconds")?),
             "rate" => Cmd::Rate(args.first().and_then(|s| s.parse().ok()).ok_or_else(|| format!("line {ln}: rate <MB/s>"))?),
             "msc" => Cmd::Msc,
+            "recovery" => Cmd::Recovery(match args.first().copied() { Some("linux") => Recovery::Linux, Some("bot") => Recovery::Bot, _ => return Err(format!("line {ln}: recovery linux|bot")) }),
+            "timeout" => Cmd::Timeout(num(0, "milliseconds")?),
+            "inject" => match args.first().copied() {
+                Some("vbus-off") => Cmd::InjectVbusOff(num(1, "milliseconds from now")?),
+                _ => return Err(format!("line {ln}: inject vbus-off <ms>")),
+            },
             "ready" => Cmd::Ready(num(0, "an interval")?, num(1, "a timeout")?),
             "poll" => Cmd::Poll(num(0, "an interval")?, num(1, "a duration")?),
             "capacity" => Cmd::Capacity, "mode-sense" => Cmd::ModeSense, "prevent" => Cmd::Prevent(true), "allow" => Cmd::Prevent(false),
@@ -67,7 +87,7 @@ pub fn parse(text: &str) -> Result<Vec<(usize, Cmd)>, String> {
             "uart0" => Cmd::Uart0(line["uart0".len()..].trim().to_string()),
             _ => return Err(format!("line {ln}: unknown command {cmd}")),
         };
-        out.push((ln, c));
+        out.push((ln, if tolerate { Cmd::Tolerate(Box::new(c)) } else { c }));
     }
     Ok(out)
 }
@@ -97,11 +117,32 @@ impl<'p> Runner<'p> {
     }
 
     pub fn step(&mut self, c: &Cmd) -> Result<(), String> {
+        let r = match c { Cmd::Tolerate(c) => self.act(c), c => self.act(c) };
+        if r.is_err() && !self.host().port().link().is_some_and(|l| l.port().connected) && (self.msc.is_some() || self.fs.is_some()) {
+            self.say(format_args!("no device on the port: interface and volume dropped"));
+            self.back_to_host();
+        }
+        match (r, c) {
+            (Err(e), Cmd::Tolerate(_)) => { self.say(format_args!("failed, going on: {e}")); Ok(()) }
+            (r, _) => r,
+        }
+    }
+
+    fn act(&mut self, c: &Cmd) -> Result<(), String> {
         let ms = 1_000_000u64;
         let e = |e: MscError| e.to_string();
         let u = |e: UsbError| e.to_string();
         match c {
-            Cmd::Attach(to) => self.host().enumerate(to * ms).map_err(u)?,
+            Cmd::Tolerate(c) => self.act(c)?,
+            Cmd::Attach(to) => { self.back_to_host(); self.host().enumerate(to * ms).map_err(u)? }
+            Cmd::PortReset => { self.host().reset_device().map_err(u)?; }
+            Cmd::Recovery(r) => { let m = self.msc()?; m.recovery = *r; m.host.say(format_args!("recovery: {r:?}")); }
+            Cmd::Timeout(t) => { let m = self.msc()?; m.timeout_ns = t * ms; m.host.say(format_args!("command timeout {t} ms")); }
+            Cmd::InjectVbusOff(t) => {
+                let at = self.host().now_ns() + t * ms;
+                self.host().port().link().ok_or("no USB host attached")?.inject(at, LinkFault::VbusOff);
+                self.say(format_args!("VBUS goes in {t} ms"));
+            }
             Cmd::Detach => { self.host().power_off().map_err(u)?; self.say(format_args!("VBUS off")); self.back_to_host(); }
             Cmd::Reset => { self.back_to_host(); self.host().enumerate(10_000 * ms).map_err(u)?; }
             Cmd::Suspend => { self.host().suspend().map_err(u)?; self.say(format_args!("suspended")); }
@@ -124,6 +165,7 @@ impl<'p> Runner<'p> {
                 let m = self.msc()?;
                 let failed = m.wait_ready(iv * ms, to * ms).map_err(e)?;
                 m.host.say(format_args!("TEST UNIT READY passed after {failed} failed polls"));
+                if failed > 0 { self.medium_changed(); }
             }
             Cmd::Poll(iv, dur) => {
                 let m = self.msc()?;
@@ -138,6 +180,7 @@ impl<'p> Runner<'p> {
                     m.host.idle_ns(iv * ms).map_err(u)?;
                 }
                 m.host.say(format_args!("polled: {ok} ready, {bad} not ready"));
+                if bad > 0 { self.medium_changed(); }
             }
             Cmd::Capacity => {
                 let m = self.msc()?;
@@ -193,17 +236,8 @@ impl<'p> Runner<'p> {
             Cmd::FatWrite { name, bytes, chunk, gap_ms, fat_every } => {
                 let data = clip_bytes(name, *bytes);
                 let (fs, m) = self.fs()?;
-                let chunk = (*chunk).max(fs.cluster_bytes()) / fs.cluster_bytes() * fs.cluster_bytes();
-                let t0 = m.host.now_ns();
-                let mut f = fs.create(m, name)?;
-                f.fat_every = *fat_every;
-                for (i, part) in data.chunks(chunk).enumerate() {
-                    if i > 0 && *gap_ms > 0 { m.pause_ns(gap_ms * ms)?; }
-                    f.write(fs, m, part)?;
-                }
-                let size = f.close(fs, m)?;
-                let dt = (m.host.now_ns() - t0).max(1);
-                m.host.say(format_args!("fat-write {name}: {size} bytes in {} chunks of {} KiB, {:.3} s, {:.2} MB/s", data.len().div_ceil(chunk), chunk / 1024, dt as f64 / 1e9, size as f64 * 1e3 / dt as f64));
+                let st = write_clip(fs, m, name, &data, *chunk, gap_ms * ms, *fat_every)?;
+                m.host.say(format_args!("fat-write {name}: {}", st.summary(gap_ms * ms)));
                 self.written.push((name.clone(), *bytes));
             }
             Cmd::FatRead(name) => {
@@ -219,6 +253,11 @@ impl<'p> Runner<'p> {
             Cmd::Uart0(text) => { let t = format!("{text}\n"); let h = self.host(); h.port().console(&t); h.say(format_args!("console: {text}")); }
         }
         Ok(())
+    }
+
+    /// A NOT READY seen: what the host knew of the volume may be stale, so it is mounted again.
+    fn medium_changed(&mut self) {
+        if self.fs.take().is_some() { self.say(format_args!("medium changed: volume dropped")); }
     }
 
     /// Back to the bare host (after a detach or a reset the interface is gone).

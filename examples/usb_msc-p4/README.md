@@ -23,3 +23,9 @@ takes the card from the application and exposes it; an eject (START STOP UNIT wi
 it back, and the console's `expose` command takes it again. While the application owns the card
 the host's TEST UNIT READY fails with MEDIUM NOT PRESENT (sense 2/3A/00). See
 ../../docs/esp32p4.md, "USB".
+
+`faults.txt` (the `usbmsc-p4-faults` golden, `--usb-host faults.txt` without `--script`) is a car
+meeting faults: a command that times out mid-transfer and the port reset Linux recovers with, a
+port reset after an eject, which takes the card back from the application (SET_CONFIGURATION runs
+`tud_mount_cb`), and VBUS lost while a clip is written, which gives it to the application
+(`tud_umount_cb`) and leaves the clip at size 0.

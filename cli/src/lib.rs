@@ -419,8 +419,13 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
     });
     let t0 = std::time::Instant::now();
     m.web_restart = !o.no_reboot;
-    if let Some(cmds) = cmds { run_usb_host(&mut m, &cmds); }
-    let stop = if m.max_cycles == 0 { Stop::Halted } else { run_with_reboots(&mut m, o.max_insns, !o.no_reboot && boot == "rom", boot == "app") };
+    let (reboot, app) = (!o.no_reboot && boot == "rom", boot == "app");
+    let (insns, ended) = match cmds { Some(cmds) => run_usb_host(&mut m, &cmds, o.max_insns, reboot, app), None => (o.max_insns, None) };
+    let stop = match ended {
+        Some(stop) => stop,
+        None if m.max_cycles == 0 => Stop::Halted,
+        None => run_with_reboots(&mut m, insns, reboot, app),
+    };
     let dt = t0.elapsed().as_secs_f64();
     report(&mut m, o, stop, dt);
     let pending = m.bus.ble_pending_commands();
@@ -432,14 +437,42 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
     }
 }
 
-/// `--usb-host`: the host's commands, each running the machine for as long as it takes; the run
-/// then goes on to its time limit.
-fn run_usb_host<S: Soc>(m: &mut Machine<S>, cmds: &[(usize, esp_soc::usb_host::script::Cmd)]) {
-    let mut r = esp_soc::usb_host::script::Runner::new(m);
+/// `--usb-host`: the host's commands, each running the machine for as long as it takes, under the
+/// run's limits and its reboot policy (`run_with_reboots`); the run then goes on to its time
+/// limit. The instructions left, and how the run ended if the script's run ended it.
+fn run_usb_host<S: Soc>(m: &mut Machine<S>, cmds: &[(usize, esp_soc::usb_host::script::Cmd)], insns: u64, reboot: bool, app: bool) -> (u64, Option<Stop>) {
+    let mut port = CliPort { m, insns, reboot, app, ended: None };
+    let mut r = esp_soc::usb_host::script::Runner::new(&mut port);
     match r.run(cmds) {
         Ok(()) => r.host().say(format_args!("script done")),
         Err((ln, e)) => r.host().say(format_args!("line {ln} failed: {e}")),
     }
+    drop(r);
+    let ended = port.ended.or((port.insns == 0).then_some(Stop::MaxInsns));
+    (port.insns, ended)
+}
+
+/// The machine as the USB host's port sees it in a CLI run: `--max-insns` counts, and a chip reset
+/// comes back up only where `run_with_reboots` would bring it back.
+struct CliPort<'a, S: Soc> { m: &'a mut Machine<S>, insns: u64, reboot: bool, app: bool, ended: Option<Stop> }
+
+impl<S: Soc> esp_soc::usb_host::UsbPort for CliPort<'_, S> {
+    fn link(&mut self) -> Option<&mut esp_periph::usb_otg::UsbLink> { self.m.bus.usb_link() }
+    fn run_until(&mut self, t_ns: u64) -> Result<(), String> {
+        if let Some(s) = &self.ended { return Err(format!("the run ended: {s:?}")); }
+        let (reboot, app, ended) = (self.reboot, self.app, &mut self.ended);
+        esp_soc::usb_host::run_machine_until(self.m, t_ns, &mut self.insns, |m| {
+            let button = m.take_button_reset();
+            if !reboot && !(button && app) { *ended = Some(Stop::SwReset); return Err("the chip reset, and this run does not reboot".into()); }
+            m.reboot();
+            if !reboot {
+                let entry = m.boot_app(0x10000).map_err(|e| { *ended = Some(Stop::SwReset); format!("restart: {e}") })?;
+                eprintln!("[emu] restart: app entry {:#010x} {}", entry, m.sym(entry));
+            }
+            Ok(())
+        })
+    }
+    fn console(&mut self, text: &str) { self.m.bus.uart_input(0, text.as_bytes()); }
 }
 
 /// Run, coming back up after a chip reset where that is possible: through the ROM when it booted

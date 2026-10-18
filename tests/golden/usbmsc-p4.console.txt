@@ -98,8 +98,8 @@ I (86) tusb_desc:
 I (86) TinyUSB: TinyUSB Driver installed on port 1
 I (86) example_main: USB MSC initialization DONE
 [5nI (246) example_main: Storage mounted to application: No
-W (656) tinyusb_msc_storage: tud_msc_scsi_cb() invoked: 53
-I (656) example_main: Storage mounted to application: Yes
+W (546) tinyusb_msc_storage: tud_msc_scsi_cb() invoked: 53
+I (546) example_main: Storage mounted to application: Yes
 
 Type 'help' to get the list of commands.
 Use UP/DOWN arrows to navigate through command history.
@@ -111,10 +111,10 @@ Line editing and history features are disabled.
 
 On Windows, try using Windows Terminal or Putty instead.
 esp32p4> write
-W (1166) example_main: README.MD doesn't exist yet, creating
+W (1186) example_main: README.MD doesn't exist yet, creating
 esp32p4> status
 storage exposed over USB: No
 esp32p4> expose
-I (1466) example_main: Unmount storage...
-I (1466) example_main: Storage mounted to application: No
-esp32p4> I (1636) example_main: Storage mounted to application: Yes
+I (1486) example_main: Unmount storage...
+I (1486) example_main: Storage mounted to application: No
+esp32p4> I (1626) example_main: Storage mounted to application: Yes
