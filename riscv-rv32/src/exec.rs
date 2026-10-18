@@ -44,9 +44,10 @@ pub const CLIC_EXT_OFFSET: u32 = 16;
 fn clic_take<B: Bus>(cpu: &mut Cpu, bus: &mut B, irq: u32, pc: u32) -> Option<StepOutcome> {
     use crate::state::{mcause, mstatus};
     let level = (irq >> CLIC_IRQ_LEVEL_SHIFT) & 0xff;
-    if level <= cpu.mil { return None; }
+    // A presented interrupt ends a WFI even when it cannot be taken: the privileged ISA allows
+    // a WFI to resume for any reason, and a core left asleep could not be woken by a lower one.
     cpu.waiting = false;
-    if !cpu.mie_enabled() || !cpu.clic_mode() { return None; }
+    if level <= cpu.mil || !cpu.mie_enabled() || !cpu.clic_mode() { return None; }
     let (line, id) = (irq & 0x1f, (irq & 0x1f) + CLIC_EXT_OFFSET);
     cpu.insn_count += 1; cpu.cycle_count += 1;
     cpu.mepc = pc;
