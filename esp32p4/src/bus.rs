@@ -521,6 +521,26 @@ mod tests {
         assert_eq!(b.periph.source_status()[0] >> crate::periph::src::SDIO_HOST & 1, 1, "source 23 asserted");
     }
 
+    /// A chip reset keeps the USB cable and its VBUS; the host sees the reset core's pull-up go.
+    #[test]
+    fn a_chip_reset_keeps_the_usb_cable() {
+        use esp_periph::usb_otg::Request;
+        let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
+        esp_soc::SocBus::attach_usb_host(&mut b, Default::default()).unwrap();
+        esp_soc::SocBus::usb_link(&mut b).unwrap().submit(Request::Attach).unwrap();
+        b.tick(64);
+        assert!(esp_soc::SocBus::usb_link(&mut b).unwrap().take_completion().is_some(), "VBUS on at the next device tick");
+        assert_eq!(b.read32(0x5000_0000).unwrap() >> 19 & 1, 1, "GOTGCTL.BSESVLD");
+        b.write32(0x5000_0804, 0).unwrap();
+        assert!(esp_soc::SocBus::usb_link(&mut b).unwrap().port().connected, "DCTL.SDIS cleared: D+ pulled up");
+        esp_soc::SocBus::reboot(&mut b, [0; 6]);
+        let p = esp_soc::SocBus::usb_link(&mut b).unwrap().port();
+        assert!(p.power && !p.connected, "VBUS stays, the reset core is soft-disconnected");
+        assert_eq!(b.read32(0x5000_0000).unwrap() >> 19 & 1, 1, "and sees the session");
+        b.write32(0x5000_0804, 0).unwrap();
+        assert!(esp_soc::SocBus::usb_link(&mut b).unwrap().port().connected);
+    }
+
     /// Core 1 sees its own CLIC block at 0x20800000 and core 0's at 0x20810000.
     #[test]
     fn the_clic_window_is_per_core() {
