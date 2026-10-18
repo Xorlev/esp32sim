@@ -1,19 +1,20 @@
 //! The ESP32-P4 and an ESP32-C6 co-processor joined over SDIO, as on boards that give the P4
 //! WiFi through ESP-Hosted: two machines in one process, stepped in lock-step on one clock.
 //!
-//! Time is nanoseconds from power-on. The P4 runs a slice to its end (`Config::slice_ns`), then
-//! the C6 catches up to the same instant, then the lines between the chips are exchanged. The
-//! SDIO bus is host-driven, so each transaction is where the two meet exactly: when the P4's SDMMC
-//! host starts a command, the C6 first runs to that nanosecond (`SdioLink`), the command and its
-//! data are carried out against the C6's slave as it stands then, and the C6 continues from there
-//! in its next run. The C6 never runs ahead of the P4. What the P4 senses without a command, the
-//! slave's interrupt on DAT1, is sampled at every command and at every slice end, so it reaches the
-//! P4 at most a slice late, as a frame reaches csim's medium at the end of the slice it started in
-//! (`--cooja`). The C6's EN pin follows a P4 GPIO, read at the same points: driven low it holds the
-//! C6 in reset, released (high, or not driven: the pull-up) it powers the C6 up again from its ROM.
+//! Time is nanoseconds from power-on, cut into slices of `Config::slice_ns` on a fixed grid. The P4
+//! runs a slice to its end, then the C6 catches up to the same instant, then the lines between the
+//! chips are exchanged. The SDIO bus is host-driven, so each transaction is where the two meet
+//! exactly: when the P4's SDMMC host starts a command, the C6 first runs to that nanosecond
+//! (`SdioLink`), the command and its data are carried out against the C6's slave as it stands
+//! then, and the C6 continues from there in its next run. The C6 never runs ahead of the P4. What
+//! the P4 senses without a command, the slave's interrupt on DAT1, is sampled at every command and
+//! at every slice end, so it reaches the P4 at most a slice late, as a frame reaches csim's medium
+//! at the end of the slice it started in (`--cooja`). The C6's EN pin follows a P4 GPIO, read at
+//! slice ends: driven low it holds the C6 in reset, released (high, or not driven: the pull-up) it
+//! powers the C6 up again from its ROM.
 //!
 //! Nothing reads a host clock or host randomness, and the order of every step is fixed, so a run
-//! is the same to the instruction every time.
+//! is the same to the instruction every time, however `run_until` is called.
 use esp32c6::Machine as C6Machine;
 use esp32p4::Machine as P4Machine;
 use esp_periph::sdmmc::{SdCmdError, SdDataError, SdDevice, SdResponse};

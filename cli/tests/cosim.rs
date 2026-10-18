@@ -4,6 +4,10 @@
 //! committed ESP-Hosted pair from the mask ROMs.
 #[path = "../../tests/common.rs"]
 mod common;
+#[path = "../../tests/sd_image.rs"]
+mod sd_image;
+#[path = "../../tests/oxidrive_board.rs"]
+mod oxidrive_board;
 use common::*;
 use emu_core::{Bus, Core};
 use esp32sim::cosim::{c6_cycle_of_ns, p4_cycle_of_ns, CoSim, Config, CoprocSpec};
@@ -154,15 +158,10 @@ fn the_coproc_spec_parses_its_keys() {
 // ------------------------------------------------------------------ with firmware
 const FW: &str = "web/wasm/fw/public";
 
-/// The committed ESP-Hosted pair, booted from the mask ROMs: IDF's station example on the P4,
-/// ESP-Hosted's slave on the C6, the virtual access point on the C6's radio.
-pub fn hosted_pair(cfg: Config) -> CoSim {
+/// The committed ESP-Hosted slave on a C6 booted from its mask ROM, the virtual access point on
+/// its radio and no NAT behind it.
+fn hosted_slave() -> esp32c6::Machine {
     let read = |name: &str| std::fs::read(root().join(FW).join(name)).unwrap_or_else(|e| panic!("{FW}/{name}: {e}"));
-    let mut p4 = esp32p4::machine([0x30, 0xed, 0xa0, 0x00, 0x11, 0x22], 2 << 20);
-    p4.bus.set_flash_size(2 << 20);
-    p4.load_rom(&std::fs::read(rom("esp32p4_rev0")).unwrap()).unwrap();
-    for (off, f) in [(0x2000, "p4-hosted-bootloader.bin"), (0x8000, "p4-hosted-ptable.bin"), (0x10000, "p4-hosted-station.bin")] { p4.write_flash(off, &read(f)).unwrap(); }
-    p4.boot_rom();
     let mut c6 = esp32c6::machine([0x40, 0x4c, 0xca, 0x00, 0x11, 0x22], 4 << 20);
     c6.bus.set_flash_size(4 << 20);
     c6.load_rom(&std::fs::read(rom("esp32c6_rev0")).unwrap()).unwrap();
@@ -171,7 +170,19 @@ pub fn hosted_pair(cfg: Config) -> CoSim {
     c6.stubs.insert(0x420b_ac5c, 0);
     c6.bus.attach_wifi(esp_soc::wifi::ApConfig::parse("ssid=esp32sim,psk=esp32sim-pass").unwrap(), None).unwrap();
     c6.boot_rom();
-    CoSim::new(p4, c6, cfg)
+    c6
+}
+
+/// The committed ESP-Hosted pair, booted from the mask ROMs: IDF's station example on the P4,
+/// ESP-Hosted's slave on the C6.
+fn hosted_pair(cfg: Config) -> CoSim {
+    let read = |name: &str| std::fs::read(root().join(FW).join(name)).unwrap_or_else(|e| panic!("{FW}/{name}: {e}"));
+    let mut p4 = esp32p4::machine([0x30, 0xed, 0xa0, 0x00, 0x11, 0x22], 2 << 20);
+    p4.bus.set_flash_size(2 << 20);
+    p4.load_rom(&std::fs::read(rom("esp32p4_rev0")).unwrap()).unwrap();
+    for (off, f) in [(0x2000, "p4-hosted-bootloader.bin"), (0x8000, "p4-hosted-ptable.bin"), (0x10000, "p4-hosted-station.bin")] { p4.write_flash(off, &read(f)).unwrap(); }
+    p4.boot_rom();
+    CoSim::new(p4, hosted_slave(), cfg)
 }
 
 fn transcript(cs: &mut CoSim) -> String {
@@ -193,4 +204,46 @@ fn the_pair_runs_the_same_whichever_way_it_is_driven() {
     assert_eq!(a, b);
     assert_eq!((whole.p4.insns(), whole.c6.borrow().m.insns()), (pieces.p4.insns(), pieces.c6.borrow().m.insns()));
     assert_eq!(whole.p4.interrupts, pieces.p4.interrupts);
+}
+
+/// The owner's oxidrive firmware (not in this repository) on the P4, with the committed
+/// ESP-Hosted 2.12.13 slave on the C6 as on its board, and the firmware's NVS partition made at
+/// test time (`oxidrive_board::nvs_image`) from `nvs.csv` beside the images: the virtual access
+/// point's credentials and placeholders that reach nothing (`--net none`: every name resolves to
+/// 10.0.2.3, every connection is refused). Neither the CSV nor the image is in this repository.
+/// Reports how far it gets in `OXIDRIVE_SECONDS` (20) of emulated time, both consoles' last lines,
+/// and how the P4's console compares with the board's capture line by line.
+#[test]
+#[ignore = "needs the oxidrive images and nvs.csv under ~/Code/dlp/sim-fixtures and ESP-IDF's nvs_partition_gen.py"]
+fn external_oxidrive_brings_up_wifi_through_the_c6() {
+    let (mut p4, board_log, _card) = oxidrive_board::boot("oxidrive-cosim.img", false);
+    let dir = oxidrive_board::dir();
+    let csv = std::path::Path::new(&dir).join("nvs.csv");
+    assert!(csv.exists(), "{}: missing; write the NVS generator CSV (key,type,encoding,value; the namespace row, then the WiFi credentials esp32sim / esp32sim-pass and placeholders for the rest) there", csv.display());
+    let table = std::fs::read(format!("{dir}/partition-table.bin")).unwrap();
+    let (off, size) = oxidrive_board::nvs_partition(&table).expect("an NVS partition in partition-table.bin");
+    p4.write_flash(off, &oxidrive_board::nvs_image(&csv, size)).unwrap();
+    let secs = std::env::var("OXIDRIVE_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20);
+    let mut cs = CoSim::new(p4, hosted_slave(), Config::default());
+    let t0 = std::time::Instant::now();
+    let r = cs.run_until(secs * 1_000_000_000);
+    let (mut p4_lines, mut c6_lines) = (Vec::new(), Vec::new());
+    for (c6, l) in cs.lines.drain(..) { if c6 { c6_lines.push(l) } else { p4_lines.push(l) } }
+    let emu: Vec<String> = p4_lines.iter().map(|l| oxidrive_board::strip_timestamp(l)).collect();
+    let board = oxidrive_board::board_lines(&board_log);
+    let cmp = oxidrive_board::compare(&emu, &board);
+    let c = cs.c6.borrow();
+    let st = &c.m.bus.periph.optional.sdio.stats;
+    eprintln!("[oxidrive] {} s in {:.1} s wall ({r:?}); P4 {} instructions, C6 {}; SDIO {} commands, {} bytes to the P4, {} from it; {} EN changes",
+              secs, t0.elapsed().as_secs_f64(), cs.p4.insns(), c.m.insns(), st.commands, st.to_host, st.from_host, cs.summary.en_changes);
+    eprintln!("[oxidrive] {}", esp_soc::SocBus::report(&c.m.bus).replace('\n', "\n[oxidrive] "));
+    eprintln!("[oxidrive] {} of {} board lines match, {} blocks differ, the comparison reached board line {}", cmp.same, board.len(), cmp.blocks.len(), cmp.reached + 1);
+    eprintln!("[oxidrive] the P4's last lines:");
+    for l in p4_lines.iter().rev().take(40).rev() { eprintln!("[oxidrive]   {l}"); }
+    eprintln!("[oxidrive] the C6's last lines:");
+    for l in c6_lines.iter().rev().take(25).rev() { eprintln!("[oxidrive]   [c6] {l}"); }
+    assert!(st.to_host > 0 && st.from_host > 0, "no packet crossed the SDIO link");
+    assert!(c6_lines.iter().any(|l| l.contains("Sta mode connected")), "the C6 did not join the access point");
+    // the virtual network's DHCP lease, which the firmware logs once WiFi is up
+    assert!(p4_lines.iter().any(|l| l.contains("10.0.2.15")), "no lease through the C6");
 }

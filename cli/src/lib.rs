@@ -273,6 +273,8 @@ fn run_cosim(o: &Opts) {
     let spec = cosim::CoprocSpec::parse(o.coproc.as_deref().unwrap()).unwrap_or_else(|e| usage_error(&format!("--coproc: {e}")));
     let mut p4 = setup_p4(o);
     let boot = prepare(&mut p4, o);
+    // the SDIO link's commands and data take their wire time, as `--sd-timing` gives the card
+    if o.sd_timing { p4.bus.periph.sdmmc.timed = true; }
     let end_ns = if p4.max_cycles == u64::MAX { u64::MAX } else { (p4.max_cycles as u128 * 1_000_000_000 / esp32p4::periph::CPU_HZ as u128) as u64 };
     p4.max_cycles = u64::MAX;
     let c6 = setup_coproc(o, &spec);
