@@ -57,8 +57,9 @@ pub enum SdDataError {
 pub trait SdDevice {
     /// A command on CMD and the device's answer.
     fn command(&mut self, now: u64, cmd: u8, arg: u32) -> Result<SdResponse, SdCmdError>;
-    /// The next `buf.len()` bytes of the data phase the last command started (card to host).
-    fn read_data(&mut self, buf: &mut [u8]) -> Result<(), SdDataError>;
+    /// The next `buf.len()` bytes of the data phase the last command started (card to host),
+    /// which the bus has carried by `now`.
+    fn read_data(&mut self, now: u64, buf: &mut [u8]) -> Result<(), SdDataError>;
     /// The next bytes of a write data phase (host to card).
     fn write_data(&mut self, now: u64, data: &[u8]) -> Result<(), SdDataError>;
     /// DAT0 held low (programming, an R1b busy period). Looking does not change the device.
@@ -403,7 +404,8 @@ impl Sdmmc {
                 let mut left = total;
                 while left > 0 {
                     let mut b = vec![0u8; block.min(left) as usize];
-                    if self.device(slot).is_none_or(|d| d.read_data(&mut b).is_err()) { break; }
+                    let now = if self.timed { self.data_due } else { self.now_ns };
+                    if self.device(slot).is_none_or(|d| d.read_data(now, &mut b).is_err()) { break; }
                     left -= b.len() as u32;
                 }
             }
@@ -499,8 +501,8 @@ impl Sdmmc {
                 while (x.fifo.len() as u32) < n && x.card_left > 0 {
                     let k = x.block.min(x.card_left) as usize;
                     let mut b = vec![0u8; k];
-                    let slot = x.slot;
-                    let r = match self.device(slot) { Some(dev) => dev.read_data(&mut b), None => Err(SdDataError::Timeout) };
+                    let (slot, now) = (x.slot, if self.timed { self.data_due } else { self.now_ns });
+                    let r = match self.device(slot) { Some(dev) => dev.read_data(now, &mut b), None => Err(SdDataError::Timeout) };
                     if let Err(e) = r { self.xfer = Some(x); self.data_error(if e == SdDataError::Crc { int::DCRC } else { int::DRTO }); return; }
                     x.fifo.extend_from_slice(&b);
                     x.card_left -= k as u32;

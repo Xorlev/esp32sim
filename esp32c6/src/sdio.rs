@@ -152,6 +152,10 @@ pub enum CardState { #[default] Inactive, Init, Standby, Command }
 #[derive(Clone, Copy, Debug)]
 struct Xfer { write: bool, func: u8, addr: u32, incr: bool, left: u32, packet: u32 }
 
+/// What the end of a data phase changes on the C6's side.
+#[derive(Clone, Copy, Debug)]
+enum Effect { DescWord0 { at: u32, w0: u32 }, Int(u32) }
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct SdioStats {
     pub commands: u64, pub to_host: u64, pub from_host: u64, pub underflows: u64, pub overflows: u64,
@@ -178,6 +182,10 @@ pub struct SdioSlave {
     new_packet_armed: bool,
     /// PKT_LEN as the host last read it
     host_len: u32,
+    /// while set, a data phase's hand-back (descriptor word 0, the C6's interrupt bits) waits for
+    /// this machine cycle, when the bus has carried the data (`deferred`)
+    defer_to: Option<u64>,
+    deferred: Vec<(u64, Effect)>,
     slc: RegRam,
     host_raw: u32,
     host_ena: u32,
@@ -204,7 +212,7 @@ impl SdioSlave {
         slc.write(slc::RX_DSCR_CONF, 1 << 1 | 1 << 3);
         SdioSlave {
             cfg_data0: CFG_DATA0_RESET, cfg_data1: CFG_DATA1_RESET, hinf: RegRam::new(), conf0: 0, int_raw: 0, int_ena: 0, token: [0; 2], len: 0,
-            rx: RxLink::default(), tx: TxLink::default(), rx_kick: false, new_packet_armed: false, host_len: 0, slc, host_raw: 0, host_ena: 0, host_ram: RegRam::new(),
+            rx: RxLink::default(), tx: TxLink::default(), rx_kick: false, new_packet_armed: false, host_len: 0, defer_to: None, deferred: Vec::new(), slc, host_raw: 0, host_ena: 0, host_ram: RegRam::new(),
             state: CardState::Inactive, rca: 0, ioe: 0, ien: 0, bus_ctrl: 0, ehs: false, blksz: [512; 3], xfer: None,
             stats: SdioStats::default(), log: false,
         }
@@ -242,6 +250,36 @@ impl SdioSlave {
                 if self.log { eprintln!("[sdio] rx link at {:#010x}: {} bytes{}", self.rx.cur, d.length(), if d.eof() { ", EOF" } else { "" }); }
             }
         }
+    }
+
+    /// Apply `e` now, or queue it for the end of the data phase in progress.
+    fn effect(&mut self, mem: &mut dyn DmaMem, e: Effect) {
+        match self.defer_to {
+            Some(at) => self.deferred.push((at, e)),
+            None => self.apply(mem, e),
+        }
+    }
+
+    fn apply(&mut self, mem: &mut dyn DmaMem, e: Effect) {
+        match e {
+            Effect::DescWord0 { at, w0 } => { mem.write32(at, w0); }
+            Effect::Int(bits) => self.int_raw |= bits,
+        }
+    }
+
+    /// The data calls that follow, until `None`, end on the bus at machine cycle `at`: their
+    /// hand-back waits for it. The bytes themselves move at once; the buffers they fill or drain
+    /// are the hardware's until then.
+    pub fn defer_to(&mut self, at: Option<u64>) { self.defer_to = at; }
+
+    /// The machine cycle the next queued hand-back is due.
+    pub fn next_due(&self) -> Option<u64> { self.deferred.first().map(|d| d.0) }
+
+    /// Apply the hand-backs due at or before machine cycle `now`, in the order they were queued.
+    pub fn apply_due(&mut self, now: u64, mem: &mut dyn DmaMem) -> bool {
+        let n = self.deferred.iter().take_while(|d| d.0 <= now).count();
+        for (_, e) in self.deferred.drain(..n).collect::<Vec<_>>() { self.apply(mem, e); }
+        n > 0
     }
 
     fn reset_rx(&mut self) { self.rx = RxLink::default(); self.rx_kick = false; self.new_packet_armed = false; }
@@ -363,8 +401,8 @@ impl SdioSlave {
             n += k;
             self.rx.off += k as u32;
             if self.rx.off >= d.length() {
-                if self.conf0 & slc::RX_AUTO_WRBACK != 0 { mem.write32(self.rx.cur, d.w0 & !Desc::OWNER); }
-                self.int_raw |= sint::RX_DONE | if d.eof() { sint::RX_EOF } else { 0 };
+                if self.conf0 & slc::RX_AUTO_WRBACK != 0 { self.effect(mem, Effect::DescWord0 { at: self.rx.cur, w0: d.w0 & !Desc::OWNER }); }
+                self.effect(mem, Effect::Int(sint::RX_DONE | if d.eof() { sint::RX_EOF } else { 0 }));
                 if self.log && d.eof() { eprintln!("[sdio] rx EOF at {:#010x}", self.rx.cur); }
                 (self.rx.cur, self.rx.off) = (d.next, 0);
             }
@@ -387,13 +425,13 @@ impl SdioSlave {
         while !data.is_empty() && steps < MAX_DESCS {
             steps += 1;
             let Some(d) = self.tx_desc(mem) else {
-                self.host_raw |= hint::TX_OVF; self.int_raw |= sint::TX_OVF; self.stats.overflows += 1;
+                self.host_raw |= hint::TX_OVF; self.effect(mem, Effect::Int(sint::TX_OVF)); self.stats.overflows += 1;
                 if self.log { eprintln!("[sdio] tx overflow: {} bytes dropped", data.len()); }
                 return;
             };
             let k = (d.size().saturating_sub(self.tx.fill) as usize).min(data.len());
             if k == 0 { self.tx_close(mem, d, false); continue; }
-            if mem.write(d.buf.wrapping_add(self.tx.fill), &data[..k]).is_err() { self.int_raw |= sint::TX_OVF; }
+            if mem.write(d.buf.wrapping_add(self.tx.fill), &data[..k]).is_err() { self.effect(mem, Effect::Int(sint::TX_OVF)); }
             self.tx.fill += k as u32;
             data = &data[k..];
             if self.tx.fill >= d.size() && !(data.is_empty() && end) { self.tx_close(mem, d, false); }
@@ -405,8 +443,8 @@ impl SdioSlave {
     /// TX_SUC_EOF at a packet's end (hal/sdio_slave_hal.c, `sdio_slave_hal_recv_has_next_item`).
     fn tx_close(&mut self, mem: &mut dyn DmaMem, d: Desc, eof: bool) {
         let w0 = (d.w0 & (0x3fff | 3 << 28)) | (self.tx.fill & 0x3fff) << 14 | if eof { Desc::EOF } else { 0 };
-        mem.write32(self.tx.cur, w0);
-        self.int_raw |= sint::TX_DONE | if eof { sint::TX_SUC_EOF } else { 0 };
+        self.effect(mem, Effect::DescWord0 { at: self.tx.cur, w0 });
+        self.effect(mem, Effect::Int(sint::TX_DONE | if eof { sint::TX_SUC_EOF } else { 0 }));
         if self.log { eprintln!("[sdio] tx buffer {:#010x}: {} bytes{}", self.tx.cur, self.tx.fill, if eof { ", EOF" } else { "" }); }
         (self.tx.last, self.tx.cur, self.tx.fill) = (self.tx.cur, d.next, 0);
     }
@@ -625,17 +663,35 @@ impl crate::bus::SocBus {
         self.sdio_settle();
         r
     }
-    pub fn sdio_read_data(&mut self, buf: &mut [u8]) -> Result<(), SdDataError> {
+    /// The next card-to-host bytes. `done` is the machine cycle the bus finishes carrying them:
+    /// the DMA's hand-back to the C6 waits for it when it is still to come.
+    pub fn sdio_read_data(&mut self, buf: &mut [u8], done: u64) -> Result<(), SdDataError> {
         let mut mem = Sram { base: crate::bus::SRAM_LOW, bytes: &mut self.sram };
-        let r = self.periph.optional.sdio.read_data(buf, &mut mem);
+        let sdio = &mut self.periph.optional.sdio;
+        sdio.defer_to((done > self.cycles).then_some(done));
+        let r = sdio.read_data(buf, &mut mem);
+        sdio.defer_to(None);
         self.sdio_settle();
         r
     }
-    pub fn sdio_write_data(&mut self, data: &[u8]) -> Result<(), SdDataError> {
+    /// The next host-to-card bytes, `done` as for `sdio_read_data`.
+    pub fn sdio_write_data(&mut self, data: &[u8], done: u64) -> Result<(), SdDataError> {
         let mut mem = Sram { base: crate::bus::SRAM_LOW, bytes: &mut self.sram };
-        let r = self.periph.optional.sdio.write_data(data, &mut mem);
+        let sdio = &mut self.periph.optional.sdio;
+        sdio.defer_to((done > self.cycles).then_some(done));
+        let r = sdio.write_data(data, &mut mem);
+        sdio.defer_to(None);
         self.sdio_settle();
         r
+    }
+    /// The machine cycle a queued hand-back is due.
+    pub fn sdio_next_due(&self) -> Option<u64> { self.periph.optional.sdio.next_due() }
+    /// Carry out the hand-backs that have come due.
+    #[cold]
+    #[inline(never)]
+    pub fn sdio_apply_due(&mut self) {
+        let mut mem = Sram { base: crate::bus::SRAM_LOW, bytes: &mut self.sram };
+        if self.periph.optional.sdio.apply_due(self.cycles, &mut mem) { self.sdio_settle(); }
     }
     /// DAT1 as the slave drives it: low (true) while function 1 interrupts the host.
     pub fn sdio_interrupt(&self) -> bool { self.periph.optional.sdio.host_interrupt() }

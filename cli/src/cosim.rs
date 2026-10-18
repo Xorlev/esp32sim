@@ -86,12 +86,18 @@ impl Coproc {
 
     pub fn running(&self) -> bool { !self.held && self.halted.is_none() }
 
-    /// Run the C6 to the last of its cycles at or before `ns`. A chip in reset or stopped stays
-    /// where it is.
+    /// The C6 machine cycle (its own count, from its first power-up) at shared time `ns`.
+    fn machine_cycle_of_ns(&self, ns: u64) -> u64 { c6_cycle_of_ns(ns).saturating_sub(self.origin) }
+
+    /// Run the C6 to the last of its cycles at or before `ns`, stopping where a data phase the
+    /// host started hands its descriptors back. A chip in reset or stopped stays where it is.
     pub fn advance_to(&mut self, ns: u64) {
         let target = c6_cycle_of_ns(ns);
-        while self.running() && self.now_cycles() < target {
-            let r = self.m.run_until_cycle(target - self.origin);
+        loop {
+            if self.m.bus.sdio_next_due().is_some_and(|d| d <= self.m.bus.cycles()) { self.m.bus.sdio_apply_due(); }
+            if !self.running() || self.now_cycles() >= target { break; }
+            let end = target - self.origin;
+            let r = self.m.run_until_cycle(self.m.bus.sdio_next_due().map_or(end, |d| d.min(end)));
             self.collect_console();
             match r {
                 RunUntil::Reached | RunUntil::Yield => {}
@@ -145,17 +151,21 @@ impl SdDevice for SdioLink {
         c.m.sync_irq();
         r
     }
-    fn read_data(&mut self, buf: &mut [u8]) -> Result<(), SdDataError> {
+    /// The bytes move now; the slave hands its descriptors back when the C6 reaches `now`, the
+    /// end of the data phase on the bus (at once unless the bus is timed or the C6 is behind).
+    fn read_data(&mut self, now: u64, buf: &mut [u8]) -> Result<(), SdDataError> {
         let mut c = self.0.borrow_mut();
         if !c.running() { return Err(SdDataError::Timeout); }
-        let r = c.m.bus.sdio_read_data(buf);
+        let done = c.machine_cycle_of_ns(now);
+        let r = c.m.bus.sdio_read_data(buf, done);
         c.m.sync_irq();
         r
     }
-    fn write_data(&mut self, _now: u64, data: &[u8]) -> Result<(), SdDataError> {
+    fn write_data(&mut self, now: u64, data: &[u8]) -> Result<(), SdDataError> {
         let mut c = self.0.borrow_mut();
         if !c.running() { return Err(SdDataError::NoCrcStatus); }
-        let r = c.m.bus.sdio_write_data(data);
+        let done = c.machine_cycle_of_ns(now);
+        let r = c.m.bus.sdio_write_data(data, done);
         c.m.sync_irq();
         r
     }

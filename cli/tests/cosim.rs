@@ -161,6 +161,126 @@ fn en_holds_the_c6_and_powers_it_up_again() {
     assert!(!inverted.c6.borrow().held, "undriven: not in reset either way");
 }
 
+/// The card selected, function 1 on, four lines: what ESP-Hosted's card init leaves.
+fn card_ready(cs: &mut CoSim) {
+    route_slot1(cs);
+    for (cmd, arg) in [(5, 0), (5, 0x30_0000), (3, 0)] { command(cs, cmd, arg); }
+    command(cs, 7, 0x1_0000).unwrap();
+    command(cs, 52, 1 << 31 | 0x07 << 9 | 0x02).unwrap();              // CCCR bus width: 4 bits
+    command(cs, 52, 1 << 31 | 0x02 << 9 | 0x02).unwrap();              // I/O enable: function 1
+}
+
+const C6_DESC: u32 = 0x4081_0000;
+const C6_BUF: u32 = 0x4082_0000;
+
+/// A packet of `len` bytes queued on the C6's send link as the driver queues one (4 KiB
+/// descriptors, EOF on the last, PKT_LEN after the START); returns the descriptors.
+fn slave_sends(cs: &mut CoSim, len: u32) -> Vec<u32> {
+    let mut c = cs.c6.borrow_mut();
+    let b = &mut c.m.bus;
+    let n = len.div_ceil(4096);
+    let descs: Vec<u32> = (0..n).map(|i| C6_DESC + 16 * i).collect();
+    for (i, &d) in descs.iter().enumerate() {
+        let size = (len - 4096 * i as u32).min(4096);
+        let last = i as u32 == n - 1;
+        for (o, v) in [(0, size | size << 14 | (last as u32) << 30 | 1 << 31), (4, C6_BUF + 4096 * i as u32), (8, if last { 0 } else { d + 16 })] { b.write32(d + o, v).unwrap(); }
+    }
+    for i in 0..len { b.write8(C6_BUF + i, (i % 251) as u8).unwrap(); }
+    b.write32(0x6001_7000, 1 << 6).unwrap();                            // SLCCONF0: RX_AUTO_WRBACK
+    b.write32(0x6001_7040, descs[0]).unwrap();                          // SLC0RX_LINK_ADDR
+    b.write32(0x6001_703c, 1 << 29).unwrap();                           // SLC0RX_LINK: START
+    b.write32(0x6001_70f4, 1 << 20 | len).unwrap();                     // SLC0_LEN_CONF: LEN_WR
+    descs
+}
+
+const P4_DESC: u32 = 0x4ff2_0000;
+const P4_BUF: u32 = 0x4ff3_0000;
+
+/// The P4's IDMAC armed for `bytes` in 512-byte blocks into `n` chained 4 KiB descriptors, the
+/// first `owned` of them the hardware's (`sdmmc_host_do_transaction`'s four-descriptor ring).
+fn idmac_read(cs: &mut CoSim, bytes: u32, n: u32, owned: u32) {
+    let b = &mut cs.p4.bus;
+    for i in 0..n {
+        let d = P4_DESC + 16 * i;
+        let last = (i + 1) * 4096 >= bytes;
+        let own = if i < owned { 1 << 31 } else { 0 };
+        let size = (bytes - 4096 * i).min(4096);
+        for (o, v) in [(0, own | 1 << 4 | if i == 0 { 1 << 3 } else { 0 } | if last { 1 << 2 } else { 0 }), (4, size), (8, P4_BUF + 4096 * i), (12, d + 16)] { b.write32(d + o, v).unwrap(); }
+    }
+    b.write32(SDMMC, 1 << 4 | 1 << 25).unwrap();                       // CTRL: interrupts, internal DMA
+    b.write32(SDMMC + 0x80, 1 << 7 | 1 << 1).unwrap();                 // BMOD: DE, fixed burst
+    b.write32(SDMMC + 0x20, bytes).unwrap();                           // BYTCNT
+    b.write32(SDMMC + 0x1c, 512).unwrap();                             // BLKSIZ
+    b.write32(SDMMC + 0x88, P4_DESC).unwrap();                         // DBADDR
+    b.write32(SDMMC + 0x44, u32::MAX).unwrap();
+    b.write32(SDMMC + 0x8c, 0x337).unwrap();
+}
+
+/// CMD53 block read from function 1's FIFO for a packet of `len` bytes, as ESP-Hosted reads one.
+fn cmd53_read(cs: &mut CoSim, len: u32) {
+    let blocks = len.div_ceil(512);
+    cs.p4.bus.write32(SDMMC + 0x28, 1 << 28 | 1 << 27 | 1 << 26 | (0x1_f800 - len) << 9 | blocks).unwrap();
+    cs.p4.bus.write32(SDMMC + 0x2c, 1 << 31 | 1 << 16 | 1 << 9 | 1 << 6 | 53).unwrap();
+}
+
+/// A read longer than the IDMAC's four descriptors: the host's DMA suspends on the fifth (DU)
+/// and resumes on a poll demand after the P4 has run on, so the last bytes cross the bus with
+/// the C6 behind. The slave hands back the descriptors those bytes came from when the C6
+/// reaches that time, not before.
+#[test]
+fn a_resumed_read_hands_the_slave_descriptors_back_at_its_time() {
+    let mut cs = spinning(Config::default());
+    card_ready(&mut cs);
+    let len = 18_944;                                                   // 37 blocks, 4.6 descriptors
+    let descs = slave_sends(&mut cs, len);
+    idmac_read(&mut cs, len, 5, 4);
+    cmd53_read(&mut cs, len);
+    assert_ne!(cs.p4.bus.read32(SDMMC + 0x8c).unwrap() & 1 << 4, 0, "IDSTS DU: suspended on the fifth descriptor");
+    let first = cs.c6.borrow().m.bus.cycles();
+    let word = |cs: &CoSim, a: u32| cs.c6.borrow_mut().m.bus.read32(a).unwrap();
+    assert_eq!(word(&cs, descs[3]) >> 31, 0, "the first 16 KiB went back at once");
+    assert_eq!(word(&cs, descs[4]) >> 31, 1);
+    let later = cs.p4.bus.periph.now_ns() + 50_000;
+    p4_alone(&mut cs, later);
+    let resume_ns = cs.p4.bus.periph.now_ns();
+    let d = P4_DESC + 16 * 4;
+    let w0 = cs.p4.bus.read32(d).unwrap();
+    cs.p4.bus.write32(d, w0 | 1 << 31).unwrap();
+    cs.p4.bus.write32(SDMMC + 0x84, 1).unwrap();                       // PLDMND
+    assert_ne!(cs.p4.bus.read32(SDMMC + 0x44).unwrap() & 1 << 3, 0, "DATA_OVER");
+    assert_eq!(cs.c6.borrow().m.bus.cycles(), first, "the C6 is behind the resume");
+    assert_eq!(word(&cs, descs[4]) >> 31, 1, "its last descriptor waits for the C6 to get there");
+    assert_eq!(word(&cs, 0x6001_7004) & 1 << 17, 0, "no RX_EOF yet");
+    cs.run_until(resume_ns.div_ceil(10_000) * 10_000).unwrap();
+    assert_eq!(word(&cs, descs[4]) >> 31, 0, "handed back");
+    assert_ne!(word(&cs, 0x6001_7004) & 1 << 17, 0, "RX_EOF");
+    let got: Vec<u8> = (0..len).map(|i| cs.p4.bus.read8(P4_BUF + i).unwrap()).collect();
+    assert!(got.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8), "the packet, in order");
+    assert_eq!(cs.c6.borrow().m.bus.periph.optional.sdio.stats.to_host, len as u64);
+}
+
+/// With the SD bus timed, a CMD53's data phase ends after its wire time: the slave's descriptors
+/// go back and RX_DONE rises when the C6 reaches that moment, not at the command.
+#[test]
+fn a_timed_read_hands_the_slave_descriptors_back_after_its_wire_time() {
+    let mut cs = spinning(Config::default());
+    card_ready(&mut cs);
+    cs.p4.bus.periph.sdmmc.timed = true;
+    let descs = slave_sends(&mut cs, 1024);
+    idmac_read(&mut cs, 1024, 1, 1);
+    let t0 = cs.p4.bus.periph.now_ns();
+    cmd53_read(&mut cs, 1024);
+    let word = |cs: &CoSim, a: u32| cs.c6.borrow_mut().m.bus.read32(a).unwrap();
+    assert_eq!(word(&cs, descs[0]) >> 31, 1, "at the command the data is still on the wire");
+    let due = cs.c6.borrow().m.bus.sdio_next_due().expect("a hand-back queued");
+    assert!(due > cs.c6.borrow().m.bus.cycles());
+    cs.run_until(t0 + 100_000).unwrap();
+    assert_eq!(word(&cs, descs[0]) >> 31, 0, "handed back once the C6 passed the data phase's end");
+    assert_ne!(word(&cs, 0x6001_7004) & 1 << 16, 0, "RX_DONE");
+    assert!(cs.c6.borrow().m.bus.sdio_next_due().is_none());
+    assert_ne!(cs.p4.bus.read32(SDMMC + 0x44).unwrap() & 1 << 3, 0, "DATA_OVER on the P4 by then");
+}
+
 #[test]
 fn the_coproc_spec_parses_its_keys() {
     let s = CoprocSpec::parse("c6:bootloader=b.bin,ptable=p.bin,app=a.bin,otadata=o.bin@0xe000,stub=bb_init=0,stub=0x4200=1,en=!53,slice-us=5,flash-mb=8,mac=02:00:00:00:00:01").unwrap();

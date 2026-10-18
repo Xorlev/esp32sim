@@ -300,3 +300,30 @@ fn a_packet_is_announced_with_its_length() {
     assert_eq!(regs(&mut s, &mut ram), (hint::NEW_PACKET, 128));
     assert_eq!(s.stats.stale_new_packets, 1, "RX_NEW_PACKET with the length the host already had");
 }
+
+/// A data phase that ends later on the bus (a timed bus, or a host DMA resumed while the C6 is
+/// behind): the bytes cross at once, the descriptors and RX_DONE/RX_EOF wait for its end.
+#[test]
+fn the_hand_back_waits_for_the_end_of_the_data_phase() {
+    let (mut s, mut ram) = (SdioSlave::new(), Ram::new());
+    selected(&mut s, &mut ram);
+    Device::write(&mut s, SLC + slc::CONF0, slc::RX_AUTO_WRBACK);
+    for i in 0..64 { ram.0[0x1000 + i] = i as u8; }
+    ram.desc(BASE + 0x200, 64, 64, true, BASE + 0x1000, 0);
+    Device::write(&mut s, SLC + slc::RX_LINK_ADDR, BASE + 0x200);
+    Device::write(&mut s, SLC + slc::RX_LINK, slc::LINK_START);
+    s.run_dma(&mut ram.mem());
+    Device::write(&mut s, SLC + slc::INT_CLR, sint::RX_DONE);
+    short(s.command(53, cmd53(false, 1, false, true, FIFO_END - 64, 64), &mut ram.mem()));
+    let mut b = [0u8; 64];
+    s.defer_to(Some(1000));
+    s.read_data(&mut b, &mut ram.mem()).unwrap();
+    s.defer_to(None);
+    assert!(b.iter().enumerate().all(|(i, &v)| v == i as u8), "the bytes crossed");
+    assert_eq!((ram.r32(BASE + 0x200) >> 31, Device::read(&mut s, SLC + slc::INT_RAW) & sint::RX_EOF), (1, 0), "nothing handed back yet");
+    assert_eq!(s.next_due(), Some(1000));
+    assert!(!s.apply_due(999, &mut ram.mem()));
+    assert!(s.apply_due(1000, &mut ram.mem()));
+    assert_eq!((ram.r32(BASE + 0x200) >> 31, Device::read(&mut s, SLC + slc::INT_RAW) & sint::RX_EOF), (0, sint::RX_EOF));
+    assert_eq!(s.next_due(), None);
+}
