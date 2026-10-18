@@ -55,21 +55,43 @@ the P4 builds core *i* with `hartid` *i*. Nothing of it is enabled on the C3 and
   `CLIC_INT_THRESH[31:24]`. On a take, `mcause` is 0x8000_0000 | MPIL (the previous level) << 16 |
   ID, with MPP and MPIE read through from `mstatus`; the level becomes the interrupt's. A
   hardware-vectored interrupt jumps to the word at `mtvt + 4*id` (CSR 0x307), a bus read made
-  with MINHV set; a fault there is an instruction access fault with MINHV still set. Non-vectored
-  interrupts and every exception enter at the 64-byte-aligned `mtvec` base, an exception
-  recording the current level in MPIL. `mret` restores the level from MPIL. `mintstatus` is CSR
-  0x346 on rev < 3. The ROM's `mtvec` mode 1 takes exceptions at its base as before.
+  with MINHV set. Non-vectored interrupts and every exception enter at the 64-byte-aligned
+  `mtvec` base, an exception recording the current level in MPIL. `mret` restores the level
+  from MPIL. `mintstatus` is CSR 0x346 on rev < 3. Any presented candidate ends a WFI, takeable
+  or not (a WFI may resume for any reason).
+- **CLINT mode.** In `mtvec` modes 0 and 1 the core takes no CLIC candidate and does not count one
+  as pending, so it idles: interrupts there would be `mie`/`mip`'s, nothing raises `mip` on this
+  chip, and the ROM runs in mode 1 with `mie` = 0. `mcause` reads as written, without the
+  aliases, and the ROM takes its exceptions at its base.
+- **Not modelled:** a fault on the vector-table read is an instruction access fault at the
+  table entry with MINHV left set, but `mret` does not resume the fetch as the specification has
+  it, and MPIE/MPIL then describe the half-entered handler. IDF's table is in mapped RAM.
 - **Harts.** `mhartid` reads the core's index and survives a reset. An LR reservation is checked
   with the bus at the SC (`Bus::reserve`, `reservation_held`): the P4 bus keeps one per hart, and
-  a store by the other hart to the reserved word breaks it. The machine tells the bus which core
-  it is about to run (`Soc::select_core`), which is how each core sees its own CLIC block at
+  any store by the other hart to the reserved word (word, half, byte, AMO, SC) breaks it. A trap
+  breaks the core's own reservation, so an SC after a handler cannot overwrite the handler's
+  store (IDF's vectors issue no SC of their own). The machine tells the bus which core it is
+  about to run (`Soc::select_core`), which is how each core sees its own CLIC block at
   0x20800000 and the other's at 0x20810000.
 
 The CLIC and the interrupt matrices are registers (`periph::Clic`, `periph::IntMatrix`): sources
 reach each core's CLIC through its matrix; IE, the attributes and the levels read back, the control
-words take byte writes as the four byte registers they are, and an edge-triggered ID clears when
-software writes 1 to IP (IDF's acknowledge) or when it is taken hardware-vectored
-(`Soc::interrupt_taken`).
+words take byte writes as the four byte registers they are, and an edge-triggered ID clears when it
+is taken hardware-vectored (`Soc::interrupt_taken`) or when software writes 1 to IP and nothing
+else: IDF acknowledges with a 32-bit `REG_SET_BIT` of IP, and its SHV/TRIG updates are
+read-modify-writes of the same word that write a pending IP back as 1, which must not consume the
+edge.
+
+The core's P4 paths cost the other chips nothing, measured against cdbbe33d (the F extension
+alone) with `cargo build --release --bins`, alternating runs, median `user` time, identical
+instruction counts:
+
+| demo | runs | cdbbe33d | this branch | instructions |
+| --- | --- | --- | --- | --- |
+| S3 `hello` (30 s) | 7 | 0.38 s | 0.38 s | 11,990,488 + 6,798,360 |
+| `c3-hello` (30 s) | 7 | 3.86 s | 3.81 s | 4,800,000,000 |
+| `c6-hello` (30 s) | 7 | 5.59 s | 5.63 s | 4,800,000,000 |
+| pocket-tank (8 s) | 5 | 13.92 s | 13.98 s | 1,113,634,993 + 1,490,529,616 |
 
 ## Compared with a board
 
@@ -131,3 +153,44 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
 - **Unmodelled blocks** hello_world touches: PMU, PVT, APB_SARADC, LP_WDT, LP_ANA_PERI, LP_ADC,
   KEYMNG, UART2-4, TRACE0/1, SDMMC, LP_UART, LP_PERI, LP_GPIO and DSI, all configuration the
   firmware writes and reads back (`--log-periph` lists them). The watchdogs never fire.
+
+## Handoff: where milestone 2 starts
+
+**Status.** Milestone 1's boot is done: the ROM, the bootloader and FreeRTOS run on one or both
+cores, `esp_restart()` comes back through the ROM, and the goldens `hello-p4`, `hello-p4-reboot`
+and `hello-p4-smp` pin it. The core has F (lazy FPU traps), Zicntr, CLIC mode and two harts.
+What milestone 1 still lacks is oxidrive matching the board through its first SD card access.
+
+**Where oxidrive stops.** `OXIDRIVE_DIR=<images> ESP32SIM_ROM_DIR=<roms> cargo test --release -p
+esp32p4 --test oxidrive -- --ignored external_ --nocapture` reports 49 of 105 board lines
+matching, then a panic. The firmware initialises the SD host before the scheduler runs (the board
+later logs `sdmmc_host_init: SDMMC host already initialized` from the card's path, so this first
+initialisation is presumably ESP-Hosted's SDIO transport): `sdmmc_host_init` calls `sdmmc_host_reset`, which sets CTRL's
+controller, DMA and FIFO reset bits at 0x50083000 and waits for the hardware to clear them
+(IDF v5.5.3 components/esp_driver_sdmmc/src/sdmmc_host.c:126-160,
+hal/esp32p4/include/hal/sdmmc_ll.h:398-449). SDMMC is register RAM here, so they never clear;
+after 100 ms the loop calls `vTaskDelay`, which with no task running dereferences
+`pxCurrentTCBs[0]` = NULL and takes a load access fault at mtval 0x14. The board's next line is
+`W (674) i2c: This driver is an old driver, ...`.
+
+**What milestone 2 needs**, in the order the driver will ask for it
+([esp32p4-plan.md](esp32p4-plan.md), "2. SD card"):
+
+1. A DesignWare MSHC host at 0x50083000 (`sdmmc_struct.h`, `hal/esp32p4/include/hal/sdmmc_ll.h`;
+   the ESP32 and S3 carry the same core), with Espressif's wrapper from 0x800 (CLK_EDGE_SEL,
+   RAW_INTS 0x804, DLL_CLK_CONF 0x808, DLL_CONF 0x80C). First CTRL's reset bits clearing, then
+   CMD.start_command (bit 31) clearing once a command is taken (`sdmmc_ll_is_command_taken`),
+   starting with the clock-update commands (`update_clk_reg`), CDETECT reporting the card
+   (`card_detect_n` low for the slot), and RINTSTS/MINTSTS command-done, data-over and errors.
+2. Its interrupt: source 23 (`ETS_SDIO_HOST_INTR_SOURCE`, include/soc/interrupts.h), which
+   `esp_intr_alloc` routes through the interrupt matrix to a CLIC line; the chip's
+   `device_set!` table takes it like any other source.
+3. The IDMAC: DBADDR 0x88, IDSTS 0x8C, IDINTEN 0x90, descriptors and buffers in L2MEM or PSRAM,
+   moved by a pump in `esp32p4/src/bus.rs` the way the C6's GDMA pumps are.
+4. An SD card behind it, backed by an image file: CMD0/8/55/41/2/3/9/7/6 initialisation, 4 bits
+   at 40 MHz, single- and multi-block reads and writes. Two slots, because slot 1 is ESP-Hosted's
+   SDIO link in milestone 4.
+5. Clocks and pins as the driver touches them: HP_SYS_CLKRST's SDMMC clock and reset fields,
+   IO_MUX for slot 0's dedicated pins, and probably the GPIO layout parameter (above) for slot 1.
+
+`--log-periph` lists every SDMMC register the driver touches that the model does not answer.
