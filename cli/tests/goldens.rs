@@ -306,6 +306,39 @@ fn sd_card_p4() {
     assert_eq!(files, want, "the files the example left on the card");
 }
 
+/// IDF's USB mass-storage example on the P4 (`examples/usb_msc-p4`), the card in its socket and a
+/// car on its high-speed USB port (`car.txt`): enumeration, the card's capacity, raw blocks
+/// written and read back, a FAT32 clip written in 64 KiB chunks and read back, an eject that
+/// hands the card to the example's application (TEST UNIT READY: MEDIUM NOT PRESENT), the
+/// application writing README.MD (`console.txt`) and exposing the card again, the host reading
+/// that file, suspend, resume and unplug. Pinned: the console, the host's log with its emulated
+/// times, the instruction count, and what is on the card afterwards.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn usb_msc_p4() {
+    let card = tmp("usbmsc-p4.img");
+    sd_image::fat32(&card, 64 << 20, 512, "").unwrap();
+    let rom = rom("esp32p4_rev0");
+    let r = run(BIN_P4, &["--rom", rom.to_str().unwrap(), "--flash-mb", "4", "--bootloader", &format!("{FW}/p4-usbmsc-bootloader.bin"),
+        "--ptable", &format!("{FW}/p4-usbmsc-ptable.bin"), "--app", &format!("{FW}/p4-usbmsc.bin"), "--sd-rw", card.to_str().unwrap(),
+        "--script", "examples/usb_msc-p4/console.txt", "--usb-host", "examples/usb_msc-p4/car.txt", "--max-seconds", "2"]);
+    let host: String = r.stderr.lines().filter(|l| l.starts_with("[usb-host]")).map(|l| format!("{l}\n")).collect();
+    for line in ["port reset: High speed", "device 303a:4002", "interface 0: class 08/06/50, endpoints 01 (512 bytes) 81 (512 bytes)",
+                 "READ CAPACITY: 131072 blocks of 512 bytes", "verify 16 blocks at 131056: all a5", "fat-read CLIP0001.MP4: 1048576 bytes",
+                 "matches what was written", "TEST UNIT READY: sense 2/3a/00 (MEDIUM NOT PRESENT)", "root: CLIP0001.MP4 (1048576), README.MD (379)", "script done"] {
+        assert!(host.contains(line), "missing {line:?} in the host's log:\n{host}");
+    }
+    assert!(r.stdout.contains("TinyUSB Driver installed on port 1") && r.stdout.contains("README.MD doesn't exist yet, creating"), "{}", r.stdout);
+    expect_text("usbmsc-p4.console.txt", &r.stdout);
+    expect_text("usbmsc-p4.host.txt", &host);
+    expect_u64("usbmsc-p4.insns", r.insns);
+    let files = sd_image::Volume::open(&card).unwrap().root_files();
+    assert_eq!(files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["CLIP0001.MP4", "README.MD"]);
+    assert!(files[0].1 == esp_soc::usb_host::fat32::clip_bytes("CLIP0001.MP4", 1 << 20), "the clip on the card is the one the car wrote");
+    assert!(String::from_utf8_lossy(&files[1].1).starts_with("Mass Storage Devices are one of the most common USB devices."));
+    let image = std::fs::read(&card).unwrap();
+    assert!(image[131056 * 512..131072 * 512].iter().all(|&b| b == 0xa5), "the raw blocks the car wrote");
+}
+
 /// The same firmware with an unformatted card (FatFs finds no volume and the example does not
 /// format) and with an empty socket (every command times out).
 #[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
