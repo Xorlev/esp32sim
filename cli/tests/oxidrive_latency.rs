@@ -371,6 +371,8 @@ fn car_write_latency(shared: bool) {
         drop(msc);
         let at = r.forced_at.expect("the MQTT session never came up");
         window = (at + 500_000_000, at + 500_000_000 + window_ns);
+        // The firmware's own first pass is due 60 s after boot, the next one 60 s after a forced one.
+        assert!(window.1 < 60_000_000_000, "the window ends at {:.1} s, past the firmware's own pass at 60 s: lower LATENCY_SECONDS", window.1 as f64 / 1e9);
         assert!(cmds.last().is_some_and(|c| c.submit_ns >= window.1), "the clip ended before the window did");
         // Past the window: the pass's summary, if it runs that long.
         let t = r.cs.now_ns + 30_000_000_000;
