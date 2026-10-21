@@ -577,13 +577,16 @@ mod tests {
         assert!(esp_soc::SocBus::usb_link(&mut b).unwrap().port().connected);
     }
 
-    /// The die keeps its temperature through a chip reset; the restarted driver writes its range
-    /// again and reads it.
+    /// The die keeps its temperature through a chip reset, and the analog blocks behind regi2c
+    /// their registers (a CPLL divider here, block 0x67); the restarted driver writes its range
+    /// again and reads the die.
     #[test]
-    fn a_chip_reset_keeps_the_die_temperature() {
+    fn a_chip_reset_keeps_the_die_temperature_and_the_analog_registers() {
         let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
         b.periph.tsens.celsius = 31.0;
+        b.write32(0x5012_4000, 0x67 | 2 << 8 | 1 << 24 | 0x5a << 16).unwrap();
         esp_soc::SocBus::reboot(&mut b, [0; 6]);
+        assert_eq!(b.periph.ana_mst.ana.get(0, 0x67, 2), Some(0x5a));
         b.write32(0x5012_4000, 0x69 | 6 << 8 | 1 << 24 | 15 << 16).unwrap();
         b.write32(0x5012_f000, 1 << 22).unwrap();
         assert_eq!(b.read32(0x5012_f000).unwrap() & 0x1ff, 1 << 8 | 117, "(31 + 20.52) / 0.4386 = 117.46");

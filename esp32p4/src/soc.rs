@@ -132,8 +132,12 @@ impl esp_soc::SocBus for SocBus {
     /// Digital peripherals re-created; L2MEM, TCM, the LP domain and the efuses kept.
     fn reboot(&mut self, mac: [u8; 6]) -> u32 {
         let cause = self.periph.lp.reset_cause;
-        let old = std::mem::replace(&mut self.periph, periph::Peripherals::new(mac, self.wafer));
+        let mut old = std::mem::replace(&mut self.periph, periph::Peripherals::new(mac, self.wafer));
         let p = &mut self.periph;
+        // The analog blocks behind regi2c (the PLLs' dividers among them) keep their registers
+        // through a digital reset: IDF's esp_restart leaves the CPLL on (esp_system/port/soc/esp32p4/
+        // system_internal.c), and a bootloader that finds HP_ROOT on the CPLL reads its dividers.
+        p.ana_mst.ana = std::mem::take(&mut old.ana_mst.ana);
         p.cycle_base = self.cycles;
         p.efuse = old.efuse;
         p.misc.log_unknown = old.misc.log_unknown;
