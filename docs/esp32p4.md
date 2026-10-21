@@ -476,6 +476,12 @@ there, so the firmware runs between the transfers of a command:
   CAPACITY(10), MODE SENSE(6), PREVENT ALLOW MEDIUM REMOVAL, START STOP UNIT, READ(10) and
   WRITE(10) of any length in commands of 240 blocks at most (usb-storage's `max_sectors`,
   scsiglue.c:670), SYNCHRONIZE CACHE(10); `wait_ready` polls TEST UNIT READY as a car polls its drive.
+  A CHECK CONDITION whose sense is UNIT ATTENTION marks the device changed (`Msc::changed`, Linux's
+  `sdev->changed` for a removable device: v6.12 drivers/scsi/scsi_lib.c:803-811 for a read or
+  write, 2391-2399 for TEST UNIT READY); while it is set the host refuses READ(10) and WRITE(10)
+  itself (`MscError::Changed`, sd's "device offline or changed", sd.c:1340-1343) until the next
+  media poll takes the change (`take_changed`, sd.c:1773-1774). `wait_ready` clears it: its caller
+  reads the drive afresh.
   A command may take 30 s (sd's SD_TIMEOUT, drivers/scsi/sd.h:15, set at sd.c:3970-3972) before it
   is aborted. The LUN is a `fat32::BlockDevice`. Recovery (`Msc::recovery`) is Linux's by default,
   from v6.12 drivers/usb/storage/transport.c:
@@ -512,18 +518,23 @@ there, so the firmware runs between the transfers of a command:
   dirty flag, and `fsck` checks and repairs the volume after dosfstools 4.2 ("The car's hazards").
 - `pagecache::PageCache` is the car's buffer and page cache between its `Fat32` and the drive:
   metadata kept until the medium is seen to change, or writeback ("The car's hazards", "The
-  writeback model"). Plain, it passes everything through.
+  writeback model"). Plain, it passes everything through. A page the drive refuses to take is
+  lost and counted (`write_errors`), not returned as the error of whatever woke the flusher, as
+  Linux keeps a writeback error for fsync (include/linux/pagemap.h:238-248 `mapping_set_error`).
 - `car::Car` records clips (and sets of camera clips) as cameras feed them, polls TEST UNIT READY
   between writes as Linux's sd driver does, mounts, unmounts, loses power, runs fsck, and keeps
-  what it believes each file holds.
+  what it believes each file holds. A medium change (NOT READY then ready, a UNIT ATTENTION at a
+  poll, or one on a read or write since the last poll) revalidates as `sd_revalidate_disk` does
+  (sd.c:3698-3763): READ CAPACITY, MODE SENSE (a failure taken as write enabled, as
+  `sd_read_write_protect_flag` takes it), then the volume read again.
 - `fat32::write_clip` records a clip as a camera feeds it: chunk i is due at t0 + i x gap (t0
   taken before the file is created), the car waits only for a chunk that is not due yet, and the
   result (`ClipStats`) has the rate overall and over the second half, the worst lateness against
   the schedule and whether the car kept up (never a whole chunk behind).
 - `script::Runner` runs a command file (`--usb-host`), each command logging what it did. A
-  NOT READY seen by `ready` or `poll` drops the mounted volume, and a failure that leaves no
-  device on the port drops the interface and the volume, so the next `mount` reads the volume
-  again. The CLI runs it under the run's `--max-insns` and reboot policy
+  NOT READY or UNIT ATTENTION seen by `ready` or `poll` drops the mounted volume, and a failure
+  that leaves no device on the port drops the interface and the volume, so the next `mount` reads
+  the volume again. The CLI runs it under the run's `--max-insns` and reboot policy
   (`usb_host::run_machine_until`).
 
 A test drives the same API between runs of the machine:
@@ -627,7 +638,8 @@ programming for 1.5 ms), has the car keep writing after it ejected: the applicat
 and writes README.MD, TEST UNIT READY answers MEDIUM NOT PRESENT, and four WRITE(10)s of 16 blocks
 are answered GOOD all the same, read back by READ(10) and on the card afterwards. esp_tinyusb's
 READ(10) and WRITE(10) callbacks serve the card whoever holds it (2.4.0 here; oxidrive's 2.2.1
-copy has the same callbacks), which is what "The car's hazards" meets with oxidrive.
+copy had the same callbacks until its window gate, teslausb-p4 5633fc2), which is what "The car's
+hazards" meets with oxidrive 728b71f.
 
 What the sources say about the hand-overs (TinyUSB 0.21.0~2, esp_tinyusb 2.4.0):
 
@@ -1207,7 +1219,10 @@ between polls, and it can write back as a page cache does (`pagecache`, `car`, t
 oxidrive build (728b71f, `OXIDRIVE_CURRENT_DIR`; the 4b tests keep the 46a5472 build of
 `OXIDRIVE_DIR`) on the rig of "Services", which moved to `tests/oxidrive_rig.rs` and logs every
 block written to the card, so a test can tell the car's writes from oxidrive's own. Each test
-asserts what the firmware does today, named so that it fails once the firmware changes it.
+asserts what the firmware does today, named so that it fails once the firmware changes it. The
+tests of findings 1 to 3 now assert the fixed behaviour and need a build with oxidrive's window
+gate (teslausb-p4 5633fc2, `OXIDRIVE_CURRENT_DIR`): "The window gate" below; what 728b71f did
+stays in the sections before it.
 
 Every run here times the SD bus (`--sd-timing`) and gives the card 1500 µs of programming after
 each write (`OXIDRIVE_SD_PRG_US`): an assumption, not a value measured on a card. The emulator runs
@@ -1227,8 +1242,12 @@ timed bus the auto-stop reaches the card after the data phase`); runs before it 
   READY or UNIT ATTENTION with ASC 3Ah marks the medium gone (`media_not_present`, 1682-1699), a
   change either way or any UNIT ATTENTION is a medium change. A medium gone has capacity 0
   (`set_media_not_present`, 1671-1680), so what the car still holds cannot reach it and is
-  dropped; a medium back is read again (`Car::mount`), after an fsck when the volume is dirty and
-  the car runs one. Between polls nothing tells the car the medium went.
+  dropped; a medium back is read again (`Car::revalidate`: READ CAPACITY, MODE SENSE, the volume),
+  after an fsck when the volume is dirty and the car runs one. Between polls only a command that
+  fails tells the car the medium went: a read or write refused with NOT READY fails (the car's
+  clip is cut), and one that meets a UNIT ATTENTION also marks the device changed, so the car's
+  reads and writes stop until its next poll, which takes it as a medium change (scsi_lib.c:803-811,
+  sd.c:1340-1343).
 - **Recording**: `record_set` writes clips as cameras feed them, chunk i of every clip due at
   t0 + i × gap, clip after clip, polling between chunks, until a poll finds the medium gone or a
   write fails; the files are made first and closed last. The car keeps every file's clip and how
@@ -1260,7 +1279,10 @@ a window the way esp_tinyusb does (TEST UNIT READY answers MEDIUM NOT PRESENT, R
 WRITE(10) still reach the card) and change the card at the window's start: writes into a window
 until the next poll; a car keeping metadata writing over a window between its polls, and one
 that does not reading it; writeback's ordering; a power cut that fsck repairs; rotation; a ring
-of long names in one directory; a USB reset followed by a bulk fsck.
+of long names in one directory; a USB reset followed by a bulk fsck. With `gated` it serves a
+window as oxidrive's gated copy does ("The window gate"): a car refused at its first write in the
+window and revalidating at the unit attention after it; a caching car reading again what a window
+between its polls wrote; a writeback car whose pages the window and the unit attention refuse.
 
 ### The writeback model
 
@@ -1301,7 +1323,8 @@ of its FAT1 sector after the data was written.
 
 ### Writes into a window
 
-`external_oxidrive_takes_car_writes_into_a_window`. The car (2 s polls, the vfat-like writer)
+Against 728b71f, in what is now `external_oxidrive_refuses_car_writes_in_a_window` ("The window
+gate" has the fixed build). The car (2 s polls, the vfat-like writer)
 records two saved events (`event.mp4`, 2 MiB each), idles, and starts a 16 MiB Sentry clip (a
 4.1 MB/s camera) the moment oxidrive's policy takes the card for a window, 72 s into the run.
 The first shared pass took the older event; the window is for the newer.
@@ -1366,9 +1389,11 @@ across a window it sees, because the window writes nothing on a card that has Te
 
 ### Windows shorter than the poll
 
-`external_oxidrive_window_between_polls_is_overwritten_by_a_caching_car`. A fresh card (FAT32 and
-nothing on it); the car keeps its metadata and looked for TeslaCam before the window, so its cache
-holds the root without TeslaCam and the first FAT sector with every cluster free. oxidrive's first
+Against 728b71f, in what is now
+`external_oxidrive_window_between_polls_reaches_a_caching_car_as_a_unit_attention`. A fresh card
+(FAT32 and nothing on it); the car keeps its metadata and looked for TeslaCam before the window,
+so its cache holds the root without TeslaCam and the first FAT sector with every cluster free.
+oxidrive's first
 window (61.3 s) finds no TeslaCam on a card this empty and makes it (the TeslaCam self-heal:
 pipeline/src/fs_source.rs `ensure_layout`): the FAT sector in both FATs, the four directory
 clusters (64 blocks each, FatFs clears a new directory's cluster), FSInfo after each, then gives
@@ -1381,9 +1406,9 @@ records a clip:
 | 2 s | yes: a poll fell inside the 1.4 s window (a 2 s poll does with probability 0.7, by arithmetic) | RecentClips, SavedClips, SentryClips | clean |
 
 The car that missed the window erased oxidrive's SavedClips and SentryClips and left nothing for
-fsck to find. esp_tinyusb never answers UNIT ATTENTION, so a car that misses the medium going
-never learns it changed; Linux's own media poll is off by default and udev's is 2 s, and a window
-that has nothing to do, or fails, lasts 1.0-1.4 s.
+fsck to find. Stock esp_tinyusb never answers UNIT ATTENTION, so a car that misses the medium
+going never learns it changed; Linux's own media poll is off by default and udev's is 2 s, and a
+window that has nothing to do, or fails, lasts 1.0-1.4 s.
 
 ### The first epoch after a mount
 
@@ -1468,6 +1493,61 @@ run of blocks written to the card, with its time), for judging other completenes
 The run is slow: the emulated firmware polls CMD13 through every programming time the car's many
 small writes cause, about 2.7 times real time with the pair running.
 
+### The window gate
+
+oxidrive's fix for findings 1 to 4 below (teslausb-p4 63024af and 5633fc2; its README, "The window
+gate"): its esp_tinyusb copy answers TEST UNIT READY, READ CAPACITY, READ(10) and WRITE(10) with
+NOT READY, MEDIUM NOT PRESENT while the application holds the card; a take closes that gate and
+then waits for the reads and writes it had already admitted, a WRITE(10) being acknowledged before
+its deferred write reaches the card; giving the card back leaves UNIT ATTENTION 6/28/00 for the
+car's first command, reported once, the REQUEST SENSE after a refused READ(10) or WRITE(10)
+carrying it; and an unreadable entry in a window's listing counts as a failure. The car treats the
+unit attention as Linux does ("The car"). The emulated build is 5633fc2 (`OXIDRIVE_CURRENT_DIR`).
+
+| test | 728b71f | 5633fc2 |
+| --- | --- | --- |
+| `external_oxidrive_refuses_car_writes_in_a_window` | fails: 207 of the car's WRITE(10)s, 4,294 KiB, reached the card in a 1.03 s window, which finished with failures after a read error; the car never saw it | passes: the car refused at its first command after the take, none of its writes on the card, the newer event archived, the window clean |
+| `external_oxidrive_window_between_polls_reaches_a_caching_car_as_a_unit_attention` | fails: the 5 s car met no unit attention, missed the 1.40 s window and erased SavedClips and SentryClips | passes: both cars met the unit attention and kept oxidrive's folders; fsck clean |
+| `external_oxidrive_window_counts_an_unreadable_directory_entry_as_a_failure` | fails: the entry skipped, the window finished clean | passes: `SavedClips: 1 directory entries unreadable`, the window finished with failures |
+
+`external_oxidrive_caching_car_through_windows_it_sees` and
+`external_oxidrive_reads_its_temperature_after_a_restart` pass on 5633fc2 as well: the caching car
+saw its four media changes, each window's NOT READY and then its unit attention. The writeback
+and fsck-burst tests were not run on it.
+
+**Writes into a window.** With 5633fc2 the window held the card from 72.52 s to 83.43 s
+(10.9 s). The car's Sentry clip began at the take; its first command, the READ that looks up
+SentryClips, was refused with 2/3A/00 within 1 ms, so nothing of the clip reached the card, and no
+block was written in the window by the car or by oxidrive. The car saw NOT READY at its poll at
+74.30 s and UNIT ATTENTION 6/28/00 at its first poll after the window (84.30 s), read the volume
+again and recorded the next event. The window uploaded the newer event (the first shared pass had
+the older), both equal to the car's files, and finished clean with no read error; fsck is clean.
+Two earlier runs of the same build, stopped by the test's own bookkeeping, held windows of 11.0 s
+and 12.9 s with no car write on the card either. With 728b71f the window lasted 1.03 s, took 207
+of the car's WRITE(10)s (4,294 KiB), met a read error and archived nothing for its event, and the
+car never saw it; the test fails at its first assertion, the Sentry clip not being refused.
+
+**Windows shorter than the poll.** On the fresh card the self-heal window lasted 1.40 s under both
+cars. The 5 s car had no poll inside it (no NOT READY); its first command after the window, a poll,
+met the unit attention, and it read the volume again: TeslaCam holds RecentClips, SavedClips and
+SentryClips, and fsck is clean. The 2 s car saw NOT READY at one poll inside the window, the unit
+attention at the next, and kept the same three folders. With 728b71f the 5 s car erased SavedClips
+and SentryClips ("Windows shorter than the poll"). Linux v6.12 reaches the same media change from
+either: a UNIT ATTENTION at a TEST UNIT READY sets `sdev->changed` (scsi_lib.c:2391-2399), and so
+does a medium that went and came back (sd.c:1765-1775). So holding the card for a poll interval
+after a window that wrote it buys nothing for a polling Linux host, and oxidrive does not.
+
+**A listing that cannot be read.** With the gate the car no longer keeps the card programming under
+FatFs, which was what failed the window's reads, so `break_dir_chain` makes the error instead: two
+saved events in SavedClips, the rest of its first cluster filled with deleted entries and its FAT1
+entry zeroed, so FatFs's readdir fails when it steps past the cluster (ff.c:1773-1774, FR_INT_ERR).
+With 5633fc2 the window (72.9 s to 83.8 s) logged `SavedClips: 1 directory entries unreadable`
+and finished with failures, having uploaded the newer event (the first shared pass had the older).
+With 728b71f the same window uploaded the same and finished clean.
+
+How a Tesla takes UNIT ATTENTION 6/28/00 is not known: the car here takes it as a media change
+because Linux's sd does, and the car's userspace decides the rest ("Handoff", what part 1 leaves
+open).
 
 ### Findings for oxidrive
 
@@ -1480,13 +1560,16 @@ small writes cause, about 2.7 times real time with the pair running.
    orphaned on the card; when it does not, the window has ended in about a second and the car
    never knew. Possible fixes: answer READ(10) and WRITE(10) with NOT READY / MEDIUM NOT PRESENT
    while the app holds the card (the car then learns at its next command); make the app's reads
-   wait for the card to be ready.
+   wait for the card to be ready. **Fixed** by the first, in teslausb-p4 5633fc2 ("The window
+   gate").
 2. **A read error while listing drops an event without a failure.** The window source skips an
    unreadable directory entry and goes on (pipeline/src/fs_source.rs:198-202, 103-106); in three
    of the eight runs a window ended "clean" with an event missing from its listing. The event is
    listed again next time, so nothing is lost, but the window reports a clean drain it did not
    make; and the window's `revalidate` relies on nobody writing the card while it is held
-   (fs_source.rs:228-243), which finding 1 contradicts.
+   (fs_source.rs:228-243), which finding 1 contradicts. **Fixed** in teslausb-p4 63024af: an
+   unreadable entry is counted and the window finishes with failures; `revalidate`'s assumption
+   holds once the gate refuses the car.
 3. **A window shorter than the car's poll is invisible to the car, and what it writes can be
    overwritten.** Shown for the TeslaCam self-heal on a fresh card: a car polling every 5 s that
    had read the root erased SavedClips and SentryClips, silently. Windows that fail or find
@@ -1494,9 +1577,11 @@ small writes cause, about 2.7 times real time with the pair running.
    READY TO READY CHANGE) at the car's first command after the card comes back, which Linux takes
    as a medium change (v6.12 drivers/scsi/scsi_lib.c:2390-2400 `scsi_test_unit_ready`,
    sd.c:1767-1775); or keep the card for several poll intervals whenever the window has written it.
+   **Fixed** by the first, in teslausb-p4 5633fc2; the window is not held longer.
 4. **The car's writes in a window are invisible to the dirty log and the quiet timer** (card.rs:
    612 and 645 test `car_has_card()`). With the settle gate off (`SHARED_SETTLE_MS` 0, this build)
    nothing here depends on it; with it on, a clip written during a window would count as settled.
+   **Closed** by finding 1's fix: the car's writes no longer reach the card in a window.
 5. **Torn clips from writeback were not archived** in the writeback run: 89 uploads, all equal to
    the car's files; the MP4 check rejected every torn clip on 238 copies of the medium, and the
    watch caught the car writing two clips while they were read. The state the MP4 check would pass
@@ -1894,10 +1979,12 @@ the update refusal (goal 4) still stops on SHA's DMA mode ("An update").
 
 **What part 1 leaves open**:
 
-- When oxidrive changes (refusing commands while it holds the card, UNIT ATTENTION when it gives
-  the card back, a window that writes held long enough, reads that wait for a ready card, a
-  listing that counts an unreadable entry as a failure), the hazard tests that assert today's
-  behaviour fail by design: turn their assertions round and keep them.
+- oxidrive now refuses the car's commands while it holds the card, reports UNIT ATTENTION when it
+  gives the card back (teslausb-p4 5633fc2) and counts an unreadable listing entry as a failure
+  (63024af); the tests of findings 1 to 3 are turned round ("The window gate"). It does not hold
+  a window that wrote the card longer, and its reads still do not wait for a ready card. When
+  oxidrive changes again, the hazard tests that assert today's behaviour fail by design: turn
+  their assertions round and keep them.
 - Shared reading stayed on in every run here; the item-5 work on another branch saw a boot-sector
   read in `Card::geometry()` meet the card programming and turn shared reading off until a reboot.
   A different interleaving, not a contradiction: a run that meets it has no shared passes.
