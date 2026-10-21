@@ -500,13 +500,22 @@ there, so the firmware runs between the transfers of a command:
   writes 8.3 files in the root directory in a vfat-like order: the directory entry at once, the
   data a chunk at a time as it comes (one WRITE(10) per contiguous run of clusters), the FAT
   sectors of each chunk's clusters in both FATs, then the entry's size and first cluster and
-  FSInfo. It is not Linux's writeback order, in which the page cache batches the data, the buffer
-  cache holds the FAT and directory sectors, inode writeback updates the entry periodically and
-  FSInfo is written at sync or unmount: a clip cut off mid-write here keeps size 0 and no cluster
-  with its clusters orphaned in the FAT, where Linux would usually have left a shorter clip.
-  Allocation starts at FSInfo's hint and writes the last cluster allocated back as the hint; the
-  free count written is FSInfo's as it stands on the volume less what this host allocated since.
-  `FileWriter::fat_every` writes the FAT less often.
+  FSInfo. A clip cut off mid-write in this order keeps size 0 and no cluster, its clusters
+  orphaned in the FAT. Allocation starts at FSInfo's hint and writes the last cluster allocated
+  back as the hint; the free count written is FSInfo's as it stands on the volume less what this
+  host allocated since and plus what it freed. `FileWriter::fat_every` writes the FAT less often,
+  and `FileWriter::linux` rewrites the entry and FSInfo after every chunk, as Linux's inode
+  writeback finds them dirty. The metadata (boot sector, FSInfo, FAT, directories) goes through
+  `BlockDevice::read_meta` and `write_meta`, which a plain device answers as blocks, so a cache
+  underneath can tell it from data. `delete_path` unlinks as vfat does (the entries marked
+  deleted, then the chain freed in both FATs, then FSInfo), `dirty`/`set_dirty` keep the volume's
+  dirty flag, and `fsck` checks and repairs the volume after dosfstools 4.2 ("The car's hazards").
+- `pagecache::PageCache` is the car's buffer and page cache between its `Fat32` and the drive:
+  metadata kept until the medium is seen to change, or writeback ("The car's hazards", "The
+  writeback model"). Plain, it passes everything through.
+- `car::Car` records clips (and sets of camera clips) as cameras feed them, polls TEST UNIT READY
+  between writes as Linux's sd driver does, mounts, unmounts, loses power, runs fsck, and keeps
+  what it believes each file holds.
 - `fat32::write_clip` records a clip as a camera feeds it: chunk i is due at t0 + i x gap (t0
   taken before the file is created), the car waits only for a chunk that is not due yet, and the
   result (`ClipStats`) has the rate overall and over the second half, the worst lateness against
@@ -612,6 +621,13 @@ sequence:
 
 The clip cut by the VBUS loss is on the card as an entry of size 0 and no cluster, its clusters
 allocated in the FAT (the golden checks both): the vfat-like writer's failure mode, not Linux's.
+
+A third golden, `usbmsc-p4-window` (`examples/usb_msc-p4/window.txt`, the SD bus timed, the card
+programming for 1.5 ms), has the car keep writing after it ejected: the application holds the card
+and writes README.MD, TEST UNIT READY answers MEDIUM NOT PRESENT, and four WRITE(10)s of 16 blocks
+are answered GOOD all the same, read back by READ(10) and on the card afterwards. esp_tinyusb's
+READ(10) and WRITE(10) callbacks serve the card whoever holds it (2.4.0 here; oxidrive's 2.2.1
+copy has the same callbacks), which is what "The car's hazards" meets with oxidrive.
 
 What the sources say about the hand-overs (TinyUSB 0.21.0~2, esp_tinyusb 2.4.0):
 
@@ -1039,11 +1055,10 @@ MQTT URL `mqtt://10.0.2.100:1883`, with the test accounts of the file (`esp32sim
 `esp32sim` / `esp32sim-mqtt`). The test reads the two URLs from the CSV, starts the services, and
 forwards the guest addresses to them (a host name in a URL stands for 10.0.2.3). Neither the CSV
 nor anything the firmware publishes is in this repository; the device id in the topics comes from
-the board's MAC at test time. The P4's temperature sensor is register RAM, and oxidrive vetoes
-every window and every shared pass when it cannot read its die temperature, so the test seeds
-LP_TSENS's OUT field (0x5012F000 bits 7:0, `tsens_struct.h`) with 104, which IDF's driver reads as
-25 °C in the −10..80 °C range oxidrive asks for (0.4386 × 104 − 20.52, `temperature_sensor_ll.h`);
-its read-modify-writes of the other fields keep it.
+the board's MAC at test time. oxidrive vetoes every window and every shared pass when it cannot
+read its die temperature; the P4's temperature sensor reads a fixed 25 °C ("The temperature
+sensor" below), which it reports as `temp_c=Some(25)`. Milestone 4b's tests seeded the register
+instead, which a P4 restart lost.
 
 **The broker and the NAS** (`external_oxidrive_meets_its_broker_and_its_nas`). The station takes
 its lease at 6.81 s, and at 7.30 s the firmware finds the NAS (`senses: nas_reachable=true ...
@@ -1145,6 +1160,352 @@ the AXI GDMA (IDF v5.5.3 `mbedtls/port/crypto_shared_gdma`, `SOC_AXI_GDMA_SUPPOR
 modelled, so SHA_BUSY (0x50091018) never clears and core 0 spins on it. The card stays with the
 application. mbedTLS's AES in DMA mode goes the same way on the P4.
 
+## The temperature sensor
+
+LP_TSENS (0x5012F000, `esp32p4::periph::Tsens`) reads a fixed die temperature, 25 °C unless a
+test sets `Tsens::celsius`, kept through a chip reset. CTRL.OUT (bits 7:0) and READY (8) read the
+sensor while POWER_UP (22) is set, in the range the driver last wrote over regi2c: I2C_SAR_ADC
+(block 0x69) register I2C_SARADC_TSENS_DAC (6), bits 3:0 (IDF v5.5.3
+`soc/esp32p4/include/soc/regi2c_saradc.h`). OUT inverts IDF's conversion,
+0.4386 × OUT − 27.88 × offset − 20.52 (`hal/esp32p4/include/hal/temperature_sensor_ll.h`;
+`esp_hw_support/sar_periph_ctrl_common.c`, `temperature_sensor_get_raw_value`), with the offset
+of the range whose register value matches (`soc/esp32p4/temperature_sensor_periph.c`: 5, 7, 15,
+11, 10 for offsets −2 to 2), rounded to the nearest count: 25 °C is 104 in the −10..80 °C range
+oxidrive asks for (DAC 15, offset 0), which reads back as 25.09. A DAC value outside the table, or
+none written, reads 0 without READY, as a sensor not powered. CTRL resets to the header's value
+(WAKEUP_MASK, INT_EN, CLK_DIV 6); the other registers are register RAM. The LP_PERI clock gate and
+reset the driver toggles, and the efuse calibration (zero here), are not modelled.
+
+A chip reset re-creates the digital peripherals but keeps the analog blocks behind regi2c (the
+PLLs' dividers, the SAR range): IDF's `esp_restart` leaves the CPLL on, and a bootloader that
+finds HP_ROOT on the CPLL after a reset reads the dividers back (`rtc_clk_cpu_freq_get_config`
+aborts on 0 MHz). The map was re-created with the peripherals before, so a CPU reset that did not
+go through `esp_restart` aborted oxidrive's bootloader. `external_oxidrive_reads_its_temperature_after_a_restart`
+restarts the P4 with a CPU software reset and finds `temp_c=Some(25)` before and after.
+
+The sensor is a `device_set!` entry. Measured against 109a1fa8 with `cargo build --release
+--bins`, seven alternating runs, median `user` time, identical instruction counts:
+
+| demo | 109a1fa8 | this branch | instructions |
+| --- | --- | --- | --- |
+| S3 `hello` (30 s) | 0.40 s | 0.40 s | 11,990,488 + 6,798,360 |
+| `c3-hello` (30 s) | 3.88 s | 3.89 s | 4,800,000,000 |
+| `c6-hello` (30 s) | 5.37 s | 5.36 s | 4,800,000,000 |
+| `p4-hello` (27 s) | 18.24 s | 18.29 s | 9,720,000,000 + 0 |
+| `p4-hello-smp` (27 s) | 19.34 s | 19.29 s | 9,720,000,000 + 9,713,148,105 |
+| pocket-tank (8 s) | 14.68 s | 14.71 s | 1,113,634,993 + 1,490,529,616 |
+
+The P4 pays one more block compare per peripheral access (`pre_access`); the others run no code
+this change touches, so their differences are noise.
+
+## The car's hazards (milestone 4c, part 1)
+
+The car of "USB" now behaves like the Linux host in a Tesla where an archive window can hurt it:
+it keeps writing until a poll tells it the medium went, it can keep its FAT and directories
+between polls, and it can write back as a page cache does (`pagecache`, `car`, the additions to
+`fat32` in "USB", "The host"). `cli/tests/oxidrive_hazards.rs` runs it against the current
+oxidrive build (728b71f, `OXIDRIVE_CURRENT_DIR`; the 4b tests keep the 46a5472 build of
+`OXIDRIVE_DIR`) on the rig of "Services", which moved to `tests/oxidrive_rig.rs` and logs every
+block written to the card, so a test can tell the car's writes from oxidrive's own. Each test
+asserts what the firmware does today, named so that it fails once the firmware changes it.
+
+Every run here times the SD bus (`--sd-timing`) and gives the card 1500 µs of programming after
+each write (`OXIDRIVE_SD_PRG_US`): an assumption, not a value measured on a card. The emulator runs
+one instruction a cycle with no cache or PSRAM stalls and leaves the card's read access time and
+the IDMAC's pace untimed, so every time below is a lower bound. smbd and mosquitto answer in host
+time, so the interleaving of a window with the car's writes differs between runs: the tests
+assert the mechanisms, and the numbers below name the run they come from. Every number below was
+taken with the SD model's auto-stop fix (a timed bus sends a multi-block command's auto-stop at
+the end of its data phase, so the card programs after the data, not during it; `sdmmc: on a
+timed bus the auto-stop reaches the card after the data phase`); runs before it are not counted.
+
+### The car
+
+- **Polls** follow `sd_check_events` (Linux v6.12 drivers/scsi/sd.c:1710-1776): TEST UNIT READY
+  every `poll_ns` while it records and idles (2 s by default, udev's media poll: systemd v256
+  rules.d/60-block.rules; the kernel's own default interval is 0, block/disk-events.c:38-39); NOT
+  READY or UNIT ATTENTION with ASC 3Ah marks the medium gone (`media_not_present`, 1682-1699), a
+  change either way or any UNIT ATTENTION is a medium change. A medium gone has capacity 0
+  (`set_media_not_present`, 1671-1680), so what the car still holds cannot reach it and is
+  dropped; a medium back is read again (`Car::mount`), after an fsck when the volume is dirty and
+  the car runs one. Between polls nothing tells the car the medium went.
+- **Recording**: `record_set` writes clips as cameras feed them, chunk i of every clip due at
+  t0 + i × gap, clip after clip, polling between chunks, until a poll finds the medium gone or a
+  write fails; the files are made first and closed last. The car keeps every file's clip and how
+  much of it it wrote, the truth an archive is compared with.
+- **Keeping metadata** (`PageCache::keeping_meta`): the boot sector, FSInfo, FAT and directory
+  sectors the car read or wrote are answered from memory until the medium is seen to change, as
+  Linux's buffer cache answers them.
+- **Writeback** (`PageCache::writeback`), below.
+- **Rotation** deletes as vfat unlinks (v6.12 fs/fat/namei_vfat.c `vfat_unlink`, inode.c
+  `fat_evict_inode`, fatent.c `fat_free_clusters`); allocation from FSInfo's hint, as Linux's
+  `fat_alloc_clusters` starts after `prev_free` (fatent.c:488), so on a full card the next clip
+  takes the clusters the last deletion freed.
+- **The dirty flag** (FAT32 boot sector byte 65, which Linux keeps as `state`: v6.12
+  include/uapi/linux/msdos_fs.h FAT_STATE_DIRTY) set at a mount and cleared at a clean unmount
+  (inode.c `fat_set_state`, `fat_put_super`); a car that loses power leaves it set.
+- **fsck** (`Fat32::fsck`) after dosfstools 4.2's `fsck.fat -a`: both FATs read whole; each
+  file's chain walked from its entry, a chain longer than the size cut at the size (src/check.c:
+  528-537), a size past the chain cut to the chain (629-640), a chain into a free, bad or owned
+  cluster cut before it; clusters no entry reaches freed (`reclaim_free`, src/fat.c:420; with -f
+  dosfstools keeps them as FSCKnnnn.REC files instead, `reclaim_file`, not modelled); FSInfo's
+  free count; the dirty flag cleared (check.c:1065-1080). The FATs are written either as dosfstools
+  writes them (`FsckWrite::Changed`: the sectors with a changed entry, in both copies, and the
+  second copy whole when the two differed, fat.c:160-186) or whole, FAT1 first
+  (`FsckWrite::Bulk`, the shared-reading plan's "fsck rewriting FAT1 in bulk", an assumption about
+  the car).
+
+`esp-soc/src/usb_host/tests.rs` pins each behaviour against the fake device, which can now serve
+a window the way esp_tinyusb does (TEST UNIT READY answers MEDIUM NOT PRESENT, READ(10) and
+WRITE(10) still reach the card) and change the card at the window's start: writes into a window
+until the next poll; a car keeping metadata writing over a window between its polls, and one
+that does not reading it; writeback's ordering; a power cut that fsck repairs; rotation; a ring
+of long names in one directory; a USB reset followed by a bulk fsck.
+
+### The writeback model
+
+`pagecache::WritebackCfg` is the firmware's own writeback model (`WritebackCfg` in teslausb-p4
+testkit/src/sim.rs) with the same fields and defaults, in nanoseconds; that file records what
+each value rests on:
+
+| parameter | value | provenance (testkit/src/sim.rs) |
+| --- | --- | --- |
+| `min_delay_ns`, `max_delay_ns` | 50 ms, 5 s | lag is one flusher wake: measured on a Linux host, the bound followed `dirty_writeback_centisecs` (4.74 s at its default 500, 14.3-15.0 s at 1500); 500 is v6.12 mm/page-writeback.c:102. The car's own value has not been read |
+| `data_first_bias` | 0.96 | the share of metadata pages held back past their data, measured on the car (0.005 on macOS) |
+| `metadata_lag_ns` | 30 s | one `dirty_expire_centisecs` (mm/page-writeback.c:109); not measured |
+| `reorder`, `seed` | true, 0x2545F4914F6CDD1D | landing order independent of write order; fixed so a run reproduces |
+| page | 8 sectors | `PAGE_SECTORS`: Linux reclaims 4 KiB pages |
+
+How the car uses them, and where it differs from `testkit::sim::Sim`:
+
+- The data of one write lands in one batch, 50 ms to 5 s after it was written (testkit lands each
+  page on its own draw); each metadata page draws its own delay, and 96 times in 100 the 30 s lag
+  on top. A page written again before it lands keeps its schedule and carries the newest bytes
+  (testkit queues a second copy, which can land after the first). Reads see the car's own pages.
+- The writes come from the car's own FAT32 writer in Linux's order (`FileWriter::linux`): the
+  entry's size and first cluster rewritten after every chunk, as inode writeback finds the inode
+  dirty, so the medium sees intermediate sizes, about once a lag.
+- FSInfo is a metadata page written whenever the free count changes, as Linux marks its FSInfo
+  inode dirty on every allocation and free (v6.12 fs/fat/fatent.c `mark_fsinfo_dirty`, written by
+  inode.c `fat_write_inode` through misc.c `fat_clusters_flush`): it lands with the metadata lag,
+  not only at sync or unmount as the handoff guessed.
+- Under contention pages land later than they fall due: the flusher's writes are USB commands
+  like any other, behind the car's own and slowed by the card.
+- A power cut drops what has not landed; the volume stays dirty.
+
+On the fake drive the model puts a cluster's data on the medium before its FAT entry for 97.2%
+of clusters (35,778 against 1,047; `writeback_lands_data_in_batches_and_holds_the_metadata_back`),
+against the 98.2% the shared-reading plan measured on a drive (18,460 clusters over 178 FAT
+sectors), counted the drive trace's way: a cluster's first data landing against the first landing
+of its FAT1 sector after the data was written.
+
+### Writes into a window
+
+`external_oxidrive_takes_car_writes_into_a_window`. The car (2 s polls, the vfat-like writer)
+records two saved events (`event.mp4`, 2 MiB each), idles, and starts a 16 MiB Sentry clip (a
+4.1 MB/s camera) the moment oxidrive's policy takes the card for a window, 72 s into the run.
+The first shared pass took the older event; the window is for the newer.
+
+esp_tinyusb answers TEST UNIT READY with MEDIUM NOT PRESENT once oxidrive holds the card
+(oxidrive's vendored esp_tinyusb 2.2.1, components/esp_tinyusb/tinyusb_msc.c:1195-1210,
+`tud_msc_test_unit_ready_cb`), but its WRITE(10) callback defers the write to the card whatever
+the mount point (1267-1285, `tud_msc_write10_cb`, and `msc_storage_write_sector_deferred`,
+346-385; READ(10) the same, 1253-1262). So every WRITE(10) the car sends before its next poll is
+answered GOOD and written to the card under oxidrive's FatFs. The golden `usbmsc-p4-window` pins
+the same callbacks in IDF's tusb_msc example, deterministically and without a network ("USB",
+"Faults").
+
+The window and the car's writes interleave differently in each run, because smbd and mosquitto
+answer in host time. Eight runs:
+
+| run | window | the car's WRITE(10)s while oxidrive held the card | the car | the window |
+| --- | --- | --- | --- | --- |
+| 1 | 6.0 s | 358, 7,544 KiB | its poll 1.8 s after the take saw MEDIUM NOT PRESENT; clip cut: 230 clusters orphaned | 1 failed, nothing archived |
+| 2 (bus logged) | 11.1 s | 295, 6,179 KiB | saw it 1.5 s after the take; 188 orphaned | the newer event uploaded, equal to the car's file |
+| 3 | 1.0 s | 205, 4,229 KiB | never saw it | 1 failed |
+| 4 | 1.0 s | 205, 4,229 KiB | never saw it | one of the two events missing from its listing; finished "clean", nothing archived |
+| 5 | 1.0 s | 203, 4,228 KiB | never saw it | as run 4 |
+| 6 (bus logged) | 1.0 s | 202, 4,164 KiB | never saw it | a CMD17 the card did not answer while programming one of the car's writes (`list SavedClips failed: I/O error`) |
+| 7 (bus logged) | 10.9 s | 298, 6,244 KiB | saw it 1.5 s after the take; 190 orphaned | the newer event uploaded |
+| 8 (bus logged) | 1.0 s | 202, 4,164 KiB | never saw it | a CMD17 unanswered the same way while listing SavedClips; one event missing from the listing, finished "clean" |
+
+In six of the eight the window did not archive the event it opened for: three reported a failure,
+three ended "clean" with an event missing from the listing. oxidrive wrote no block itself in any
+of them (it writes in a window only when it makes TeslaCam; reclaim is off in this build). When
+the car's poll fell inside the window (runs 1, 2, 7) the clip it was writing was left on the card
+with its entry at size 0 and no cluster and its clusters orphaned (fsck_msdos: 188 to 230 orphaned
+clusters, FSInfo's free count off by as many); when it did not (the other five, whose windows
+ended within 1.0 s) the car never knew, its clip closed, and fsck is clean.
+
+Why oxidrive's reads fail, seen in runs 6 and 8, whose SD bus was logged (`ESP_EMU_DEBUG=sdmmc`):
+FatFs's CMD17 came while the card was programming one of the car's writes (`prg`), and a card in
+`prg` answers no read (SD Physical Layer Simplified Specification v9.10 §4.8; "The card" above;
+the 0x107 and status 0x400E00 the reference board reported for reads during USB writes). IDF's
+`sdmmc_read_sectors` sends CMD17 or CMD18 without waiting for the card to be ready. FatFs turns
+the failed read into EIO (IDF v5.5.3 fatfs/vfs/vfs_fat.c:325-326). Where it hits a folder's
+listing, oxidrive's window source skips the entry as unreadable and goes on (pipeline/src/
+fs_source.rs:198-202, the same in `clips_in`, 103-106), so the event drops out of the window
+without a failure being counted; the window source's `revalidate` takes a size match as enough
+because "while the card is held exclusively nothing else writes to it" (fs_source.rs:228-243),
+which the car's writes contradict. Runs 1 and 3 were not logged and their cause is the likely one,
+not a proven one. Two more firmware facts from the sources: oxidrive's write tap records nothing
+while it holds the card (app/src/storage/card.rs:603-675, `__wrap_sdmmc_write_sectors`, gates the
+dirty log and the quiet timer on `car_has_card()`), so the car's writes in a window are in
+neither once the card is back; and a window that fails or finds nothing ends within about a
+second, shorter than a 2 s poll.
+
+### A car that keeps its FAT
+
+`external_oxidrive_caching_car_through_windows_it_sees`. The car keeps its metadata between polls
+and polls every 2 s; it records two events, oxidrive's policy takes the card at 61.2 s (16.0 s,
+two uploads), `force_open` again at 96.3 s (16.0 s, two uploads). The car saw both (four medium
+changes) and read the volume again after each; between them its cache answered 369 metadata reads
+and missed 22. oxidrive wrote no block in either window, every upload equals the car's file, every
+clip is on the card as the car wrote it, and fsck is clean: with 728b71f a caching car is safe
+across a window it sees, because the window writes nothing on a card that has TeslaCam.
+
+### Windows shorter than the poll
+
+`external_oxidrive_window_between_polls_is_overwritten_by_a_caching_car`. A fresh card (FAT32 and
+nothing on it); the car keeps its metadata and looked for TeslaCam before the window, so its cache
+holds the root without TeslaCam and the first FAT sector with every cluster free. oxidrive's first
+window (61.3 s) finds no TeslaCam on a card this empty and makes it (the TeslaCam self-heal:
+pipeline/src/fs_source.rs `ensure_layout`): the FAT sector in both FATs, the four directory
+clusters (64 blocks each, FatFs clears a new directory's cluster), FSInfo after each, then gives
+the card back after 1.40 s with nothing to archive. Then the car makes TeslaCam/RecentClips and
+records a clip:
+
+| car's poll | saw the window | TeslaCam afterwards | fsck |
+| --- | --- | --- | --- |
+| 5 s | no | RecentClips only: the car's TESLACAM took the same root slot and cluster 3, its stale FAT sector freed oxidrive's other three clusters again | clean |
+| 2 s | yes: a poll fell inside the 1.4 s window (a 2 s poll does with probability 0.7, by arithmetic) | RecentClips, SavedClips, SentryClips | clean |
+
+The car that missed the window erased oxidrive's SavedClips and SentryClips and left nothing for
+fsck to find. esp_tinyusb never answers UNIT ATTENTION, so a car that misses the medium going
+never learns it changed; Linux's own media poll is off by default and udev's is 2 s, and a window
+that has nothing to do, or fails, lasts 1.0-1.4 s.
+
+### The first epoch after a mount
+
+`external_oxidrive_reads_through_the_cars_fsck_burst_after_a_reset`. A 64 GiB card two earlier
+boots left dirty and torn (`previous_boots`, below), so its FATs are 8 MiB each. The car runs
+fsck at the mount and writes the FATs whole (`FsckWrite::Bulk`), records sets of four camera clips
+(`Tesla`, below), and forces a shared pass as soon as oxidrive's broker session is up; when the
+pass begins to upload a clip, the car resets the port without dropping VBUS
+(`UsbHost::reset_device`) and runs the same fsck again:
+
+- The mount's burst ran from 0.29 s to 3.53 s (both FATs read and written whole, 16 MiB each way;
+  the copies differed after the power cuts, 4 sizes cut). oxidrive's first pass began at 9.2 s,
+  5.7 s after it, and only that early because it was forced as soon as its broker session was up:
+  unforced, the first pass comes a minute after boot (`shared_interval_secs`). The first epoch
+  waits out the mount's burst.
+- The pass began uploading a Sentry clip at 9.27 s; the reset's burst ran from 9.58 s to 12.82 s.
+  At 9.60 s the pass's walker failed (`list SavedClips failed: directory walk failed`) and the
+  pass ended having archived nothing. Nothing it archived differs from the car's file, and fsck
+  is clean afterwards. A run before the SD model's auto-stop fix (above) read through more of the
+  burst: oxidrive's watch caught the FAT writes and discarded the two clips it was reading
+  (`shared: the car touched ... while it was read`), then the walker failed the same way.
+
+oxidrive 728b71f sets `auto_mount_off`, so the port reset did not take the card from it (as the
+tusb_msc example's reset did, "Faults").
+
+### Writeback, shared passes and windows
+
+`external_oxidrive_archives_no_torn_clip_from_a_writeback_car`, on the writeback model above:
+
+- **The card**: 4 GiB, filled with one file but for 160 MiB (`fill_volume`), so the car's
+  rotation hands freed clusters straight to the next clip, as on a full card.
+- **The recorder** (`Tesla`): a set of four 384 KiB camera clips every 6 s into RecentClips,
+  written together, a ring of 12 sets with the oldest deleted; every fifth set an event copying the
+  last two sets into SentryClips or SavedClips at the bus's speed; at most 8 events kept, the oldest
+  deleted. The clips are `mp4_bytes`: `ftyp`, an `mdat` that states its size, `moov` last.
+- **Earlier boots**, offline (`previous_boots`): four boots of 90 s on the card, each starting with
+  an fsck when the volume is dirty (`FsckWrite::Changed`) and ending in a power cut 0-6 s into the
+  next set, which lost 31, 78, 96 and 35 dirty pages. Their fscks found 4 to 12 files to cut, 8 to
+  12 broken chains, 48 to 353 lost clusters, and once two FATs that differed.
+- **This boot**: oxidrive boots on that card; the car's fsck at the mount cuts 8 files, frees 305
+  lost clusters and rewrites FAT2 from FAT1 (the copies differed); then the car records 120 s,
+  stays quiet until a window has come and gone, records 120 s more, and stays quiet with
+  `force_open` until another. oxidrive passes every minute meanwhile. The medium is copied every
+  second while the car records.
+
+One run, 447 s emulated (1,215 s on the host):
+
+| | |
+| --- | --- |
+| written | 1,584 chunks, 104 MB; 268 clips deleted by the rotation |
+| landings | data 1,586: written to landed median 2.53 s, 99th percentile 4.94 s, max 5.00 s; metadata 183: median 32.4 s, max 35.0 s. Behind their schedule by at most 20 ms: the shared passes' contention never pushed a landing late |
+| shared passes | 9; 72 clips uploaded; 2 stopped early on `card busy with the car` (a read the card did not answer while programming), 2 clips discarded by the watch because the car wrote them while they were read, 2 walks of a folder failed |
+| windows | 208.3 s (1.3 s, nothing new), 414.3 s (22.2 s, 17 clips), 440.8 s (1.3 s, forced, nothing new); the car's 2 s poll happened to fall inside all three |
+| uploads against the car's files | 72 by shared passes and 17 by windows, every one equal to the car's file: **no torn or prefix clip archived as finished** |
+
+The 238 copies of the medium, judged as a reader without a dirty log would judge them (each Saved
+and Sentry clip present: what each rule accepts, and how many of those differ from the clip the car
+was recording into that file):
+
+| rule | clips accepted | torn among them |
+| --- | --- | --- |
+| any file with a size | 15,503 | 959 |
+| MP4 boxes complete (oxidrive's complete.rs) | 14,544 | 0 |
+| and the entry agreeing with its chain (oxidrive's shared.rs `structural`) | 14,544 | 0 |
+| and nothing written to its sectors for 120 s (the settle gate, from the card's write log) | 3,632 | 0 |
+
+Every torn clip on the medium in this run was one being written: its entry's size, landed late
+from inode writeback, falls short of the `mdat` size the clip states, so the box walk runs past
+the end. The state that would pass the MP4 check, a final size and the `moov` on the medium with a
+middle chunk not landed, needs the entry's page to be one of the 4% not held back and to land
+before a data batch; it is reachable in the model and did not occur in these copies. Earlier
+boots' torn files did not survive the car's fsck as complete-looking clips: fsck cuts a file to its
+chain, and a cut clip's `mdat` runs past its end. So the counts say the MP4 check and the watch were
+enough for this model and run; they do not show that the settle gate, which oxidrive ships off,
+is unnecessary, and a recorder that writes `moov` first or patches `mdat`'s size at the end would
+change the first rule's column. The settle gate's column uses the card's own write log, which also
+records the car's writes during a window; oxidrive's dirty log does not ("Writes into a window").
+
+`OXIDRIVE_SNAPSHOT_DIR` keeps the copies with `truth.tsv` (every file the car made, its size and
+the CRC-32 of its clip), a table per copy of what the car knew of each file, and `writes.tsv` (every
+run of blocks written to the card, with its time), for judging other completeness rules offline.
+The run is slow: the emulated firmware polls CMD13 through every programming time the car's many
+small writes cause, about 2.7 times real time with the pair running.
+
+
+### Findings for oxidrive
+
+1. **A car's writes reach the card in a window and break the window.** esp_tinyusb's READ(10) and
+   WRITE(10) callbacks serve the card whoever holds it (tinyusb_msc.c:1253-1285 in oxidrive's
+   2.2.1 copy); only TEST UNIT READY looks. A car that starts writing within a poll interval of
+   the take writes the card under FatFs. The card's programming makes FatFs's reads fail (IDF's
+   reads do not wait for a ready card): in six of eight runs the window did not archive the event
+   it opened for. When the car's poll falls inside the window, the clip it was writing is left
+   orphaned on the card; when it does not, the window has ended in about a second and the car
+   never knew. Possible fixes: answer READ(10) and WRITE(10) with NOT READY / MEDIUM NOT PRESENT
+   while the app holds the card (the car then learns at its next command); make the app's reads
+   wait for the card to be ready.
+2. **A read error while listing drops an event without a failure.** The window source skips an
+   unreadable directory entry and goes on (pipeline/src/fs_source.rs:198-202, 103-106); in three
+   of the eight runs a window ended "clean" with an event missing from its listing. The event is
+   listed again next time, so nothing is lost, but the window reports a clean drain it did not
+   make; and the window's `revalidate` relies on nobody writing the card while it is held
+   (fs_source.rs:228-243), which finding 1 contradicts.
+3. **A window shorter than the car's poll is invisible to the car, and what it writes can be
+   overwritten.** Shown for the TeslaCam self-heal on a fresh card: a car polling every 5 s that
+   had read the root erased SavedClips and SentryClips, silently. Windows that fail or find
+   nothing last 1.0-1.4 s, under udev's 2 s. Possible fixes: answer UNIT ATTENTION (6/28/00, NOT
+   READY TO READY CHANGE) at the car's first command after the card comes back, which Linux takes
+   as a medium change (v6.12 drivers/scsi/scsi_lib.c:2390-2400 `scsi_test_unit_ready`,
+   sd.c:1767-1775); or keep the card for several poll intervals whenever the window has written it.
+4. **The car's writes in a window are invisible to the dirty log and the quiet timer** (card.rs:
+   612 and 645 test `car_has_card()`). With the settle gate off (`SHARED_SETTLE_MS` 0, this build)
+   nothing here depends on it; with it on, a clip written during a window would count as settled.
+5. **Torn clips from writeback were not archived** in the writeback run: 89 uploads, all equal to
+   the car's files; the MP4 check rejected every torn clip on 238 copies of the medium, and the
+   watch caught the car writing two clips while they were read. The state the MP4 check would pass
+   is rare in the model and did not occur; the counts do not argue for or against the settle gate.
+6. **An fsck burst during a shared pass costs the pass, not the archive**: the pass archived
+   nothing during it and nothing torn, and its walker failed outright, which a ready check before
+   each read (finding 1) would also address. The first pass after boot comes well after the car's
+   fsck at the mount.
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,
@@ -1174,8 +1535,7 @@ Eight blocks differ:
 - the firmware's journal and configuration, which the board's NVS holds from earlier boots and
   the emulator's blank flash does not: it reports a first boot, seeds a default and runs
   unconfigured (four blocks);
-- the die temperature: the temperature sensor is register RAM here (the services test seeds a
-  reading, "Services").
+- the die temperature: the emulator's sensor reads a fixed 25 °C ("The temperature sensor").
 
 The board's lines from 93 on come through the C6 (WiFi, the clock, MQTT). With the C6 on slot 1
 (`--coproc`, "The co-processor", "oxidrive") the WiFi and clock lines are reached and 80 lines
@@ -1224,6 +1584,9 @@ car meanwhile; with the co-processor it comes up ("The co-processor").
 - **The host's packet announcement must wait for the length.** Raising RX_NEW_PACKET at the rx
   link's START left a few instructions in which ESP-Hosted's combined register read could see a
   packet with its old length and wait for ever. Found in review, not seen in a run.
+- **A chip reset must keep the analog registers.** The bootloader reads the CPLL's dividers back
+  over regi2c when HP_ROOT is still on the CPLL, which every reset but `esp_restart`'s leaves it
+  on; re-created with the digital peripherals, they read 0 and the bootloader aborted.
 - **A restarted P4 glitches EN.** ESP-Hosted makes GPIO 54 an output (its output latch still 0
   after the reset) before it writes the level (`transport_gpio_reset`), so EN is low for a few
   instructions; a slice end can see that, so EN needs the C6's t_RST before it resets the chip.
@@ -1235,7 +1598,7 @@ car meanwhile; with the co-processor it comes up ("The co-processor").
 | CPU | two RV32IMAFC cores (`Cpu::new_esp32p4`, `misa` 0x40001125): F with the lazy FPU traps, EXT_ILL, Zicntr, CLIC mode, `mhartid`; core 1 held in reset until HP_SYS_CLKRST releases it. Xesppie and the hardware loops decode as illegal |
 | Memory | 128 KB mask ROM at 0x4FC00000 (reset vector), 768 KB L2MEM at 0x4FF00000 and its uncached alias at 0x8FF00000, 8 KB TCM at 0x30100000, LP ROM (empty) and 32 KB LP RAM; flash (0x40000000) and PSRAM (0x48000000) windows behind two 1024-entry MMUs of 64 KB pages, reached through SPI_MEM_C / SPI_MEM_S item registers, with their uncached aliases |
 | Interrupts | both interrupt matrices (128 sources, rev < 3) and both CLIC register blocks, delivered through the cores' CLIC mode |
-| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`), an SDIO function on slot 1 with its interrupt on DAT1 (`--coproc`: an ESP32-C6 running ESP-Hosted's slave, "The co-processor"); everything else is register RAM, listed by `--log-periph` |
+| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back, kept through a chip reset), the die temperature sensor at a fixed temperature, ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`), an SDIO function on slot 1 with its interrupt on DAT1 (`--coproc`: an ESP32-C6 running ESP-Hosted's slave, "The co-processor"); everything else is register RAM, listed by `--log-periph` |
 | Time base | 360 MHz, the rev < 3 application clock; one instruction is one cycle |
 
 The revision is a type parameter (`esp32p4::Revision`, `RevLt3`): rev >= 3 (its own ROM, the
@@ -1253,9 +1616,6 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
   the host, run by `external_` tests ("Services"); there is no in-process broker or SMB server, so
   no golden reaches them, and `--usb-host` does not run with `--coproc` yet (a test drives the car
   through `CoSim`'s `UsbPort`).
-- **The temperature sensor** (LP_TSENS) is register RAM: IDF's driver reads OUT as 0, which it
-  turns into −48 °C and ESP_FAIL. A model would give a fixed die temperature from OUT and the DAC
-  range the driver writes over regi2c; it is a `device_set!` entry and needs a CPU-time receipt.
 - **USB**: the full-speed OTG core (0x50040000) and USB_WRAP, host mode, the core's slave mode
   (the data FIFOs), descriptor DMA, isochronous and interrupt endpoints, LPM, the
   per-endpoint interrupt source (94), and the time a transaction takes inside the core: it
@@ -1285,104 +1645,72 @@ to this one. The browser build boots the same images (`web/wasm/fw/p4-hello.json
   KEYMNG, UART2-4, TRACE0/1, LP_UART, LP_PERI, LP_GPIO and DSI, all configuration the firmware
   writes and reads back (`--log-periph` lists them). The watchdogs never fire.
 
-## Handoff: where milestone 4c starts
+## Handoff: where milestone 4c goes on
 
-**Status.** Milestone 4b is done ("Services"): real servers on the host (mosquitto, samba's
-smbd) run by `tests/services.rs`, reached through guest-to-host TCP forwards (`--net
-none,fwd=...`, which keep everything else inside the virtual network); oxidrive provisioned for
-them, its MQTT session up with its retained availability and state, its NAS probe answered; an
-archive window end to end with a car that writes Tesla's directory tree (long names, three levels,
-MP4 clips): a shared pass and then a window upload through `.part`, read-back, rename and
-manifest, the car sees MEDIUM NOT PRESENT and gets the card back, its next clip lands, fsck is
-clean, and every clip and upload compares byte for byte; the upload rate measured (0.53 MB/s, 0.35
-with the SD bus timed) and explained as far as experiments go: not the access point's pacing,
-not a per-packet cost, most likely the NAT's 5840-byte window over a 10.7 ms round trip.
-`CoSim` is a USB host's port. Milestones 1-4a are as described above. Not done: the update
-refusal (goal 4) stops on SHA's DMA mode, which needs the P4's AXI GDMA ("An update").
+**Status.** Milestone 4c, part 1 is done ("The car's hazards"): the car writes into a window
+until its poll, keeps its FAT between polls, misses windows shorter than its poll, writes back as
+Linux does with the firmware's own writeback parameters, rotates on a full card, keeps the dirty
+flag, and runs fsck at a mount and after a USB reset; each runs against oxidrive 728b71f in
+`cli/tests/oxidrive_hazards.rs`, the findings for the firmware listed in "Findings for
+oxidrive". `usbmsc-p4-window` pins the window's write mechanism with IDF's own tusb_msc example,
+deterministic and without a network. The die temperature sensor is a model ("The temperature
+sensor"), and a chip reset keeps the analog registers. Milestones 1-4b are as described above;
+the update refusal (goal 4) still stops on SHA's DMA mode ("An update").
 
-**What milestone 4c needs**: the hazards of "The car, for archive windows" below, built into the
-car and run against oxidrive, and the measurements the firmware's shared-reading plan asks of the
-emulator (its section "Snapshot overlay: reviewed, reduced design", the "Experiments" table). The
-services test is the base for all of them (`cli/tests/oxidrive_services.rs`: `rig`, the car on
-`Rig`'s `UsbPort`, `upload_phases`, the samples).
+**What is left of 4c**, numbered as the handoff numbered it:
 
-1. **A car that writes into a window** (item 1 below): WRITE(10)s queued chunk after chunk until a
-   command fails or a poll says NOT READY, instead of today's car, which writes only between polls
-   that passed. esp_tinyusb's callbacks let those writes reach the card under the application's
-   FatFs; fsck and the clip comparison say what that costs.
-2. **A caching FAT layer** (item 2): the car keeps its FAT and directories (`fat32::Fat32` and what
-   it read) across polls and reads the volume again only after a NOT READY then READY, or a UNIT
-   ATTENTION; then fsck and compare. Today's test remounts after the change it saw.
-3. **Windows shorter than the poll** (item 3): the window here held the card 8.9 s and the car,
-   polling every 2 s, saw it; a car polling every 5 s, or a window of a small clip, will not. It
-   matters where the application writes the card in a window: reclaim's deletions, FatFs's FSInfo.
-4. **Writeback realism** (item 4): data in page-cache batches, the FAT and directory sectors held
-   and written back late and out of order, intermediate entry sizes, FSInfo at sync, torn files
-   from the previous boot, with the parameters of the firmware's `testkit::sim` writeback model
-   (its `WritebackCfg`: the flusher interval, the share of metadata held back past its data, how
-   long it trails). Count the torn clips each completeness rule accepts.
 5. **Car write latency under a shared reader**: the car at 4 MB/s with a programming time
    (`--sd-prg-us`, `SdCardConfig::prg_ns`) while a shared pass runs, and the per-WRITE(10)
    latency distribution for reader chunks of 16, 32, 64 and 128 KiB. `Msc` would record each
    command's time; the reader's chunk is the firmware's. The emulator runs one instruction a
    cycle with no cache or PSRAM stalls, so these are lower bounds. A reader's CMD18 that meets
-   the card programming gets no response (0x107, status 0x400e00; "The card").
-6. **The first epoch after a mount**: the car's fsck at mount racing the firmware's first shared
-   pass after boot, and a USB reset without power loss (`UsbHost::reset_device`) with the car's
-   fsck rewriting FAT1 in bulk.
+   the card programming gets no response (0x107, status 0x400e00; "The card"), which the hazard
+   runs saw end windows and passes.
 7. **The network under the firmware**: the NAT's window and window scaling, an MSS option in its
    SYN-ACK, and the round trip taken apart (where the 10.7 ms go) before the rate is compared
    with the board's; first why a window of 16384 or 65535 bytes stalls the first 1.5 MB write
    ("Upload throughput").
 8. **The AXI GDMA** for SHA's (and AES's) DMA mode, which the update path and TLS need, then
    `external_oxidrive_refuses_an_unsigned_update` should pass.
-9. **The temperature sensor** as a model rather than the test's seeded register: a fixed die
-   temperature from LP_TSENS OUT and the DAC range the driver writes over regi2c. After a P4
-   restart the seed is gone and oxidrive vetoes every window again.
 10. **The owner's radio wedge** (carried from 4b's plan): a one-shot stub that makes the P4's
    `hosted_malloc_align` (esp_hosted's `port_esp_hosted_host_os.c`) return NULL at its Nth call
    would reproduce the board's wedge chain end to end; the fault hooks show where such a chain
    ends ("Faults").
 
+**What part 1 leaves open**:
+
+- When oxidrive changes (refusing commands while it holds the card, UNIT ATTENTION when it gives
+  the card back, a window that writes held long enough, reads that wait for a ready card), the
+  hazard tests that assert today's behaviour fail by design: turn their assertions round and keep
+  them.
+- Where the sources stop, the car's reactions are assumptions: what Tesla's MCU does after a
+  medium change (here it reads the volume again, after an fsck when the volume is dirty, which it
+  is while mounted), after a USB reset (here an fsck rewriting both FATs whole), and whether it
+  writes MP4 the way `mp4_bytes` lays a clip out. Linux itself reports the change as an event and
+  marks the disk for a partition rescan when it is next opened (v6.12 block/disk-events.c:272-284
+  `disk_check_media_change`, which sd calls from `sd_open`, drivers/scsi/sd.c:1484-1488); a volume
+  mounted on it is left as it is, and the car's userspace decides what follows.
+- The writeback model is the testkit's: the car's own `dirty_writeback_centisecs` has not been
+  read, the metadata lag has not been measured, and the data-first share is the model's (97.2%),
+  close to the drive's 98.2% by construction rather than by fit.
+- Builds with the settle gate on (`SHARED_SETTLE_MS`) and with reclaim configured, which 728b71f
+  does not ship; more boots and clips for the writeback counts. The writeback run is slow: the
+  emulated firmware polls CMD13 through every programming time the car's many small writes
+  cause, about 2.7 times real time with the pair running.
+- `--usb-host` still does not run with `--coproc`; the oxidrive tests drive the car from Rust.
+- A digital system reset (LP_SYSTEM's SYS_SW_RST) of oxidrive was not tried again after the
+  regi2c fix; the CPU reset was.
+
 **Timed SD transfers** are there (`--sd-timing`). oxidrive's 11.0 MB/s with them against its
-board's 10.9 MB/s is a coincidence, not a calibration ("USB", "Throughput"): the card's
-programming time is 0 and cache and PSRAM stalls are not modelled. The card's read access time
-and its programming time per block (`--sd-prg-us` is per write; measure it on a card first) are
-what is left. An archive window's reads of the card on slot 0 and ESP-Hosted's traffic on slot 1
-share the one host, and timing both slots takes the upload from 0.53 to 0.35 MB/s ("Upload
-throughput").
-
-**The car, for archive windows.** The car here checks the drive between commands. Milestone 4b
-gave it Tesla's tree (directories, long names, MP4 clips: `fat32::mkdir_all`, `create_path`,
-`mp4_bytes`) and nothing of the list below. What a window needs from it, and what the sources say a
-window will meet:
-
-1. A car that keeps writing into a window: queued WRITE(10)s, chunk after chunk, until a command
-   fails or a poll says NOT READY, rather than stopping at the next poll. esp_tinyusb's default
-   READ(10) and WRITE(10) callbacks do not check who has the card (tinyusb_msc.c:1379-1388 and
-   1393-1411; `msc_storage_write_sector_deferred` writes whatever the mount point): a write that
-   arrives after the application took the card goes to the card under the application's FatFs.
-   Only TEST UNIT READY looks at the mount point (1321-1336), and it reports NOT READY, MEDIUM NOT
-   PRESENT; it never reports UNIT ATTENTION.
-2. A caching FAT layer, as Linux's page and buffer caches are: what the car knows of the FAT and
-   the directory stays valid until it sees the medium change, a NOT READY then READY, or a UNIT
-   ATTENTION, and only then is the volume read again. After the window: fsck the image and compare
-   every clip. Linux's media-change detection is `sd_check_events` (v6.12 drivers/scsi/sd.c:1710-1776):
-   a TEST UNIT READY per poll, MEDIUM NOT PRESENT under NOT READY or UNIT ATTENTION marks the
-   medium gone (`media_not_present`, 1682-1699), and a change either way or a UNIT ATTENTION is a
-   media-change event. sd polls removable disks (`DISK_EVENT_FLAG_POLL`, sd.c:4012-4016); the
-   kernel's default interval is 0, polling off (`disk_events_dfl_poll_msecs`, block/disk-events.c:38-39),
-   and systemd's udev rules set it to 2000 ms (systemd v256 rules.d/60-block.rules).
-3. Windows shorter than the poll interval: the card taken and given back between two polls. With
-   no UNIT ATTENTION from esp_tinyusb, a car polling every 2 s does not see such a window at all,
-   and its cached FAT and directory are written back over what the application changed.
-4. A writeback mode for the FAT32 writer, closer to Linux: data in page-cache batches, the FAT
-   and directory sectors held and written back periodically, the entry's size updated as inode
-   writeback does, FSInfo at sync or unmount, so that a clip cut off mid-write leaves what Linux
-   would. Not built; the vfat-like order is what the tests and goldens pin today.
+board's 10.9 MB/s is a coincidence, not a calibration ("USB", "Throughput"): cache and PSRAM
+stalls are not modelled, and the hazard runs' 1500 µs programming time is an assumption. The
+card's read access time and its programming time per block (`--sd-prg-us` is per write; measure
+it on a card first) are what is left. An archive window's reads of the card on slot 0 and
+ESP-Hosted's traffic on slot 1 share the one host, and timing both slots takes the upload from
+0.53 to 0.35 MB/s ("Upload throughput").
 
 The tusb_msc example shows two more things a window will meet ("Faults"): a port reset, which is
 how Linux recovers from any transport error or timeout, takes the card back from an application
-that does not set `auto_mount_off`; and a bus reset during a write's data stage makes TinyUSB's
-MSC class assert in `proc_write10_cmd` (harmless there; seen only in emulation, not checked on
-silicon).
+that does not set `auto_mount_off` (oxidrive sets it); and a bus reset during a write's data stage
+makes TinyUSB's MSC class assert in `proc_write10_cmd` (harmless there; seen only in emulation, not
+checked on silicon).
