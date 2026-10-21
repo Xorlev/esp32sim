@@ -7,7 +7,8 @@
 //!
 //! The servers answer in host time, so two runs of one variant differ a little; everything else
 //! (the car's schedule, the firmware, the network's clock) is fixed. [esp32p4.md](../../docs/esp32p4.md),
-//! "Car write latency under a shared reader", has the method and the results.
+//! "Car write latency under a shared reader", has the method and the results, and "The fixed
+//! reader" what `external_a_shared_pass_completes_without_racing_the_car` asserts.
 #[path = "../../tests/common.rs"]
 mod common;
 #[path = "../../tests/sd_image.rs"]
@@ -134,18 +135,17 @@ impl SdDevice for Nothing {
 /// The firmware, its card (timed, programming for `prg_ns` after each write) and both services,
 /// the pair joined; the SD devices tapped. `forced_at` is the first moment past `FORCE_AT_NS`
 /// with the MQTT session up; `force` publishes `force_open` then, otherwise it is only noted.
-struct Rig { cs: CoSim, _smb: Samba, mqtt: Mosquitto, card: std::path::PathBuf, id: String, lines: Vec<(u64, String)>, bus: Rc<RefCell<Vec<BusOp>>>,
+struct Rig { cs: CoSim, smb: Samba, mqtt: Mosquitto, card: std::path::PathBuf, id: String, lines: Vec<(u64, String)>, bus: Rc<RefCell<Vec<BusOp>>>,
              force: bool, forced_at: Option<u64>, pcs: Option<Vec<Sample>> }
 
-fn rig(prg_ns: u64, force: bool) -> Rig {
-    let dir = oxidrive_board::dir();
+fn rig(dir: &str, prg_ns: u64, force: bool) -> Rig {
     let csv_path = std::path::Path::new(&dir).join("nvs.csv");
     let csv = std::fs::read_to_string(&csv_path).unwrap_or_else(|e| panic!("{}: {e}", csv_path.display()));
     let (smb_at, mqtt_at) = (endpoint(&csv, "smb", 445), endpoint(&csv, "mqtt", 1883));
     let share = smb_at.path.split('/').next().filter(|s| !s.is_empty()).expect("a share in the smb:// URL").to_string();
     let smb = Samba::start(&share, SHARE_USER, SHARE_PASS).unwrap_or_else(|e| panic!("samba: {e}"));
     let mqtt = Mosquitto::start(BROKER_USER, BROKER_PASS).unwrap_or_else(|e| panic!("mosquitto: {e}"));
-    let (mut p4, board_log, card) = oxidrive_board::boot_card("oxidrive-latency.img", true, Some(4 << 30));
+    let (mut p4, board_log, card) = oxidrive_board::boot_in(dir, "oxidrive-latency.img", true, oxidrive_board::CardOpts { size: Some(4 << 30), ..Default::default() });
     let table = std::fs::read(format!("{dir}/partition-table.bin")).unwrap();
     let (off, size) = oxidrive_board::nvs_partition(&table).expect("an NVS partition in partition-table.bin");
     p4.write_flash(off, &oxidrive_board::nvs_image(&csv_path, size)).unwrap();
@@ -167,7 +167,7 @@ fn rig(prg_ns: u64, force: bool) -> Rig {
     let link = std::mem::replace(&mut periph.sdmmc.devices[i], Box::new(Nothing));
     periph.sdmmc.devices[i] = Box::new(Tap { inner: link, sdio: true, ops: bus.clone() });
     let pcs = std::env::var("LATENCY_PCS").is_ok_and(|v| v == "1").then(Vec::new);
-    Rig { cs, _smb: smb, mqtt, card, id, lines: Vec::new(), bus, force, forced_at: None, pcs }
+    Rig { cs, smb, mqtt, card, id, lines: Vec::new(), bus, force, forced_at: None, pcs }
 }
 
 impl Rig {
@@ -335,14 +335,15 @@ const RECENT: &str = "TeslaCam/RecentClips/2026-01-01_00-03-00-front.mp4";
 /// through the window; `shared` forces a pass at `FORCE_AT_NS`, otherwise none runs before the
 /// window ends. `OXIDRIVE_SD_PRG_US` (1000) is the card's programming time,
 /// `LATENCY_SECONDS` (40) the window, `OXIDRIVE_EVENT_MIB` (4) each saved event's size,
-/// `LATENCY_LABEL` names the run and `LATENCY_OUT` a directory for its rows.
-fn car_write_latency(shared: bool) {
+/// `LATENCY_LABEL` names the run and `LATENCY_OUT` a directory for its rows. `fixed` asserts what
+/// a reader that shares a lock with the car's writes must do (`FixedChecks`).
+fn car_write_latency(dir: &str, shared: bool, fixed: bool) {
     use esp_soc::usb_host::{fat32::{mp4_bytes, write_clip, Fat32}, msc::Msc, UsbHost};
     let prg_ns = env_u64("OXIDRIVE_SD_PRG_US", 1000) * 1000;
     let window_ns = env_u64("LATENCY_SECONDS", 40) * 1_000_000_000;
     let event_mib = env_u64("OXIDRIVE_EVENT_MIB", 4) as usize;
     let label = std::env::var("LATENCY_LABEL").unwrap_or_else(|_| if shared { "shared".into() } else { "alone".into() });
-    let mut r = rig(prg_ns, shared);
+    let mut r = rig(dir, prg_ns, shared);
     eprintln!("[latency] {label}: the card timed on a timed bus, programming {} us after each write", prg_ns / 1000);
     let events: Vec<Vec<u8>> = EVENTS.iter().map(|s| mp4_bytes(s, event_mib << 20)).collect();
     let wall = std::time::Instant::now();
@@ -414,18 +415,66 @@ fn car_write_latency(shared: bool) {
     assert!(data_writes as u64 >= window_ns / GAP_NS - 2, "{data_writes} data WRITE(10)s timed in the window");
     assert!(report.writes.iter().all(|w| w.t.ok), "a WRITE(10) failed");
     if shared { assert!(!reads.is_empty(), "the firmware never read the card after the force"); } else { assert!(report.reader.iter().all(|o| o.start_ns < window.0 || o.start_ns >= window.1), "the firmware read the card in the control's window"); }
+    if fixed {
+        let after: Vec<&str> = r.lines.iter().filter(|(t, _)| *t > forced).map(|(_, l)| l.as_str()).collect();
+        let held_back = EVENTS.len() - 1;
+        let archived = EVENTS[..held_back].iter().zip(&events)
+            .filter(|(stamp, ev)| std::fs::read(r.smb.path().join(format!("SavedClips/{stamp}/event.mp4"))).is_ok_and(|b| b == **ev)).count();
+        let checks = FixedChecks { report: &report, pass_ended: pass_end.is_some(), stopped_early: after.iter().any(|l| l.contains("stopped early")), archived, expected: held_back };
+        eprintln!("[latency] {label}: {}", checks.summary());
+        if let Err(e) = checks.verdict() { panic!("{label}: {e}; {}", checks.summary()); }
+    }
+}
+
+/// What a shared reader that shares a lock with the car's writes, and keeps libsmb2 off its core,
+/// must do (oxidrive's fix-shared-reader): every card read it sends is answered (none meets the
+/// card programming, `0x107`), no car command takes 100 ms or more, and the pass runs to its end
+/// with the events it was offered archived as the car wrote them.
+struct FixedChecks<'a> { report: &'a Report, pass_ended: bool, stopped_early: bool, archived: usize, expected: usize }
+
+impl FixedChecks<'_> {
+    fn unanswered(&self) -> usize { self.report.reader.iter().filter(|o| !o.answered).count() }
+    fn slow(&self) -> Vec<CmdTime> {
+        self.report.writes.iter().map(|w| w.t).chain(self.report.others.iter().copied()).filter(|c| c.latency_ns() >= 100_000_000).collect()
+    }
+    fn summary(&self) -> String {
+        format!("fixed-reader checks: {} firmware reads unanswered, {} car commands of 100 ms or more, the pass {}{}, {} of {} events archived",
+                self.unanswered(), self.slow().len(), if self.pass_ended { "ended" } else { "did not end" }, if self.stopped_early { " early" } else { "" }, self.archived, self.expected)
+    }
+    fn verdict(&self) -> Result<(), String> {
+        if self.unanswered() > 0 { return Err("the card did not answer a firmware read: it met the card programming the car's write".into()); }
+        if !self.slow().is_empty() { return Err(format!("car commands of 100 ms or more: {:?}", self.slow())); }
+        if !self.pass_ended || self.stopped_early { return Err("the pass did not run to its end".into()); }
+        if self.archived != self.expected { return Err("not every event offered was archived as the car wrote it".into()); }
+        Ok(())
+    }
+}
+
+/// The firmware `fixed` holds to: `OXIDRIVE_READER_DIR`, else oxidrive's fix-shared-reader build in
+/// the fixtures.
+fn reader_dir() -> String {
+    std::env::var("OXIDRIVE_READER_DIR").unwrap_or_else(|_| format!("{}/Code/dlp/sim-fixtures/esp32p4/oxidrive-fix-reader", std::env::var("HOME").unwrap_or_default()))
 }
 
 /// The shared pass reading alongside the car; `OXIDRIVE_DIR` picks the firmware (a reader chunk
 /// variant or the baseline).
 #[test]
 #[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
-fn external_car_write_latency_under_a_shared_reader() { car_write_latency(true); }
+fn external_car_write_latency_under_a_shared_reader() { car_write_latency(&oxidrive_board::dir(), true, false); }
 
 /// The control: the same car and firmware, no pass in the window.
 #[test]
 #[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
-fn external_car_write_latency_alone() { car_write_latency(false); }
+fn external_car_write_latency_alone() { car_write_latency(&oxidrive_board::dir(), false, false); }
+
+/// The shared pass of oxidrive's fix-shared-reader (`OXIDRIVE_READER_DIR`): no read meets the card
+/// programming, no car command of 100 ms or more, and the pass archives both events it was
+/// offered. oxidrive 728b71f fails it at every `OXIDRIVE_SD_PRG_US`. At 2000 the pass's summary
+/// came at 74 s, inside the 30 s the run waits after the car's last write (61 s); a slower SMB
+/// path could push it past that.
+#[test]
+#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_READER_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_a_shared_pass_completes_without_racing_the_car() { car_write_latency(&reader_dir(), true, true); }
 
 /// The analysis on a made-up run: the car's READ(10) transfers are not the reader's, and a
 /// WRITE(10) counts the reader's and the link's bus time inside it.
@@ -440,4 +489,22 @@ fn the_reader_is_what_the_car_did_not_ask_for() {
     assert_eq!(rep.reader.iter().map(|o| o.arg).collect::<Vec<_>>(), [9000, 60], "the car's own READ(10) at block 50 is not the reader's");
     assert_eq!(rep.writes.len(), 2, "both WRITE(10)s start in the window");
     assert_eq!(rep.writes.iter().map(|w| (w.reader_ns, w.sdio_ns)).collect::<Vec<_>>(), [(100, 50), (20, 0)]);
+}
+
+/// The fixed-reader checks on made-up runs: each of an unanswered read, a slow car command, a pass
+/// that stopped early and a missing event fails them.
+#[test]
+fn the_fixed_reader_checks_fail_on_each_hazard() {
+    let cmd = |op, submit_ns, done_ns| CmdTime { op, lba: 1000, blocks: 128, submit_ns, done_ns, ok: true };
+    let read = |answered| BusOp { sdio: false, cmd: CMD_READ_MULTIPLE, arg: 9000, start_ns: 10, end_ns: 20, bytes: 32768, answered, resp: 0 };
+    let report = |slow: bool, answered| Report::new(&[cmd(WRITE10, 0, if slow { 100_000_000 } else { 2_620_000 })], &[read(answered)], (0, 1_000_000_000), Some((0, 1_000_000_000)));
+    let fails = |c: FixedChecks| c.verdict().is_err();
+    let (good, slow, refused) = (report(false, true), report(true, true), report(false, false));
+    let checks = |report, pass_ended, stopped_early, archived| FixedChecks { report, pass_ended, stopped_early, archived, expected: 2 };
+    assert!(!fails(checks(&good, true, false, 2)), "a clean run passes");
+    assert!(fails(checks(&refused, true, false, 2)), "an unanswered read");
+    assert!(fails(checks(&slow, true, false, 2)), "a car command of 100 ms");
+    assert!(fails(checks(&good, false, false, 2)), "a pass that never ended");
+    assert!(fails(checks(&good, true, true, 2)), "a pass that stopped early");
+    assert!(fails(checks(&good, true, false, 1)), "an event not archived");
 }
