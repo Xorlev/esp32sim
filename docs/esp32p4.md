@@ -1436,7 +1436,7 @@ One run, 447 s emulated (1,215 s on the host):
 | written | 1,584 chunks, 104 MB; 268 clips deleted by the rotation |
 | landings | data 1,586: written to landed median 2.53 s, 99th percentile 4.94 s, max 5.00 s; metadata 183: median 32.4 s, max 35.0 s. Behind their schedule by at most 20 ms: the shared passes' contention never pushed a landing late |
 | shared passes | 9; 72 clips uploaded; 2 stopped early on `card busy with the car` (a read the card did not answer while programming), 2 clips discarded by the watch because the car wrote them while they were read, 2 walks of a folder failed |
-| windows | 208.3 s (1.3 s, nothing new), 414.3 s (22.2 s, 17 clips), 440.8 s (1.3 s, forced, nothing new); the car's 2 s poll happened to fall inside all three |
+| windows | 208.3 s (1.3 s, nothing new), 414.3 s (22.2 s, 17 clips), 440.8 s (1.3 s, forced, nothing new); the car's 2 s poll fell inside all three, by phase: a 2 s poll meets a 1.3 s window with probability 0.65 (arithmetic) |
 | uploads against the car's files | 72 by shared passes and 17 by windows, every one equal to the car's file: **no torn or prefix clip archived as finished** |
 
 The 238 copies of the medium, judged as a reader without a dirty log would judge them (each Saved
@@ -1680,9 +1680,12 @@ the update refusal (goal 4) still stops on SHA's DMA mode ("An update").
 **What part 1 leaves open**:
 
 - When oxidrive changes (refusing commands while it holds the card, UNIT ATTENTION when it gives
-  the card back, a window that writes held long enough, reads that wait for a ready card), the
-  hazard tests that assert today's behaviour fail by design: turn their assertions round and keep
-  them.
+  the card back, a window that writes held long enough, reads that wait for a ready card, a
+  listing that counts an unreadable entry as a failure), the hazard tests that assert today's
+  behaviour fail by design: turn their assertions round and keep them.
+- Shared reading stayed on in every run here; the item-5 work on another branch saw a boot-sector
+  read in `Card::geometry()` meet the card programming and turn shared reading off until a reboot.
+  A different interleaving, not a contradiction: a run that meets it has no shared passes.
 - Where the sources stop, the car's reactions are assumptions: what Tesla's MCU does after a
   medium change (here it reads the volume again, after an fsck when the volume is dirty, which it
   is while mounted), after a USB reset (here an fsck rewriting both FATs whole), and whether it
