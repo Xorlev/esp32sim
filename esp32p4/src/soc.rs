@@ -146,6 +146,7 @@ impl esp_soc::SocBus for SocBus {
         p.spi1.jedec = old.spi1.jedec;
         p.psram1.psram_mr = old.psram1.psram_mr;      // the PSRAM keeps its mode registers
         p.gpio.g.strap = old.gpio.g.strap;
+        p.tsens.celsius = old.tsens.celsius;
         // The card in the socket keeps its power and its state; IDF's init resets it with CMD0.
         p.sdmmc.devices = old.sdmmc.devices;
         p.sdmmc.stats = old.sdmmc.stats;

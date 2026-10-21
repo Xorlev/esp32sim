@@ -18,6 +18,8 @@ impl Regi2c {
             self.0.insert((host << 16) | (control & 0xffff), (control >> 16) as u8);
         }
     }
+    /// The last value written to `reg` of analog `block` through `host`, if any.
+    pub fn get(&self, host: u32, block: u8, reg: u8) -> Option<u8> { self.0.get(&((host << 16) | (reg as u32) << 8 | block as u32)).copied() }
 }
 #[cfg(test)]
 mod tests {
@@ -31,5 +33,6 @@ mod tests {
         r.write(4, 0x00ff0762);
         assert_eq!(r.read(4, 0x0762, |_| &0), 0x00a50762);
         assert_eq!(r.read(4, 0x03ff0762, |_| &0), 0x01ff0762);
+        assert_eq!((r.get(4, 0x62, 0x07), r.get(0, 0x62, 0x07)), (Some(0xa5), None));
     }
 }

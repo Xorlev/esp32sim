@@ -577,6 +577,18 @@ mod tests {
         assert!(esp_soc::SocBus::usb_link(&mut b).unwrap().port().connected);
     }
 
+    /// The die keeps its temperature through a chip reset; the restarted driver writes its range
+    /// again and reads it.
+    #[test]
+    fn a_chip_reset_keeps_the_die_temperature() {
+        let mut b = SocBus::new(0x1000, [0; 6], (1, 0));
+        b.periph.tsens.celsius = 31.0;
+        esp_soc::SocBus::reboot(&mut b, [0; 6]);
+        b.write32(0x5012_4000, 0x69 | 6 << 8 | 1 << 24 | 15 << 16).unwrap();
+        b.write32(0x5012_f000, 1 << 22).unwrap();
+        assert_eq!(b.read32(0x5012_f000).unwrap() & 0x1ff, 1 << 8 | 117, "(31 + 20.52) / 0.4386 = 117.46");
+    }
+
     /// Core 1 sees its own CLIC block at 0x20800000 and core 0's at 0x20810000.
     #[test]
     fn the_clic_window_is_per_core() {

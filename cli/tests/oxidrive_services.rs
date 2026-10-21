@@ -60,13 +60,6 @@ fn hosted_slave(nat: Nat) -> esp32c6::Machine {
     c6
 }
 
-/// LP_TSENS CTRL (0x5012F000; IDF v5.5.3 soc/esp32p4/register/hw_ver1/soc/tsens_struct.h): OUT in
-/// bits 7:0. The block is register RAM here; the driver only read-modify-writes the other fields,
-/// so a seeded OUT stays. 104 reads as 25 C in the -10..80 C range oxidrive asks for (offset 0:
-/// 0.4386 * OUT - 20.52, temperature_sensor_ll.h). Without a reading every window is vetoed.
-const TSENS_CTRL: u32 = 0x5012_f000;
-const TSENS_OUT_25C: u32 = 104;
-
 /// The firmware, its card and both services, the pair joined: the C6's network forwards the
 /// two guest addresses nvs.csv names to the services, and refuses everything else.
 struct Rig { cs: CoSim, smb: Samba, mqtt: Mosquitto, card: std::path::PathBuf, id: String, lines: Vec<(u64, bool, String)>, samples: Vec<Sample> }
@@ -89,7 +82,6 @@ fn rig(card_name: &str, card_bytes: u64, car: bool) -> Rig {
     let table = std::fs::read(format!("{dir}/partition-table.bin")).unwrap();
     let (off, size) = oxidrive_board::nvs_partition(&table).expect("an NVS partition in partition-table.bin");
     p4.write_flash(off, &oxidrive_board::nvs_image(&csv_path, size)).unwrap();
-    emu_core::Bus::write32(&mut p4.bus, TSENS_CTRL, TSENS_OUT_25C).unwrap();
     if std::env::var_os("ESP_EMU_DEBUG").is_some() { p4.set_debug(&esp_soc::DebugFlags::from_env()); }
     if car { esp_soc::SocBus::attach_usb_host(&mut p4.bus, Default::default()).unwrap(); }
     // the firmware's id: the factory MAC's last three bytes (its main.rs)
