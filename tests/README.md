@@ -65,6 +65,8 @@ writes) is `tests/oxidrive_rig.rs`. `cli/tests/oxidrive_hazards.rs` runs a later
 (`OXIDRIVE_CURRENT_DIR`) against the car's hazards of milestone 4c: writes into a window, a car
 keeping its FAT, windows shorter than its poll, Linux's writeback, the fsck burst after a mount,
 and the die temperature after a restart (esp32p4.md, "The car's hazards").
+`cli/tests/oxidrive_latency.rs` times every car command while oxidrive's shared pass reads the
+card (`OXIDRIVE_SD_PRG_US`, `LATENCY_*`; esp32p4.md, "Car write latency under a shared reader").
 `sd_image::fsck` checks a card image's volume with the system's FAT checker (`fsck_msdos -n`,
 `fsck.fat -n`, or `FSCK_FAT`); `external_fat32_tree_passes_fsck` holds the car's long-name and
 directory writes to it.

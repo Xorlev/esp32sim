@@ -1506,6 +1506,216 @@ small writes cause, about 2.7 times real time with the pair running.
    each read (finding 1) would also address. The first pass after boot comes well after the car's
    fsck at the mount.
 
+## Car write latency under a shared reader
+
+Tesla reports a drive as too slow when its writes take too long; how long is not known. While the
+car records, oxidrive's shared pass reads the card through the SDMMC host the car's writes go
+through (slot 0), which ESP-Hosted's SDIO link shares (slot 1). The firmware's shared-reading plan
+asks for the car's per-WRITE(10) latency with reader chunks of 16, 32, 64 and 128 KiB, and knows
+that a read meeting the card while it programs the car's last write is not answered (`0x107`,
+card status `0x400e00`). `cli/tests/oxidrive_latency.rs` measures both (milestone 4c, item 5):
+
+- A reader transfer adds at most its own time on the bus to a car write that meets it: 0.8, 1.7,
+  3.4 and 6.7 ms for 16, 32, 64 and 128 KiB at 4 bits and 40 MHz. The cost is linear in the
+  chunk, with no knee, and the reader's rate does not depend on it (its 1 MB/s pacer and SMB set
+  it).
+- With the card programming for 1 or 2 ms after each write, 23 of 24 passes met that race and
+  stopped, after at most 7.8 MB. When the race hits the boot-sector read a pass starts
+  with, shared reading stays off until the next boot. No chunk size avoids it.
+- The car's worst waits, 50 to 250 ms, were not bus time. The reader runs in the firmware's main
+  task, pinned to core 0; it held the SD host's request mutex while libsmb2's software AES (SMB3
+  signing) held core 0, and the car's USB task waited for the mutex with core 1 idle. More reader
+  commands mean more chances: the firmware as it stands reads 512 bytes at a time, because its
+  buffer is not cache-line aligned, and was hit hardest. With the SMB thread pinned to core 1
+  there were none.
+
+### What sets the size of a shared read
+
+From oxidrive's source (not in this repository):
+
+- `SharedCardSource::open` hands the archiver a `ChainReader`, which reads one cluster per call
+  into a cluster-sized `Vec<u8>` (`app/src/storage/shared_source.rs`). The clusters are 32 KiB, as
+  on the owner's card.
+- Each read first pays a token bucket of 1 MB/s (`DEFAULT_READ_BYTES_PER_S`). Refill is capped at a
+  second's worth, so after an SMB stall the reader can read up to 1 MB back to back.
+- The archiver fills a 1.5 MiB transfer buffer from it (`size_buffer`: the SMB sink's
+  `transfer_size()`, `MAX_WRITE` 64 KiB times `INFLIGHT` 24, in `pipeline/src/archiver.rs` and
+  `oxidrive-smb/src/sink.rs`) and queues it for the SMB thread, three deep. That sets how much is
+  read between hand-offs, not the size of a card read.
+- `Vec<u8>` promises no alignment, and IDF v5.5.3's `sdmmc_read_sectors` reads a buffer that fails
+  the cache-line check one block at a time through a bounce buffer (`sdmmc_cmd.c`). In the emulator
+  every shared read of the current firmware is a one-block CMD17: its chunk is 512 bytes. The
+  archiver's own buffer is aligned for that reason (`Aligned64`); the reader's is not.
+- The FAT walker (listing, chain walks) reads single sectors.
+
+The sweep's builds change only the reader: a `READ_CHUNK` constant and a 64-byte-aligned chunk
+buffer in `ChainReader` (contiguous clusters in one read), one build per size. The 32 KiB build
+reads what the current firmware reads, aligned. None of the builds is in this repository.
+
+### Method
+
+`external_car_write_latency_under_a_shared_reader` and the control
+`external_car_write_latency_alone` run the rig of "Services" against `OXIDRIVE_DIR`'s build:
+
+- **The card**: a 4 GiB FAT32 image with 32 KiB clusters, the bus timed on both slots (the card and
+  the SDIO link, as `--sd-timing`), programming for `OXIDRIVE_SD_PRG_US` after each write. 1000
+  and 2000 µs are assumptions until a card is measured; 0 is a diagnostic arm in which the race
+  cannot happen.
+- **The car**: enumerates, records three 4 MiB saved events (`TeslaCam/SavedClips/<stamp>/event.mp4`),
+  then one long RecentClips clip at a 4.1 MB/s camera, 64 KiB due every 16 ms (`write_clip`). Each
+  chunk is a WRITE(10) of 128 blocks and the vfat-like FAT update after it: a one-block READ(10)
+  and two one-block WRITE(10)s.
+- **The pass**: forced with `force_open` once the MQTT session is up, at 9.0 s. The firmware holds
+  the newest event back, so the pass has two 4 MiB clips to read. The control forces nothing; the
+  firmware's own first pass is due at 60 s, after the window.
+- **The measurement**: `Msc::times` times every car command from its CBW to its checked CSW, over
+  the 40 s from 0.5 s after the force. A tap on each SD device logs every command at its emulated
+  time, so each WRITE(10) carries the bus time the firmware's own card reads (the reader) and the
+  SDIO link took inside it.
+- Each cell ran twice (32 KiB with no programming time three times): 39 runs of 2 to 4.5 minutes,
+  four at a time.
+
+What a WRITE(10)'s latency covers: esp_tinyusb takes it in 32 KiB halves and defers each half's
+card write to the TinyUSB task (`tud_msc_write10_cb`, `tinyusb_msc.c`), so the CSW follows the
+first half's CMD25 and its programming, and the second half is written after the CSW. Alone, a
+64 KiB WRITE(10) takes 2.62 ms with no programming time, 3.62 ms with 1 ms, 4.62 ms with 2 ms. A
+delay to the second half shows in the car's next command.
+
+The timed bus sent the auto-stop's CMD12 to the card at the command's start, so a multi-block
+write's programming was over before its data was in. It now goes at the end of the data phase
+(`a_timed_multi_block_write_programs_from_its_auto_stop`); the runs with a programming time are
+from after that fix.
+
+### Results
+
+No programming time, two runs each ("a-b" when the runs differ). "Met the reader": data WRITE(10)s
+with reader bus time inside them, and the most of it in one.
+
+| reader | transfers in the window | data WRITE(10), ms: median / p90 / p99 / max | met the reader | those, ms: median / p99 | car commands of 100 ms or more | worst car command | car behind the camera | reader over the pass |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| none (control) | | 2.63 / 2.63 / 2.63 / 2.63 | | | 0 | 2.63 ms | never | |
+| current firmware, 512 B | 2880 CMD17 | 2.63 / 2.63-2.75 / 2.87-2.88 / 247 | 37-39 (1.5%), 0.57 ms | 2.88 / 247 | 7-8 | 247 ms | 178-196 chunks, up to 1.8 s | 1.8 MB at 0.29 MB/s, then stopped by its own guard |
+| 16 KiB | 496 CMD18 | 2.62 / 2.63-2.75 / 3.25 / 3.6-252 | 106-117 (4.2-4.7%), 1.7-2.4 ms | 2.88 / 3.50-4.25 | 4 | 249-252 ms | 71-80, up to 0.30 s | 8.5 MB, 0.20 MB/s |
+| 32 KiB | 250 CMD18 | 2.62 / 2.62-2.75 / 2.87-3.37 / 4.13-4.25 | 49 (2.0%), 1.67 ms | 2.62-3.37 / 4.13-4.25 | 2 | 171-242 ms | 39-51, up to 0.23 s | 8.5 MB, 0.20 MB/s |
+| 64 KiB | 127 CMD18 | 2.62 / 2.62 / 2.75 / 5.88 | 25-27 (1.0%), 3.37 ms | 5.12 / 5.88 | 2 | 145 ms | 29, up to 0.14 s | 8.7 MB, 0.20 MB/s |
+| 128 KiB | 66 CMD18 | 2.63 / 2.63-2.75 / 2.75 / 9.25 | 9-10 (0.4%), 6.74 ms | 9.25 / 9.25 | 0 | 15.4 ms | 0-1, 22 ms | 8.9 MB, 0.21 MB/s |
+| 32 KiB, SMB thread on core 1 | 250 CMD18 | 2.62 / 2.62-2.63 / 2.75 / 4.12 | 40-41 (1.6%), 1.74 ms | 2.62 / 4.12 | 0 | 5.4 ms | never | 8.5 MB, 0.20 MB/s |
+
+Every data WRITE(10)'s minimum is 2.62 ms. The longest run of consecutive data WRITE(10)s meeting
+the reader was 23-25 for 512-byte reads, 13-21 for 16 KiB, 4 for 32 KiB and 1-3 above. The reader
+read at its pacer's 1 MB/s in bursts (median gaps 16, 33, 65 and 131 ms between transfers) and
+otherwise waited on SMB: 0.2 MB/s over the pass, both clips uploaded.
+
+With a programming time, the race ends the pass first. "Ended" gives each run's first unanswered
+firmware read and what was read before it:
+
+| reader | programming | data WRITE(10), ms: median / p99 / max | car commands of 100 ms or more | the pass ended |
+| --- | --- | --- | --- | --- |
+| none (control) | 1 ms | 3.62 / 3.63 / 3.63-3.75 | 0 | its own pass at 60.2 s: the boot-sector read (CMD17 LBA 0) in both runs; shared reading off until reboot |
+| none (control) | 2 ms | 4.63 / 4.75 / 4.75-4.87 | 0 | its own pass at 60.4 s: a FAT read while listing, in both runs |
+| current firmware, 512 B | 1 ms | 3.62 / 3.63 / 3.63-3.75 | 0 | a FAT read while listing, 9.2 s, nothing read (both runs) |
+| current firmware | 2 ms | 4.63 / 4.75 / 4.75 | 0 | a clip block at 9.35 s after 0.16 MB; the root directory at 9.22 s |
+| 16 KiB | 1 ms | 3.62 / 3.63-3.75 / 4.25-240 | 0-1 | 12.1 s after 3.0 MB; 10.8 s after 1.6 MB |
+| 16 KiB | 2 ms | 4.62 / 4.75-4.88 / 4.75-227 | 0-3 | 9.6 s after 0.4 MB; no race, stopped at 12.0 s by its own guard after 2.6 MB |
+| 32 KiB | 1 ms | 3.62 / 3.63-3.75 / 3.75-5.12 | 0-1 | 11.6 s after 2.4 MB; a FAT read at 9.2 s, nothing read |
+| 32 KiB | 2 ms | 4.62 / 4.75-4.87 / 6.25 | 0 | 35.7 s after 4.7 MB, one clip uploaded; 35.6 s after 4.3 MB, one clip |
+| 64 KiB | 1 ms | 3.62 / 3.63-3.75 / 3.75-7.13 | 0-2 | 32.4 s after 4.3 MB, one clip; 10.9 s, nothing read |
+| 64 KiB | 2 ms | 4.62 / 4.75-4.87 / 7.25 | 0 | 35.7 s after 4.6 MB, one clip; 38.1 s after 7.8 MB, one clip |
+| 128 KiB | 1 ms | 3.63 / 3.63 / 9.25 | 0 | 10.0 s after 0.7 MB (both runs) |
+| 128 KiB | 2 ms | 4.63 / 4.75 / 4.75 | 0 | a FAT read at 9.2 s; 9.8 s after 0.5 MB |
+
+Every WRITE(10) in the windows ended with good status, and every clip read back off the image as
+the car wrote it.
+
+### The stalls: a priority inversion
+
+During each long stall the card bus is idle: no command from the reader or from the car for 50 to
+250 ms. Sampling both P4 cores' PCs (`LATENCY_PCS=1`) puts core 0 in libsmb2's AES-CMAC
+(`smb3_aes_cmac_128`, `AES128_ECB_encrypt_reference`) and core 1 in `esp_cpu_wait_for_intr` for
+the whole stall; interrupts stay enabled on both, the SDMMC interrupt on core 0 and USB-OTG's on
+core 1. The stall ends when the SMB thread next runs on core 1. The sequence, from the bus and the
+sources:
+
+1. The reader, in the main task (priority 1, pinned to core 0), sends a command inside
+   `sdmmc_host_do_transaction`, which holds the host's request mutex until the command's event is
+   handled (IDF v5.5.3 `sdmmc_transaction.c`).
+2. The command completes; its interrupt makes the main task ready, but the SMB thread (a pthread at
+   priority 5, no affinity) is running on core 0, so the main task waits.
+3. The car's next command reaches the TinyUSB task (priority 24, pinned to core 1), which blocks on
+   the request mutex. FreeRTOS raises the main task's priority to 24 (`xTaskPriorityInherit`,
+   `tasks.c`) but does not make core 0 reschedule, and core 0's tick switches only for a task the
+   tick itself unblocked, for time slicing at the running task's priority, or for a pending yield.
+4. Core 0 runs the SMB thread's signing until it blocks, and only then the main task, which
+   releases the mutex.
+
+More reader commands give step 2 more chances, which is why 512-byte reads stall most and 128 KiB
+not in these runs. The pacer does not help: the window opens while the reader holds the mutex,
+whatever the budget. Two ways out, the first measured: keep libsmb2 off core 0 (the SMB
+thread pinned to core 1: no stall, the car never behind, the same 0.20 MB/s), or run the reader
+at a priority above the SMB thread. The signing load exists because the test's samba requires
+signing ("Services"); whether the owner's NAS does is not known here.
+
+### The bus race
+
+A reader's command that meets the card programming the car's last write is not answered: on the
+bus, a CMD18 with no response, and the reader's own CMD13 after it answered `0x400e00`
+(ILLEGAL_COMMAND in prg), the card's status the board reported. IDF logs it as
+`sdmmc_read_sectors_dma: sdmmc_send_cmd returned 0x107, status 0x400e00` (`sdmmc_cmd.c`); that line
+goes to oxidrive's syslog hook (`esp_log_set_vprintf`), not to the UART this test reads. What
+oxidrive does next:
+
+- In a pass, `CardBlocks` latches the failure: every later read in the pass is refused without
+  touching the card, the clip being uploaded fails (its `.part` stays on the share to resume), and
+  the pass ends. It logs `shared: ... stopped early: card busy with the car` only when it uploaded
+  or refused something; otherwise only its `scan: shared` line marks the end. The next attempt is
+  the next pass, 60 s later.
+- `main.rs` reads the boot sector again (`Card::geometry`) before every pass. If that read meets
+  the race, the firmware logs `shared: no FAT geometry; not reading alongside the car` and turns
+  shared reading off until the next boot. Both control runs at 1 ms lost it that way at their
+  first pass.
+- The card recovers by itself: ILLEGAL_COMMAND clears with the response that reports it, and the
+  car's writes, whose CSWs went out before their second halves reached the card, all landed.
+
+The driver's writes return only after CMD13 reports the card ready, but each poll is its own
+transaction, so the request mutex is free between polls and the reader's command lands in prg. With
+the car writing four times per 16 ms (two halves of 32 KiB, two FAT sectors), the card programs
+for about a quarter of the time at 1 ms, half at 2 ms, and no pass here got past 7.8 MB.
+
+### What the data support
+
+The chunk's own cost is the time one transfer holds the bus, paid by the car write that meets it:
++0.8, +1.7, +3.4, +6.7 ms. It grows linearly with the chunk; nothing bends. A bigger chunk buys
+fewer commands, which matters here only through the inversion and the race, and does not raise
+the reader's rate, which is the pacer's. 32 KiB, one cluster in an aligned buffer, keeps a colliding
+write under 2 ms over its baseline in one command per cluster; 64 KiB doubles that; 128 KiB nearly
+quadruples a 64 KiB write's time with no programming time (9.25 against 2.63 ms). Without Tesla's
+threshold, 32 KiB is the size these runs support, 64 KiB if each command costs more on silicon.
+
+Three things matter more than the chunk, in order: the race (the reader has to wait for the card,
+or share a lock with the write tap that covers the write and its CMD13 polls, as the plan
+proposes; and a refused read should not end the pass, or shared reading for the boot), the
+inversion above, and the reader's alignment, without which a 32 KiB read is 64 commands.
+
+### Limits
+
+- **Lower bounds.** The CPUs run one instruction a cycle with no cache or PSRAM stalls, so the
+  signing, the drivers and TinyUSB all take longer on silicon, and the stalls would last longer.
+- **The card.** Its read access time and the IDMAC's pace are not timed: a read holds the bus for
+  its wire time only. The programming time is an assumption, the same after every write; a real
+  card's busy time varies and can run far longer (internal garbage collection). It wants a value
+  measured on the owner's card.
+- **The car.** 64 KiB WRITE(10)s every 16 ms with a vfat-like FAT update after each, not Linux's
+  writeback (larger writes back to back, metadata held back), so how often a write meets the reader
+  and how often the card programs are this car's.
+- **The network.** The NAT's 5840-byte window holds SMB to about 0.2 MB/s ("Upload throughput"),
+  so the reader waits on SMB most of a pass and met at most 5% of the car's data writes. At the
+  board's 2 MB/s it would read at its 1 MB/s pace and meet about five times as many, at the same
+  cost per write.
+- **Repeats.** The servers answer in host time, so two runs of one cell differ in which commands
+  collide (16 KiB's worst data write: 3.6 ms in one run, 252 ms in the other). Counts of stalls are
+  small numbers.
+- **Tesla's threshold** can only be found on the car, with the firmware plan's delay-injection probe.
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,
@@ -1587,6 +1797,11 @@ car meanwhile; with the co-processor it comes up ("The co-processor").
 - **A chip reset must keep the analog registers.** The bootloader reads the CPLL's dividers back
   over regi2c when HP_ROOT is still on the CPLL, which every reset but `esp_restart`'s leaves it
   on; re-created with the digital peripherals, they read 0 and the bootloader aborted.
+- **A timed auto-stop reached the card at the command's start.** `Sdmmc::finish` sent the CMD12
+  with the time of the register write that started the command, so with `--sd-timing` a
+  multi-block write began programming before its data had crossed the bus and a 32 KiB write hid
+  up to 1.7 ms of programming time. Found by the car-latency runs; it now goes at the end of the
+  data phase.
 - **A restarted P4 glitches EN.** ESP-Hosted makes GPIO 54 an output (its output latch still 0
   after the reset) before it writes the level (`transport_gpio_reset`), so EN is low for a few
   instructions; a slice end can see that, so EN needs the C6's t_RST before it resets the chip.
@@ -1659,13 +1874,13 @@ the update refusal (goal 4) still stops on SHA's DMA mode ("An update").
 
 **What is left of 4c**, numbered as the handoff numbered it:
 
-5. **Car write latency under a shared reader**: the car at 4 MB/s with a programming time
-   (`--sd-prg-us`, `SdCardConfig::prg_ns`) while a shared pass runs, and the per-WRITE(10)
-   latency distribution for reader chunks of 16, 32, 64 and 128 KiB. `Msc` would record each
-   command's time; the reader's chunk is the firmware's. The emulator runs one instruction a
-   cycle with no cache or PSRAM stalls, so these are lower bounds. A reader's CMD18 that meets
-   the card programming gets no response (0x107, status 0x400e00; "The card"), which the hazard
-   runs saw end windows and passes.
+5. **Car write latency under a shared reader**, done ("Car write latency under a shared reader"):
+   `Msc::times`, `cli/tests/oxidrive_latency.rs`, reader chunks of 512 bytes (the firmware as it
+   stands) and 16 to 128 KiB with no, 1 and 2 ms of programming. A transfer costs a colliding car
+   write its wire time; every pass with a programming time met the 0x107 race and stopped; the
+   long waits were a priority inversion with libsmb2's signing on core 0. What is left is the
+   firmware's (a race-free reader, the inversion, the buffer's alignment) and a measured
+   programming time.
 7. **The network under the firmware**: the NAT's window and window scaling, an MSS option in its
    SYN-ACK, and the round trip taken apart (where the 10.7 ms go) before the rate is compared
    with the board's; first why a window of 16384 or 65535 bytes stalls the first 1.5 MB write
