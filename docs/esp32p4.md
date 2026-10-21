@@ -1528,6 +1528,10 @@ card status `0x400e00`). `cli/tests/oxidrive_latency.rs` measures both (mileston
   commands mean more chances: the firmware as it stands reads 512 bytes at a time, because its
   buffer is not cache-line aligned, and was hit hardest. With the SMB thread pinned to core 1
   there were none.
+- oxidrive's `fix-shared-reader` build shares a lock with the car's writes, retries a refused
+  read, reads 32 KiB at a time and holds the card at priority 23: at 0, 1 and 2 ms no read went
+  unanswered, no car command took 100 ms, and every pass archived both events ("The fixed
+  reader", asserted by `external_a_shared_pass_completes_without_racing_the_car`).
 
 ### What sets the size of a shared read
 
@@ -1715,6 +1719,68 @@ inversion above, and the reader's alignment, without which a 32 KiB read is 64 c
   collide (16 KiB's worst data write: 3.6 ms in one run, 252 ms in the other). Counts of stalls are
   small numbers.
 - **Tesla's threshold** can only be found on the car, with the firmware plan's delay-injection probe.
+
+### The fixed reader
+
+oxidrive's branch `fix-shared-reader` (6adb83d, not in this repository) changes the reader along
+the lines above:
+
+- **A lock with the car's writes.** One FreeRTOS mutex. The firmware's write tap (its linker wrap
+  of `sdmmc_write_sectors`) holds it across each car write, which returns only once CMD13 reports
+  the card back in TRAN, and the reader holds it for one transfer. A car write waits at most
+  10 ms for it, then writes without it.
+- **Refused reads retried.** After 2, 4, ... 256 ms; three reads that fail every try in a row, or
+  eight in a pass, end the pass and nothing more. The boot sector is no longer read before each
+  pass: the geometry from the card probe is kept, and read again only after the car writes the
+  boot sector.
+- **32 KiB reads**, aligned, contiguous clusters in one transfer (the 32 KiB build above).
+- **The reader at priority 23 while it holds the card**, above the SMB thread (5) and below the
+  TinyUSB task (24), so made ready on core 0 it preempts libsmb2's signing whatever priority
+  inheritance does.
+
+`external_a_shared_pass_completes_without_racing_the_car` runs the scenario of "Method" against
+the build in `OXIDRIVE_READER_DIR` (default the fixtures' `oxidrive-fix-reader`) and asserts:
+every firmware read answered, no car command of 100 ms or more in the window, the pass's `scan:
+shared` line with no `stopped early`, and both older events on the share byte for byte.
+`the_fixed_reader_checks_fail_on_each_hazard` checks the checks on made-up runs. Two runs per
+cell, three at a time:
+
+| build | programming | data WRITE(10), ms: median / p99 / max | worst car command | car commands of 100 ms or more | unanswered firmware reads | the pass | MB/s over it | test |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 728b71f | 0 | 2.63 / 2.88 / 247 | 247 ms | 8 | 0 | stopped by its own guard at 15.4 s, 1.8 MB read, nothing archived | 0.30 | fails |
+| 728b71f | 1 ms | 3.62 / 3.63 / 3.63-3.87 | 3.87 ms | 0 | 1 | ended at 9.2-9.6 s after 0-0.4 MB, nothing archived | | fails |
+| 728b71f | 2 ms | 4.63 / 4.75 / 4.75 | 4.75 ms | 0 | 1 | ended at 9.2 s, nothing read | | fails |
+| fix-shared-reader | 0 | 2.63 / 3.25 / 4.25-4.38 | 5.25-5.37 ms | 0 | 0 | both events archived, summary at 51.7 s | 0.20 | passes |
+| fix-shared-reader | 1 ms | 3.62 / 3.87 / 5.37 | 6.25 ms | 0 | 0 | both events archived, 54.5 s | 0.19 | passes |
+| fix-shared-reader | 2 ms | 4.63 / 4.88 / 6.00-6.12 | 7.25-7.37 ms | 0 | 0 | both events archived, 61.1-61.2 s | 0.16 | passes |
+
+The 728b71f rows are one run each (0 ms twice, the same both times). A fixed build's data
+WRITE(10) meets a reader transfer 4-6 times in a run, never more than 1.84 ms of bus inside one,
+and no read was retried. Every WRITE(10) ended with good status and the card held every clip as
+the car wrote it.
+
+At 2 ms the car's own commands for a chunk (the 64 KiB WRITE(10), the FAT sector's READ(10) and
+two one-block WRITE(10)s) fill about 15.9 of its 16 ms, so the reader's bus time, about 1.7 ms
+per transfer five times a second, accumulates: in every fixed run at 2 ms the car started 10
+chunks a whole chunk or more late, at most 30 ms. At 0 and 1 ms it kept up (at most 6.4 ms
+late). 728b71f's passes ended before that could happen.
+
+The inversion fix was chosen by measuring the others, from scratch commits of the same branch
+(`sim-fix-reader-*` in oxidrive's repository; the `fixed` checks applied to each):
+
+| build | programming | runs | car commands of 100 ms or more | worst car command | MB/s over the pass |
+| --- | --- | --- | --- | --- | --- |
+| the lock and retries only, the SMB thread floating | 0 / 1 / 2 ms | 2 / 1 / 1 | 2-3 / 4 / 3 | 203 / 223 / 195 ms | 0.20 / 0.19 / 0.16 |
+| the same, with the SMB thread pinned to core 1 | 0 / 1 / 2 ms | 2 / 2 / 2 | 0 | 5.25 / 6.37 / 7.37 ms | 0.20 / 0.16 / 0.13 |
+| the same, with the reader at priority 23 (the shipped fix) | 0 / 1 / 2 ms | 2 / 1 / 1 | 0 | 5.38 / 6.25 / 7.25 ms | 0.20 / 0.19 / 0.16 |
+
+The lock alone leaves the inversion: the reader now holds the card lock as well as the SD host's
+mutex while libsmb2 holds its core. Both fixes remove it. The pinned build uploads more slowly
+whenever the card programs, because the TinyUSB task on core 1 polls CMD13 back to back through
+each write's programming time and libsmb2 then shares that core: at 2 ms each phase of its pass
+(two uploads, a read-back) took 1.25 to 1.6 times as long as the floating builds' while the car
+wrote, and as long as at 0 ms once the car stopped. The priority-23 scratch build differs from
+6adb83d, the build in the first table, in comments only.
 
 ## Compared with a board
 
