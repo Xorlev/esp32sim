@@ -34,6 +34,9 @@ pub trait CarFs: Clone + Sized {
     const NAME: &'static str;
     fn mount(dev: &mut dyn BlockDevice) -> Result<Self, String>;
     fn cluster_bytes(&self) -> usize;
+    /// What a chunk the car writes is a multiple of: a cluster for the vfat-like writer, a
+    /// sector for exFAT, which allocates as the pages reach a new cluster.
+    fn write_unit(&self) -> usize { self.cluster_bytes() }
     /// The dirty flag as the medium has it.
     fn dirty(&self, dev: &mut dyn BlockDevice) -> Result<bool, String>;
     /// After the mount; `dirty_flag` is `CarCfg::dirty_flag`.
@@ -101,6 +104,7 @@ impl CarFs for ExFat {
     const NAME: &'static str = "exFAT";
     fn mount(dev: &mut dyn BlockDevice) -> Result<Self, String> { ExFat::mount(dev) }
     fn cluster_bytes(&self) -> usize { ExFat::cluster_bytes(self) }
+    fn write_unit(&self) -> usize { 512 }
     fn dirty(&self, dev: &mut dyn BlockDevice) -> Result<bool, String> { ExFat::dirty(self, dev) }
     /// Linux 5.8's exfat writes nothing at the mount: VolumeFlags go dirty at the first change.
     fn mounted<D: BlockDevice>(&mut self, _: &mut PageCache<D>, dirty_flag: bool, truth: &TruthLog) -> Result<(), String> {
@@ -398,7 +402,7 @@ impl<D: Drive, F: CarFs> Car<D, F> {
             ws.push(w);
             self.files.insert(path.to_string(), CarFile { data: data.to_vec(), written: 0, complete: false, deleted: false, started_ns: t0, closed_ns: None });
         }
-        let cb = self.fs.as_ref().unwrap().cluster_bytes();
+        let cb = self.fs.as_ref().unwrap().write_unit();
         let chunk = self.cfg.chunk.max(cb) / cb * cb;
         let n = clips.iter().map(|c| c.1.len().div_ceil(chunk)).max().unwrap_or(0);
         let mut worst = 0;

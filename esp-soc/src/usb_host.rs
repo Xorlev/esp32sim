@@ -18,8 +18,10 @@ pub mod exfat;
 pub mod fat32;
 pub mod msc;
 pub mod pagecache;
+pub mod recorder;
 pub mod script;
 pub mod timing;
+pub mod writelog;
 #[cfg(test)]
 mod tests;
 

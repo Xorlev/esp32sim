@@ -44,6 +44,7 @@
 //! file's allocation, conversion, close and deletion goes to the ground truth (`Truth`), with the
 //! VolumeFlags writes, for checking a trace of the car's writes against.
 use super::fat32::{BlockDevice, DirEntry, FsckReport, FsckWrite};
+pub use super::writelog::Region;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -114,8 +115,9 @@ pub struct Truth {
     /// by path; a path made again after its deletion moves the old record to `past`
     pub files: BTreeMap<String, FileTruth>,
     pub past: Vec<(String, FileTruth)>,
-    /// clusters that hold a directory, and since when
+    /// clusters that hold a directory, and since when; the root's
     pub dir_clusters: BTreeMap<u32, u64>,
+    pub root_clusters: BTreeSet<u32>,
     /// VolumeFlags changes: (time, the new value, written at once (`sync_meta`) or left dirty)
     pub flags: Vec<(u64, u16, bool)>,
 }
@@ -125,8 +127,10 @@ pub struct Truth {
 pub struct FileTruth {
     pub dir: bool,
     pub created_ns: u64,
-    /// the sectors its entry set occupies, and how many entries it has
+    /// the sectors its entry set occupies, the File entry's byte offset in the first, and how
+    /// many entries it has
     pub set_lbas: Vec<u64>,
+    pub set_offset: usize,
     pub entries: u32,
     /// its clusters in the order it took them, with the time
     pub clusters: Vec<(u32, u64)>,
@@ -150,8 +154,10 @@ pub type TruthLog = Arc<Mutex<Truth>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub volume_lba: u64,
+    pub volume_sectors: u64,
     pub fat_lba: u64,
     pub fat_sectors: u32,
+    pub fats: u8,
     pub heap_lba: u64,
     pub sectors_per_cluster: u32,
     /// ClusterCount: cluster numbers run from 2 to clusters + 1
@@ -163,10 +169,6 @@ pub struct Layout {
     pub upcase_bytes: u64,
 }
 
-/// What a sector of the volume holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Region { Mbr, Boot, Fat, Bitmap, UpCase, Dirent, Data, Other }
-
 impl Layout {
     pub fn cluster_lba(&self, c: u32) -> u64 { self.heap_lba + (c as u64 - 2) * self.sectors_per_cluster as u64 }
     pub fn cluster_of_lba(&self, lba: u64) -> Option<u32> {
@@ -174,16 +176,26 @@ impl Layout {
     }
     pub fn fat_sector_of(&self, c: u32) -> u64 { self.fat_lba + c as u64 / 128 }
     pub fn bitmap_sector_of(&self, c: u32) -> u64 { self.cluster_lba(self.bitmap_cluster) + (c as u64 - 2) / 4096 }
-    /// The region of `lba`, with the clusters that hold directories.
-    pub fn region(&self, lba: u64, dirs: &BTreeMap<u32, u64>) -> Region {
-        if lba < self.volume_lba { return Region::Mbr; }
-        if lba < self.volume_lba + 24 { return Region::Boot; }
-        if (self.fat_lba..self.fat_lba + self.fat_sectors as u64).contains(&lba) { return Region::Fat; }
-        let Some(c) = self.cluster_of_lba(lba) else { return Region::Other };
+    /// What the sector at `lba` holds, with the clusters of the root and of the other directories.
+    pub fn region(&self, lba: u64, root: &BTreeSet<u32>, dirs: &BTreeMap<u32, u64>) -> Region {
+        let v = self.volume_lba;
+        if lba == 0 && v > 0 { return Region::Mbr; }
+        if lba < v { return Region::PreVolume; }
+        if lba >= v + self.volume_sectors { return Region::Outside; }
+        match lba - v {
+            0 => return Region::BootSector,
+            1..=11 => return Region::BootRegion,
+            12..=23 => return Region::BackupBoot,
+            _ => {}
+        }
+        if lba >= self.fat_lba && lba < self.fat_lba + self.fat_sectors as u64 * self.fats as u64 {
+            return if lba < self.fat_lba + self.fat_sectors as u64 { Region::Fat } else { Region::Fat2 };
+        }
+        let Some(c) = self.cluster_of_lba(lba) else { return Region::Unknown };
         let in_run = |first: u32, bytes: u64| c >= first && ((c - first) as u64) < bytes.div_ceil(self.sectors_per_cluster as u64 * SECTOR as u64);
         if in_run(self.bitmap_cluster, self.bitmap_bytes) { return Region::Bitmap; }
         if in_run(self.upcase_cluster, self.upcase_bytes) { return Region::UpCase; }
-        if dirs.contains_key(&c) { Region::Dirent } else { Region::Data }
+        if root.contains(&c) { Region::RootDir } else if dirs.contains_key(&c) { Region::Dir } else { Region::Data }
     }
 }
 
@@ -266,8 +278,9 @@ pub struct ExFat {
     clu_srch_ptr: u32,
     used: u32,
     upcase: Arc<Vec<u16>>,
-    /// directories met so far, by first cluster
+    /// directories met so far, by first cluster, and the root's clusters
     dirs: BTreeMap<u32, Dir>,
+    root_clusters: Vec<u32>,
     pub truth: Option<TruthLog>,
 }
 
@@ -296,13 +309,14 @@ impl ExFat {
         if get32(&region, 11 * SECTOR) != sum { return Err(format!("boot region checksum {:08x}, sector 11 says {:08x}", sum, get32(&region, 11 * SECTOR))); }
         let spc = 1u32 << b[109];
         let mut layout = Layout {
-            volume_lba: volume, fat_lba: volume + get32(b, 80) as u64, fat_sectors: get32(b, 84), heap_lba: volume + get32(b, 88) as u64,
+            volume_lba: volume, volume_sectors: get64(b, 72), fat_lba: volume + get32(b, 80) as u64, fat_sectors: get32(b, 84), fats: b[110].max(1), heap_lba: volume + get32(b, 88) as u64,
             sectors_per_cluster: spc, clusters: get32(b, 92), root_cluster: get32(b, 96), bitmap_cluster: 0, bitmap_bytes: 0, upcase_cluster: 0, upcase_bytes: 0,
         };
         let boot: Box<[u8; SECTOR]> = Box::new(region[..SECTOR].try_into().unwrap());
         let vol_flag = get16(&boot[..], 106);
-        let mut fs = ExFat { layout, label: String::new(), boot, vol_flag, track_flags: false, bitmap: Vec::new(), clu_srch_ptr: 2, used: 0, upcase: Arc::new(Vec::new()), dirs: BTreeMap::new(), truth: None };
+        let mut fs = ExFat { layout, label: String::new(), boot, vol_flag, track_flags: false, bitmap: Vec::new(), clu_srch_ptr: 2, used: 0, upcase: Arc::new(Vec::new()), dirs: BTreeMap::new(), root_clusters: Vec::new(), truth: None };
         let root_chain = fs.fat_chain(dev, layout.root_cluster)?;
+        fs.root_clusters = root_chain.clone();
         let root = Chain { first: layout.root_cluster, flags: ALLOC_FAT_CHAIN, clusters: root_chain.len() as u32 };
         fs.dirs.insert(layout.root_cluster, Dir { chain: root, at: None });
         // the root's critical entries: the label, the bitmap, the up-case table
@@ -340,8 +354,7 @@ impl ExFat {
         {
             let mut t = log.lock().unwrap();
             t.layout = Some(self.layout);
-            let now = t.dir_clusters.get(&self.layout.root_cluster).copied().unwrap_or(0);
-            t.dir_clusters.entry(self.layout.root_cluster).or_insert(now);
+            for &c in &self.root_clusters { t.dir_clusters.entry(c).or_insert(0); t.root_clusters.insert(c); }
         }
         self.truth = Some(log);
     }
@@ -597,7 +610,9 @@ impl ExFat {
         d.chain.clusters += 1;
         self.dirs.insert(first, d);
         let now = dev.now_ns();
-        self.note(|t| { t.dir_clusters.insert(new, now); });
+        let root = first == self.layout.root_cluster;
+        if root { self.root_clusters.push(new); }
+        self.note(|t| { t.dir_clusters.insert(new, now); if root { t.root_clusters.insert(new); } });
         if let Some((parent, index)) = d.at {
             let bytes = d.chain.clusters as u64 * self.cluster_bytes() as u64;
             self.edit_set(dev, p, parent, index, |set| { let st = &mut set[32..64]; put64(st, 8, bytes); put64(st, 24, bytes); st[1] = d.chain.flags; })?;
@@ -732,6 +747,7 @@ impl ExFat {
             let cb = self.cluster_bytes() as u64;
             self.init_set(dev, &mut p, d.chain.first, index, c, true, new, cb)?;
             let set_lbas = self.set_lbas(dev, d.chain, index, n)?;
+            let set_offset = self.entry_lba(dev, d.chain, index)?.1;
             p.flush(dev)?;
             self.set_vol_flags(dev, VOL_CLEAN)?;
             let child = Dir { chain: Chain { first: new, flags: ALLOC_NO_FAT_CHAIN, clusters: 1 }, at: Some((d.chain.first, index)) };
@@ -740,7 +756,7 @@ impl ExFat {
             let full = comps[..=i].join("/");
             self.note(|t| {
                 t.dir_clusters.insert(new, now);
-                let ft = FileTruth { dir: true, created_ns: now, set_lbas, entries: n, clusters: vec![(new, now)], ..Default::default() };
+                let ft = FileTruth { dir: true, created_ns: now, set_lbas, set_offset, entries: n, clusters: vec![(new, now)], ..Default::default() };
                 if let Some(old) = t.files.insert(full.clone(), ft) { t.past.push((full, old)); }
             });
             let mut p = Pending::default();
@@ -766,12 +782,13 @@ impl ExFat {
         let d = self.dir(d.chain.first);
         self.init_set(dev, &mut p, d.chain.first, index, name, false, 0, 0)?;
         let set_lbas = self.set_lbas(dev, d.chain, index, n)?;
+        let set_offset = self.entry_lba(dev, d.chain, index)?.1;
         p.flush(dev)?;
         self.set_vol_flags(dev, VOL_CLEAN)?;
         let now = dev.now_ns();
         let full = path.to_string();
         self.note(|t| {
-            let ft = FileTruth { created_ns: now, set_lbas, entries: n, ..Default::default() };
+            let ft = FileTruth { created_ns: now, set_lbas, set_offset, entries: n, ..Default::default() };
             if let Some(old) = t.files.insert(full.clone(), ft) { t.past.push((full, old)); }
         });
         let mut p = Pending::default();
@@ -814,6 +831,26 @@ impl ExFat {
         let path = path.to_string();
         self.note(|t| if let Some(ft) = t.files.get_mut(&path) { ft.deleted_ns = Some(now); });
         Ok(freed)
+    }
+
+    /// Fill all of the volume but `leave` bytes with one file in the root, `name`, NoFatChain over
+    /// the free clusters from the first free one, its data left as the medium holds it: its
+    /// entry and the bitmap written straight, VolumeFlags untouched. A card as full as a car keeps
+    /// it; the free clusters must be one run, as on a fresh volume.
+    pub fn fill(&mut self, dev: &mut dyn BlockDevice, name: &str, leave: u64) -> Result<u32, String> {
+        let flags = std::mem::replace(&mut self.track_flags, false);
+        let f = self.create_path(dev, name)?;
+        self.track_flags = flags;
+        let first = self.find_free(2).ok_or("the volume is full")?;
+        let n = self.free_clusters() - (leave / self.cluster_bytes() as u64) as u32;
+        if (first..first + n).any(|c| self.bit(c)) { return Err("the free clusters are not one run".into()); }
+        let mut p = Pending::default();
+        for c in first..first + n { self.set_bit(&mut p, c, true); }
+        self.used += n;
+        let size = n as u64 * self.cluster_bytes() as u64;
+        self.edit_set(dev, &mut p, f.dir, f.index, |set| { let st = &mut set[32..64]; st[1] = ALLOC_NO_FAT_CHAIN; put32(st, 20, first); put64(st, 8, size); put64(st, 24, size); })?;
+        p.flush(dev)?;
+        Ok(n)
     }
 
     /// Check and repair the volume as exfatprogs 1.0.4's `fsck.exfat -y` does (fsck/fsck.c, the
@@ -986,21 +1023,25 @@ impl ExFile {
     pub fn first_cluster(&self) -> u32 { if self.first == EOF { 0 } else { self.first } }
     pub fn is_chained(&self) -> bool { self.flags == ALLOC_FAT_CHAIN }
 
-    /// Append `data` (whole clusters, but for the file's last chunk). Each cluster as the pages
-    /// reach it, as `exfat_map_cluster` takes it (inode.c:104-262): VolumeFlags dirty; a cluster
-    /// hinted after the file's last; a FAT-chain conversion when it is not that one; the entry set
-    /// rewritten for the first cluster and at a conversion, with the size the file has then. The
-    /// data in one write per contiguous run; with `linux`, the inode written back.
+    /// Append `data` (whole sectors, but for the file's last chunk). A cluster is taken as the
+    /// pages reach one the file does not have, as `exfat_map_cluster` takes it (inode.c:104-262):
+    /// VolumeFlags dirty; a cluster hinted after the file's last; a FAT-chain conversion when it is
+    /// not that one; the entry set rewritten for the first cluster and at a conversion, with the
+    /// size the file has then. The data in one write per contiguous run of sectors; with `linux`,
+    /// the inode written back.
     pub fn write(&mut self, fs: &mut ExFat, dev: &mut dyn BlockDevice, data: &[u8]) -> Result<(), String> {
         if data.is_empty() { return Ok(()); }
         let cb = fs.cluster_bytes() as u64;
-        if self.size % cb != 0 { return Err("a chunk after a partial cluster".into()); }
+        if !self.size.is_multiple_of(SECTOR as u64) { return Err("a chunk after a partial sector".into()); }
         let mut p = Pending::default();
+        // the file's clusters this chunk lands in: the last one when it has room, then new ones
+        let end = self.size + data.len() as u64;
         let mut taken = Vec::new();
-        for k in 0..(data.len() as u64).div_ceil(cb) {
+        if !self.size.is_multiple_of(cb) { taken.push(self.last); }
+        for k in self.clusters as u64..end.div_ceil(cb) {
             fs.set_vol_flags(dev, VOL_DIRTY)?;
             let (new, flags) = fs.alloc_one(dev, &mut p, self.last, self.flags)?;
-            let i_size = self.size + k * cb;
+            let i_size = k * cb;
             let mut modified = false;
             let now = dev.now_ns();
             if self.last == EOF {
@@ -1034,17 +1075,22 @@ impl ExFile {
             }
         }
         p.flush(dev)?;
+        // the data from where the file ends, a run of contiguous clusters in one write, the last
+        // sector padded
+        let skip = (self.size % cb) as usize;
         let mut i = 0;
         while i < taken.len() {
             let mut j = i + 1;
             while j < taken.len() && taken[j] == taken[j - 1] + 1 { j += 1; }
-            let (from, to) = (i * cb as usize, (j * cb as usize).min(data.len()));
+            let from = if i == 0 { 0 } else { i * cb as usize - skip };
+            let to = (j * cb as usize - skip).min(data.len());
             let mut buf = data[from..to].to_vec();
-            buf.resize((j - i) * cb as usize, 0);
-            dev.write_blocks(fs.layout.cluster_lba(taken[i]), &buf)?;
+            buf.resize(buf.len().next_multiple_of(SECTOR), 0);
+            let at = fs.layout.cluster_lba(taken[i]) + if i == 0 { (skip / SECTOR) as u64 } else { 0 };
+            dev.write_blocks(at, &buf)?;
             i = j;
         }
-        self.size += data.len() as u64;
+        self.size = end;
         if self.linux { self.write_inode(fs, dev)?; }
         Ok(())
     }

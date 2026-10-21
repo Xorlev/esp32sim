@@ -4,6 +4,7 @@ use super::sd_image;
 use super::{FakeMsc, FakePort, FakeWindow, FileDisk, msc};
 use crate::usb_host::car::{Car, CarCfg, Offline, Recorded};
 use crate::usb_host::exfat::{self, ExFat, Region, ALLOC_FAT_CHAIN, ALLOC_NO_FAT_CHAIN, EOF, VOL_CLEAN, VOL_DIRTY};
+use crate::usb_host::writelog;
 use crate::usb_host::fat32::{mp4_bytes, FsckWrite, MemDisk};
 use crate::usb_host::pagecache::{PageCache, WritebackCfg};
 
@@ -240,9 +241,23 @@ fn writeback_lands_intermediate_entry_sets() {
     assert!(sizes.iter().any(|s| s.2 > 0 && s.2 < 3 << 20), "an intermediate size landed: {sizes:?}");
     assert_eq!(*sizes.last().unwrap(), (ALLOC_NO_FAT_CHAIN, f.clusters[0].0, 3 << 20));
     for l in &car.disk.landings {
-        let r = layout.region(l.lba, dirs);
-        assert!(if l.meta { matches!(r, Region::Boot | Region::Fat | Region::Bitmap | Region::Dirent) } else { r == Region::Data }, "{l:?} in {r:?}");
+        let r = layout.region(l.lba, &t.root_clusters, dirs);
+        assert!(if l.meta { matches!(r, Region::BootSector | Region::Fat | Region::Bitmap | Region::RootDir | Region::Dir) } else { r == Region::Data }, "{l:?} in {r:?}");
     }
+    // the ground truth: every write's regions, the file's facts
+    let mut boot0 = [0u8; 512];
+    boot0.copy_from_slice(&volume("wb", 64 << 20, 4096)[2048 * 512..2049 * 512]);
+    let w = writelog::exfat_writes(&t, &car.disk.landings, &car.disk.meta_landed, &boot0);
+    assert_eq!(w.len(), car.disk.landings.len());
+    assert!(w.iter().all(|x| x.regions.iter().map(|r| r.1).sum::<u32>() == x.count));
+    let boots: Vec<_> = w.iter().filter_map(|x| x.boot).collect();
+    assert!(!boots.is_empty() && boots.iter().all(|b| b.1 == writelog::BootClass::State), "VolumeFlags only: {boots:?}");
+    assert!(boots[0].2 && boots[0].0 == VOL_DIRTY, "the first, dirty and at once: {boots:?}");
+    let facts = writelog::exfat_files(&t, &car.disk.landings, &car.disk.meta_landed);
+    let ff = facts.iter().find(|x| x.path == p).unwrap();
+    assert!(!ff.truth.is_chained() && ff.truth.fragments() == 1);
+    let (d0, dall, s0, sfin) = (ff.data_first_ns.unwrap(), ff.data_all_ns.unwrap(), ff.set_first_ns.unwrap(), ff.set_final_ns.unwrap());
+    assert!(d0 <= dall && s0 <= sfin && dall <= sfin, "data first {d0}, all {dall}; set first {s0}, final {sfin}");
 }
 
 /// Power gone mid-recording on exFAT: the medium keeps a dirty, torn volume; exfatprogs-style
@@ -450,4 +465,139 @@ fn an_exfat_car_and_a_window_between_its_polls() {
             assert!(!names.iter().any(|n| n == "SavedClips"), "the root read again but the bitmap kept: the window's clusters taken again");
         }
     }
+}
+
+// ---- one workload on FAT32 and on exFAT ----
+
+use crate::usb_host::car::CarFs;
+use crate::usb_host::fat32::{BlockDevice, Fat32};
+use crate::usb_host::recorder::{Fill, Sentry};
+use crate::usb_host::writelog::{Changes, Region as R};
+use std::collections::HashMap;
+
+fn env_u64(name: &str, default: u64) -> u64 { std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
+
+/// A writeback car (Linux's order, the dirty flag kept) recording `secs` of `sentry` on the card
+/// image `img`, filled first but for what the recorder needs; then 40 s for everything to land.
+/// The sectors before the data region and the bitmap's, as they were before the car wrote.
+fn sentry_run<F: CarFs + Fill>(img: &std::path::Path, sentry: &mut Sentry, secs: u64, snap: &[(u64, u64)]) -> (Car<Offline<FileDisk>, F>, HashMap<u64, [u8; 512]>) {
+    let mut f = FileDisk(std::fs::OpenOptions::new().read(true).write(true).open(img).unwrap());
+    F::fill(&mut f, sentry.needs()).unwrap();
+    let mut base = HashMap::new();
+    for &(from, n) in snap {
+        let mut b = vec![0u8; n as usize * 512];
+        f.read_blocks(from, &mut b).unwrap();
+        for (i, s) in b.chunks(512).enumerate() { base.insert(from + i as u64, s.try_into().unwrap()); }
+    }
+    let mut car = Car::<_, F>::on(PageCache::writeback(Offline { dev: f, now: 0 }, WritebackCfg::default()), CarCfg { poll_ns: 0, linux_entries: true, dirty_flag: true, ..CarCfg::default() });
+    car.disk.record = true;
+    car.mount().unwrap();
+    while car.now() < secs * S { sentry.step(&mut car).unwrap(); }
+    car.idle(40 * S).unwrap();
+    (car, base)
+}
+
+fn pct(n: u64, d: u64) -> String { if d == 0 { "-".into() } else { format!("{:.1}%", n as f64 * 100.0 / d as f64) } }
+fn changes(c: &Changes) -> String { format!("{} ({} chain, {} free, {} both, {} unchanged)", c.sectors, c.chain, c.free, c.both, c.unchanged) }
+
+/// The Sentry-like recorder of `oxidrive_refusals.rs` (four cameras, a set every 20 s, a ring of
+/// six sets, an event every fourth set copied beside the live set, six events kept) on a 4 GiB
+/// card filled but for what it needs, by the same writeback car, once on FAT32 and once on exFAT:
+/// how many clips end FAT-chained, which FAT and bitmap sectors the car writes and why, how many
+/// FAT sectors files written together share, how often the boot sector is written. Scaled by
+/// `EXFAT_CMP_SECS` (240), `EXFAT_CMP_CLIP_KIB` (2048), `EXFAT_CMP_CARD_MIB` (4096) and
+/// `EXFAT_CMP_EXFAT_CLUSTER_KIB` (32; FAT32 keeps 32).
+#[test]
+fn one_sentry_workload_on_fat32_and_exfat() {
+    let secs = env_u64("EXFAT_CMP_SECS", 240);
+    let clip = (env_u64("EXFAT_CMP_CLIP_KIB", 2048) << 10) as usize;
+    let card = env_u64("EXFAT_CMP_CARD_MIB", 4096) << 20;
+    let ecl = (env_u64("EXFAT_CMP_EXFAT_CLUSTER_KIB", 32) << 10) as u32;
+    let dir = std::env::temp_dir();
+    let (fimg, eimg) = (dir.join(format!("usbhost-cmp-fat32-{}.img", std::process::id())), dir.join(format!("usbhost-cmp-exfat-{}.img", std::process::id())));
+    sd_image::fat32(&fimg, card, 32 << 10, "ESP32SIM").unwrap();
+    sd_image::exfat(&eimg, card, ecl, "ESP32SIM").unwrap();
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    let mut row = |what: &str, a: String, b: String| rows.push((what.to_string(), a, b));
+
+    // FAT32
+    let fs0 = { let mut f = FileDisk(std::fs::File::open(&fimg).unwrap()); Fat32::mount(&mut f).unwrap() };
+    let mut s32 = Sentry::default();
+    s32.clip = clip;
+    s32.written.track_clusters = true;
+    let (c32, base32) = sentry_run::<Fat32>(&fimg, &mut s32, secs, &[(fs0.volume_lba, fs0.data_lba - fs0.volume_lba)]);
+    // exFAT
+    let l = { let mut f = FileDisk(std::fs::File::open(&eimg).unwrap()); ExFat::mount(&mut f).unwrap().layout };
+    let mut sex = Sentry::default();
+    sex.clip = clip;
+    let bitmap_sectors = l.bitmap_bytes.div_ceil(512);
+    let (cex, baseex) = sentry_run::<ExFat>(&eimg, &mut sex, secs, &[(l.volume_lba, l.heap_lba - l.volume_lba), (l.cluster_lba(l.bitmap_cluster), bitmap_sectors)]);
+    let t = cex.truth.lock().unwrap().clone();
+    let (m32, mex) = (c32.disk.dev.now as f64 / 60e9, cex.disk.dev.now as f64 / 60e9);
+    row("recorded, then 40 s to land", format!("{secs} s, {} sets, {} events", s32.sets, s32.events), format!("{secs} s, {} sets, {} events", sex.sets, sex.events));
+    row("cluster", "32 KiB".into(), format!("{} KiB", ecl >> 10));
+
+    // clips chained, fragments
+    let is_clip = |p: &str| p.ends_with(".mp4");
+    let ex_files: Vec<(&String, &exfat::FileTruth)> = t.files.iter().chain(t.past.iter().map(|(p, f)| (p, f))).filter(|(_, f)| !f.dir && !f.clusters.is_empty()).collect();
+    let ex_clips: Vec<_> = ex_files.iter().filter(|(p, _)| is_clip(p)).collect();
+    let ex_chained = ex_clips.iter().filter(|(_, f)| f.is_chained()).count() as u64;
+    let ex_small: Vec<_> = ex_files.iter().filter(|(p, _)| !is_clip(p)).collect();
+    let f32_clips = s32.written.clusters.iter().filter(|(p, c)| is_clip(p) && !c.is_empty()).count() as u64;
+    row("clips (.mp4) FAT-chained", format!("{f32_clips} of {f32_clips} (FAT32 always chains)"), format!("{ex_chained} of {} ({})", ex_clips.len(), pct(ex_chained, ex_clips.len() as u64)));
+    row("event.json, thumb.png FAT-chained", "all".into(), format!("{} of {}", ex_small.iter().filter(|(_, f)| f.is_chained()).count(), ex_small.len()));
+    let frag = |v: Vec<usize>| { let mut v = v; v.sort(); if v.is_empty() { "-".into() } else { format!("median {}, max {}", v[v.len() / 2], v[v.len() - 1]) } };
+    let runs = |c: &[u32]| c.windows(2).filter(|w| w[1] != w[0] + 1).count() + 1;
+    row("fragments per clip", frag(s32.written.clusters.iter().filter(|(p, c)| is_clip(p) && !c.is_empty()).map(|(_, c)| runs(c)).collect()), frag(ex_clips.iter().map(|(_, f)| f.fragments()).collect()));
+    let conv: Vec<u32> = ex_clips.iter().filter_map(|(_, f)| f.chained.map(|c| c.1)).collect();
+    row("exFAT: clusters a clip had when it was chained", "-".into(), frag(conv.iter().map(|&n| n as usize).collect()));
+
+    // FAT and bitmap sectors landed, by change
+    let fat32_meta = meta_changes32(&c32, &fs0, &base32);
+    let ex_meta = writelog::meta_changes(&cex.disk.meta_landed, |x| l.region(x, &t.root_clusters, &t.dir_clusters), |x| baseex[&x]);
+    let get = |m: &std::collections::BTreeMap<R, Changes>, r: R| m.get(&r).copied().unwrap_or_default();
+    let (f1, f2, eb, ef) = (get(&fat32_meta, R::Fat), get(&fat32_meta, R::Fat2), get(&ex_meta, R::Bitmap), get(&ex_meta, R::Fat));
+    row("FAT sector writes", format!("FAT1 {}; FAT2 {}", changes(&f1), f2.sectors), changes(&ef));
+    row("FAT sector writes a minute", format!("{:.0} (FAT1 + FAT2)", (f1.sectors + f2.sectors) as f64 / m32), format!("{:.0}", ef.sectors as f64 / mex));
+    row("bitmap sector writes", "-".into(), changes(&eb));
+    row("bitmap sector writes a minute", "-".into(), format!("{:.0}", eb.sectors as f64 / mex));
+
+    // FAT sectors shared by files written together
+    let (tf, sf) = writelog::shared_fat_sectors(&s32.written.sets, |p| s32.written.clusters.get(p).cloned().unwrap_or_default());
+    let live_ex = |p: &str| t.files.get(p).filter(|f| f.is_chained()).map(|f| f.clusters.iter().map(|c| c.0).collect()).unwrap_or_default();
+    let (te, se) = writelog::shared_fat_sectors(&sex.written.sets, live_ex);
+    row("FAT sectors with live entries of a set's files: shared by two or more", format!("{sf} of {tf} ({})", pct(sf, tf)), format!("{se} of {te} ({})", pct(se, te)));
+
+    // boot sector
+    let boot0: [u8; 512] = baseex[&l.volume_lba];
+    let w = writelog::exfat_writes(&t, &cex.disk.landings, &cex.disk.meta_landed, &boot0);
+    let (dirty, clean, sync) = writelog::boot_writes(&w);
+    let b32 = c32.disk.landings.iter().filter(|x| x.lba <= fs0.volume_lba && fs0.volume_lba < x.lba + x.count as u64).count();
+    row("boot-sector writes while recording", format!("{b32} (the dirty flag: once at the mount, once at the unmount)"), format!("{} ({dirty} dirty, {clean} clean; {sync} at once)", dirty + clean));
+    row("boot-sector writes a minute", format!("{:.2}", b32 as f64 / m32), format!("{:.2}", (dirty + clean) as f64 / mex));
+    let dirw = |c: &[Landing], f: &dyn Fn(u64) -> R| c.iter().filter(|x| x.meta && matches!(f(x.lba), R::Dir | R::RootDir)).count();
+    let d32 = dirw(&c32.disk.landings, &|x| writelog::fat32_region(&fs0, x, true));
+    let dex = dirw(&cex.disk.landings, &|x| l.region(x, &t.root_clusters, &t.dir_clusters));
+    row("directory writes a minute", format!("{:.0}", d32 as f64 / m32), format!("{:.0}", dex as f64 / mex));
+    let data = |c: &[Landing]| c.iter().filter(|x| !x.meta).count();
+    row("data writes a minute", format!("{:.0}", data(&c32.disk.landings) as f64 / m32), format!("{:.0}", data(&cex.disk.landings) as f64 / mex));
+
+    eprintln!("| | FAT32 | exFAT |\n| --- | --- | --- |");
+    for (a, b, c) in &rows { eprintln!("| {a} | {b} | {c} |"); }
+    drop((c32, cex));
+    let _ = std::fs::remove_file(&fimg);
+    let _ = std::fs::remove_file(&eimg);
+
+    assert!(ex_chained as usize == ex_clips.len(), "every clip written beside another is chained");
+    assert!(ex_small.iter().all(|(_, f)| !f.is_chained()), "a one-cluster file written alone is not");
+    assert_eq!((ef.free, ef.both), (0, 0), "exFAT never zeroes a FAT entry");
+    assert!(f1.free + f1.both > 0, "FAT32's rotation zeroes FAT entries");
+    assert!(eb.free + eb.both > 0 && eb.chain > 0, "exFAT's bitmap: bits set by allocation, cleared by rotation");
+    assert!(dirty + clean > 0 && b32 == 0);
+}
+
+use crate::usb_host::pagecache::Landing;
+
+fn meta_changes32(c: &Car<Offline<FileDisk>, Fat32>, fs: &Fat32, base: &HashMap<u64, [u8; 512]>) -> std::collections::BTreeMap<R, Changes> {
+    writelog::meta_changes(&c.disk.meta_landed, |x| writelog::fat32_region(fs, x, true), |x| base.get(&x).copied().unwrap_or([0u8; 512]))
 }
