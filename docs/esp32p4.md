@@ -1495,59 +1495,71 @@ small writes cause, about 2.7 times real time with the pair running.
 
 ### The window gate
 
-oxidrive's fix for findings 1 to 4 below (teslausb-p4 63024af and 5633fc2; its README, "The window
-gate"): its esp_tinyusb copy answers TEST UNIT READY, READ CAPACITY, READ(10) and WRITE(10) with
-NOT READY, MEDIUM NOT PRESENT while the application holds the card; a take closes that gate and
-then waits for the reads and writes it had already admitted, a WRITE(10) being acknowledged before
-its deferred write reaches the card; giving the card back leaves UNIT ATTENTION 6/28/00 for the
-car's first command, reported once, the REQUEST SENSE after a refused READ(10) or WRITE(10)
-carrying it; and an unreadable entry in a window's listing counts as a failure. The car treats the
-unit attention as Linux does ("The car"). The emulated build is 5633fc2 (`OXIDRIVE_CURRENT_DIR`).
+oxidrive's fix for findings 1 to 4 below (teslausb-p4 63024af and 5633fc2, reviewed through
+51ae822; its README, "The window gate"): its esp_tinyusb copy answers TEST UNIT READY, READ
+CAPACITY, READ(10) and WRITE(10) with NOT READY, MEDIUM NOT PRESENT while the application holds the
+card; a take closes that gate and then waits for the reads and writes it had already admitted, a
+WRITE(10) being acknowledged before its deferred write reaches the card, and a take that fails
+gives the card back inside the component; giving the card back leaves UNIT ATTENTION 6/28/00 for
+the car's first command, reported once, the REQUEST SENSE after a refused READ(10) or WRITE(10)
+carrying it (`CONFIG_TINYUSB_MSC_UNIT_ATTENTION`, shipped on); and a readdir error, which ends that
+directory's listing, counts as a failure. The car treats the unit attention as Linux does ("The
+car"). The emulated build is 51ae822 (`OXIDRIVE_CURRENT_DIR`); the first runs, on 5633fc2, met
+the same mechanisms.
 
-| test | 728b71f | 5633fc2 |
+| test | 728b71f | 5633fc2, 51ae822 |
 | --- | --- | --- |
 | `external_oxidrive_refuses_car_writes_in_a_window` | fails: 207 of the car's WRITE(10)s, 4,294 KiB, reached the card in a 1.03 s window, which finished with failures after a read error; the car never saw it | passes: the car refused at its first command after the take, none of its writes on the card, the newer event archived, the window clean |
 | `external_oxidrive_window_between_polls_reaches_a_caching_car_as_a_unit_attention` | fails: the 5 s car met no unit attention, missed the 1.40 s window and erased SavedClips and SentryClips | passes: both cars met the unit attention and kept oxidrive's folders; fsck clean |
-| `external_oxidrive_window_counts_an_unreadable_directory_entry_as_a_failure` | fails: the entry skipped, the window finished clean | passes: `SavedClips: 1 directory entries unreadable`, the window finished with failures |
+| `external_oxidrive_window_counts_a_listing_cut_short_as_a_failure` | fails: the error passed over, the window finished clean | passes: `SavedClips: listing cut short; read errors: 1`, the window finished with failures |
 
 `external_oxidrive_caching_car_through_windows_it_sees` and
-`external_oxidrive_reads_its_temperature_after_a_restart` pass on 5633fc2 as well: the caching car
+`external_oxidrive_reads_its_temperature_after_a_restart` pass on 5633fc2 as well (not re-run on
+51ae822): the caching car
 saw its four media changes, each window's NOT READY and then its unit attention. The writeback
 and fsck-burst tests were not run on it.
 
-**Writes into a window.** With 5633fc2 the window held the card from 72.52 s to 83.43 s
-(10.9 s). The car's Sentry clip began at the take; its first command, the READ that looks up
-SentryClips, was refused with 2/3A/00 within 1 ms, so nothing of the clip reached the card, and no
-block was written in the window by the car or by oxidrive. The car saw NOT READY at its poll at
-74.30 s and UNIT ATTENTION 6/28/00 at its first poll after the window (84.30 s), read the volume
-again and recorded the next event. The window uploaded the newer event (the first shared pass had
-the older), both equal to the car's files, and finished clean with no read error; fsck is clean.
-Two earlier runs of the same build, stopped by the test's own bookkeeping, held windows of 11.0 s
-and 12.9 s with no car write on the card either. With 728b71f the window lasted 1.03 s, took 207
-of the car's WRITE(10)s (4,294 KiB), met a read error and archived nothing for its event, and the
-car never saw it; the test fails at its first assertion, the Sentry clip not being refused.
+**Writes into a window.** With 51ae822 the window held the card from 72.79 s to 83.80 s (11.0 s; on
+5633fc2, 72.52 s to 83.43 s). The car's Sentry clip began at the take; its first command, the READ
+that looks up SentryClips, was refused with 2/3A/00 within 1 ms, so nothing of the clip reached the
+card, and no block was written in the window by the car or by oxidrive. The car saw NOT READY at its
+poll at 74.30 s and UNIT ATTENTION 6/28/00 at its first poll after the window (84.30 s), read the
+volume again and recorded the next event. The window uploaded the newer event (the first shared pass
+had the older), both equal to the car's files, and finished clean with no read error; fsck is clean.
+Two earlier runs of 5633fc2, stopped by the test's own bookkeeping, held windows of 11.0 s and 12.9
+s with no car write on the card either. With 728b71f the window lasted 1.03 s, took 207 of the car's
+WRITE(10)s (4,294 KiB), met a read error and archived nothing for its event, and the car never saw
+it; the test fails at its first assertion, the Sentry clip not being refused.
 
 **Windows shorter than the poll.** On the fresh card the self-heal window lasted 1.40 s under both
-cars. The 5 s car had no poll inside it (no NOT READY); its first command after the window, a poll,
-met the unit attention, and it read the volume again: TeslaCam holds RecentClips, SavedClips and
-SentryClips, and fsck is clean. The 2 s car saw NOT READY at one poll inside the window, the unit
-attention at the next, and kept the same three folders. With 728b71f the 5 s car erased SavedClips
-and SentryClips ("Windows shorter than the poll"). Linux v6.12 reaches the same media change from
-either: a UNIT ATTENTION at a TEST UNIT READY sets `sdev->changed` (scsi_lib.c:2391-2399), and so
-does a medium that went and came back (sd.c:1765-1775). So holding the card for a poll interval
-after a window that wrote it buys nothing for a polling Linux host, and oxidrive does not.
+cars on 5633fc2 (1.50 s and 1.40 s on 51ae822, with the same outcome). The 5 s car had no poll
+inside it (no NOT READY); its first command after the window, a poll, met the unit attention, and it
+read the volume again: TeslaCam holds RecentClips, SavedClips and SentryClips, and fsck is clean.
+The 2 s car saw NOT READY at one poll inside the window, the unit attention at the next, and kept
+the same three folders. With 728b71f the 5 s car erased SavedClips and SentryClips ("Windows shorter
+than the poll"). Linux v6.12 reaches the same media change from either: a UNIT ATTENTION at a TEST
+UNIT READY sets `sdev->changed` (scsi_lib.c:2391-2399), and so does a medium that went and came back
+(sd.c:1765-1775). So holding the card for a poll interval after a window that wrote it buys nothing
+for a polling Linux host, and oxidrive does not.
 
 **A listing that cannot be read.** With the gate the car no longer keeps the card programming under
 FatFs, which was what failed the window's reads, so `break_dir_chain` makes the error instead: two
 saved events in SavedClips, the rest of its first cluster filled with deleted entries and its FAT1
 entry zeroed, so FatFs's readdir fails when it steps past the cluster (ff.c:1773-1774, FR_INT_ERR).
-With 5633fc2 the window (72.9 s to 83.8 s) logged `SavedClips: 1 directory entries unreadable`
-and finished with failures, having uploaded the newer event (the first shared pass had the older).
-With 728b71f the same window uploaded the same and finished clean.
+A readdir error ends that directory's listing (std's `ReadDir` stops after one; IDF's
+`vfs_fat_readdir` returns no entry), so what follows it is missing from the pass. With 51ae822 the
+window (72.8 s to 83.8 s) logged `SavedClips: listing cut short; read errors: 1` and finished with
+failures, having uploaded the newer event (the first shared pass had the older); 5633fc2, which
+called it `1 directory entries unreadable`, did the same. With 728b71f the same window uploaded the
+same and finished clean.
 
 How a Tesla takes UNIT ATTENTION 6/28/00 is not known: the car here takes it as a media change
 because Linux's sd does, and the car's userspace decides the rest ("Handoff", what part 1 leaves
-open).
+open). The risk oxidrive names for board day: sd fails the I/O that meets the unit attention and
+refuses all I/O after it until the next media check (scsi_lib.c:803-811, sd.c:1340-1343), which
+only a media poll (udev's 2 s; the kernel's own interval is 0) or a reopen runs, so a car that
+never polls and keeps its filesystem mounted would get EIO on every write after the first window.
+The car here polls.
 
 ### Findings for oxidrive
 
@@ -1567,9 +1579,10 @@ open).
    of the eight runs a window ended "clean" with an event missing from its listing. The event is
    listed again next time, so nothing is lost, but the window reports a clean drain it did not
    make; and the window's `revalidate` relies on nobody writing the card while it is held
-   (fs_source.rs:228-243), which finding 1 contradicts. **Fixed** in teslausb-p4 63024af: an
-   unreadable entry is counted and the window finishes with failures; `revalidate`'s assumption
-   holds once the gate refuses the car.
+   (fs_source.rs:228-243), which finding 1 contradicts. **Fixed** in teslausb-p4 63024af and
+   ae63d65: a readdir error ends the directory's listing rather than skipping one entry, so it is
+   counted as a listing cut short and the window finishes with failures; `revalidate`'s
+   assumption holds once the gate refuses the car.
 3. **A window shorter than the car's poll is invisible to the car, and what it writes can be
    overwritten.** Shown for the TeslaCam self-heal on a fresh card: a car polling every 5 s that
    had read the root erased SavedClips and SentryClips, silently. Windows that fail or find
@@ -1980,11 +1993,11 @@ the update refusal (goal 4) still stops on SHA's DMA mode ("An update").
 **What part 1 leaves open**:
 
 - oxidrive now refuses the car's commands while it holds the card, reports UNIT ATTENTION when it
-  gives the card back (teslausb-p4 5633fc2) and counts an unreadable listing entry as a failure
-  (63024af); the tests of findings 1 to 3 are turned round ("The window gate"). It does not hold
-  a window that wrote the card longer, and its reads still do not wait for a ready card. When
-  oxidrive changes again, the hazard tests that assert today's behaviour fail by design: turn
-  their assertions round and keep them.
+  gives the card back (teslausb-p4 5633fc2, switchable since 1f18779) and counts a listing a read
+  error cut short as a failure (63024af, ae63d65); the tests of findings 1 to 3 are turned round
+  ("The window gate"). It does not hold a window that wrote the card longer, and its reads still do
+  not wait for a ready card. When oxidrive changes again, the hazard tests that assert today's
+  behaviour fail by design: turn their assertions round and keep them.
 - Shared reading stayed on in every run here; the item-5 work on another branch saw a boot-sector
   read in `Card::geometry()` meet the card programming and turn shared reading off until a reboot.
   A different interleaving, not a contradiction: a run that meets it has no shared passes.

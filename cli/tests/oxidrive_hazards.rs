@@ -161,7 +161,7 @@ fn fsck_report(card: &std::path::Path) -> (bool, String) {
 /// listing (finding 2 in docs/esp32p4.md); after the window the car meets UNIT ATTENTION 6/28/00, reads the
 /// volume again and records; every closed clip is on the card as written and fsck is clean.
 #[test]
-#[ignore = "needs an oxidrive build with the window gate (5633fc2 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
+#[ignore = "needs an oxidrive build with the window gate (51ae822 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
 fn external_oxidrive_refuses_car_writes_in_a_window() {
     let mut r = hazard_rig("hazard-window-writes.img", None);
     let shared = r.shared.clone();
@@ -221,7 +221,7 @@ fn external_oxidrive_refuses_car_writes_in_a_window() {
     let ups = archived(&r.smb.path(), &files);
     for (p, v) in &ups { eprintln!("[hazard] {p}: {v:?} ({})", path_of_upload(&sh, p.strip_prefix("TeslaCam/").unwrap())); }
     let failed = sh.when("window: finished with failures").is_some_and(|t| (taken..=returned).contains(&t));
-    let io_error = sh.lines.iter().any(|(t, l)| (taken..=returned).contains(t) && (l.contains("Input/output error") || l.contains("I/O error") || l.contains("entries unreadable")));
+    let io_error = sh.lines.iter().any(|(t, l)| (taken..=returned).contains(t) && (l.contains("Input/output error") || l.contains("I/O error") || l.contains("listing cut short")));
     eprintln!("[hazard] outcome: the car {} at its poll; the window {}{}", if gone_at < u64::MAX { "saw the medium go" } else { "never saw the medium go" },
               if failed { "finished with failures" } else { "finished clean" }, if io_error { ", after an error reading the card" } else { "" });
     for (p, f) in files.iter().filter(|f| f.1.complete) {
@@ -348,7 +348,7 @@ fn short_window_run(name: &str, poll_ns: u64) -> ShortWindow {
 /// not a poll fell inside the window, reads the volume again, keeps oxidrive's SavedClips and
 /// SentryClips and makes its RecentClips beside them; fsck is clean.
 #[test]
-#[ignore = "needs an oxidrive build with the window gate (5633fc2 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
+#[ignore = "needs an oxidrive build with the window gate (51ae822 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
 fn external_oxidrive_window_between_polls_reaches_a_caching_car_as_a_unit_attention() {
     let slow = short_window_run("hazard-short-5s.img", env_u64("OXIDRIVE_CAR_POLL_MS", 5000) * MS);
     let fast = short_window_run("hazard-short-2s.img", 2 * S);
@@ -381,16 +381,18 @@ fn break_dir_chain(image: &std::path::Path, dir: &str) {
     f.write_blocks(fat, &s).unwrap();
 }
 
-/// Finding 2 of "Findings for oxidrive" in docs/esp32p4.md, as fixed in teslausb-p4 63024af. With
-/// 728b71f a read error while listing a folder skipped the entry and the window went on: three of
-/// item 1's eight runs ended "clean" with an event missing. The window gate removes that read
-/// error's cause (the car's writes keeping the card programming), so a broken directory chain
-/// stands in for it: two saved events, then SavedClips' first cluster filled with deleted entries
-/// and its FAT1 entry zeroed (`break_dir_chain`), so each readdir of SavedClips fails after the
-/// events. Asserted: the window counts the entry it could not read and finishes with failures.
+/// Finding 2 of "Findings for oxidrive" in docs/esp32p4.md, as fixed in teslausb-p4 (63024af, worded
+/// as now in 51ae822). A readdir error ends that directory's listing (std's ReadDir stops after
+/// one; IDF's vfs_fat_readdir returns no entry), and with 728b71f the window went on as if it had
+/// read everything: three of item 1's eight runs ended "clean" with an event missing. The window
+/// gate removes that read error's cause (the car's writes keeping the card programming), so a
+/// broken directory chain stands in for it: two saved events, then SavedClips' first cluster
+/// filled with deleted entries and its FAT1 entry zeroed (`break_dir_chain`), so each readdir of
+/// SavedClips fails after the events. Asserted: the window counts the listing cut short and
+/// finishes with failures.
 #[test]
-#[ignore = "needs an oxidrive build with the window gate (5633fc2 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
-fn external_oxidrive_window_counts_an_unreadable_directory_entry_as_a_failure() {
+#[ignore = "needs an oxidrive build with the window gate (51ae822 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxidrive_window_counts_a_listing_cut_short_as_a_failure() {
     use esp_soc::usb_host::car::Offline;
     let proto = common::tmp("hazard-unreadable-proto.img");
     sd_image::fat32(&proto, env_u64("OXIDRIVE_CARD_MIB", 4096) << 20, 32 << 10, "ESP32SIM").unwrap();
@@ -420,11 +422,11 @@ fn external_oxidrive_window_counts_an_unreadable_directory_entry_as_a_failure() 
     let in_window = |s: &str| sh.lines.iter().any(|(t, l)| (taken..=returned).contains(t) && l.contains(s));
     let ups = archived(&r.smb.path(), &files);
     for (p, v) in &ups { eprintln!("[hazard] {p}: {v:?} ({})", path_of_upload(&sh, p.strip_prefix("TeslaCam/").unwrap())); }
-    let counted = in_window("SavedClips: 1 directory entries unreadable");
+    let counted = in_window("SavedClips: listing cut short; read errors: 1");
     let failed = in_window("window: finished with failures");
-    eprintln!("[hazard] the window {} to {}: the unreadable entry {}; the window {}", secs(taken), secs(returned), if counted { "counted" } else { "not counted" }, if failed { "finished with failures" } else { "finished clean" });
+    eprintln!("[hazard] the window {} to {}: the listing cut short {}; the window {}", secs(taken), secs(returned), if counted { "counted" } else { "not counted" }, if failed { "finished with failures" } else { "finished clean" });
     assert!(ups.iter().all(|(_, v)| matches!(v, Archived::Same | Archived::Absent)), "an upload differs from the car's file");
-    assert!(counted && failed, "the window counts the entry it could not read, and does not report a clean drain");
+    assert!(counted && failed, "the window counts the listing cut short, and does not report a clean drain");
 }
 
 const CAMS: [&str; 4] = ["front", "back", "left_repeater", "right_repeater"];
