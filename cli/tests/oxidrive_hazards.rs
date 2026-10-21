@@ -155,10 +155,9 @@ fn fsck_report(card: &std::path::Path) -> (bool, String) {
 /// on the card under oxidrive's FatFs and are acknowledged GOOD. The car (2 s polls, a vfat-like
 /// writer) records two saved events, idles a minute so a window opens to take the newer one, and
 /// starts a Sentry event the moment it does. Asserted, as the firmware behaves today: the car's
-/// writes after the take reach the card until its poll, the clip it was writing is left as
-/// clusters no entry reaches, and oxidrive's quiet timer does not count the writes it took while
-/// it held the card (its write tap records only while the car has the card,
-/// app/src/storage/card.rs `__wrap_sdmmc_write_sectors`).
+/// writes after the take reach the card; when the car's poll falls inside the window the clip it
+/// was writing is left as clusters no entry reaches, and when it does not the window ended within
+/// the poll interval having archived nothing.
 #[test]
 #[ignore = "needs the oxidrive 728b71f images and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
 fn external_oxidrive_takes_car_writes_into_a_window() {
@@ -225,8 +224,10 @@ fn external_oxidrive_takes_car_writes_into_a_window() {
         assert_eq!(e.map(|e| (e.size, e.cluster)), Some((0, 0)), "the cut clip keeps its empty entry");
         assert!(!clean, "fsck finds the cut clip's clusters, which no entry reaches");
     } else {
-        // the window ended before the car's poll: the car never knew
-        assert!(returned - taken < 2 * S && failed, "a window the car missed ended early, with failures");
+        // the window ended before the car's poll, having archived nothing: the car never knew
+        let newer = event_path("SavedClips", 1);
+        assert!(returned - taken < 2 * S, "a window the car missed ended within its poll interval");
+        assert_eq!(archived(&r.smb.path(), &files).into_iter().find(|f| f.0 == newer).map(|f| f.1), Some(Archived::Absent), "the window took the newer event");
         assert!(matches!(rec, Recorded::Closed { .. }) && clean);
     }
 }
