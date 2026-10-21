@@ -67,6 +67,9 @@ keeping its FAT, windows shorter than its poll, Linux's writeback, the fsck burs
 and the die temperature after a restart (esp32p4.md, "The car's hazards").
 `cli/tests/oxidrive_latency.rs` times every car command while oxidrive's shared pass reads the
 card (`OXIDRIVE_SD_PRG_US`, `LATENCY_*`; esp32p4.md, "Car write latency under a shared reader").
+`cli/tests/oxidrive_exfat.rs` runs oxidrive's exFAT builds (`OXIDRIVE_EXFAT_DIR`,
+`OXIDRIVE_EXFAT_TRACE_DIR`) against a car writing exFAT, and checks the SD_TRACE build's trace,
+classified by `oxi trace` (`OXI_BIN`), against the car's ground truth (esp32p4.md, "An exFAT car").
 `sd_image::fsck` checks a card image's volume with the system's FAT checker (`fsck_msdos -n`,
 `fsck.fat -n`, or `FSCK_FAT`); `external_fat32_tree_passes_fsck` holds the car's long-name and
 directory writes to it. `sd_image::exfat` lays out an exFAT card, and `fsck` sends an exFAT

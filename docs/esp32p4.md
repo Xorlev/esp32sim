@@ -2261,8 +2261,10 @@ new event folder zeroes a 128 KiB cluster, which lands page by page.
    writeback, nearly always holding VolumeFlags dirty: a create's clean is overtaken by the next
    allocation's dirty before it lands. A write at once happens only on a change to dirty with
    the buffer clean: the first change after a mount, and the first after an unlink's clean has
-   landed. Nothing is written at the mount. A trace showing a boot-sector write at the mount, or
-   with FUA, or one per create, would mean the car's driver is not this one.
+   landed. Nothing is written at the mount. Once the car stops, its deferred inode writebacks
+   most likely leave the medium dirty ("Limits"). A trace showing a boot-sector write at the
+   mount, or one per create, would mean the car's driver is not this one. A trace cannot show FUA:
+   the write tap sees sectors, not the command's flags.
 6. **An entry set lands before its file is whole**: NoFatChain, the first cluster and size 0
    from the first allocation, then intermediate sizes (`writeback_lands_intermediate_entry_sets`).
    fsck.exfat reads such an entry as "first cluster is wrong" (size 0 with a cluster).
@@ -2280,6 +2282,44 @@ fake drive, a car writing into a window until its poll, a gated window and its u
 and windows between polls (a caching or not caching car loses the window's folder, the bitmap
 being pinned; a gated window's unit attention saves it); a port reset and a bulk fsck.
 
+### The firmware on exFAT
+
+`cli/tests/oxidrive_exfat.rs` runs the owner's exFAT builds of oxidrive (not in this repository)
+on the rig of "Services", with the exFAT car on its port: Linux's writeback, VolumeFlags kept,
+the entry set rewritten as a file grows. The card is a fresh 4 GiB exFAT image of 32 KiB clusters;
+the SD bus is timed and the card programs for 1500 µs after each write (assumed, as in "The car's
+hazards"). Builds: 037647d, with exFAT archive windows (`OXIDRIVE_EXFAT_DIR`), and 67e58e5, the
+SD_TRACE build (`OXIDRIVE_EXFAT_TRACE_DIR`), which uploads every car write to `oxidrive-trace/` on
+the share. One run each, five at a time:
+
+| test | what happened | verdict |
+| --- | --- | --- |
+| `external_oxidrive_archives_an_exfat_card_through_windows` | The first window (61.2 s, 1.5 s long) found no TeslaCam and made it. The image as it left it passes `fsck_exfat`, and the car mounts it with TeslaCam's three folders, VolumeFlags clean. The car met MEDIUM NOT PRESENT inside it and UNIT ATTENTION after it, read the volume again and recorded two saved events. Two windows forced once its writeback had landed (108.7 s and 164.8 s, 11 s each) archived the older event, then the newer: both equal the car's files. The third event is held back. Every clip is on the card as written; the car unmounts clean; fsck is clean | passes; 220 s emulated, 350 s wall |
+| `external_oxidrive_refuses_shared_passes_on_exfat_and_says_so_once` | The car wrote a clip every 20 s for 200 s, so no window opened. The refusal (`shared: the card is exFAT; shared passes read FAT32 only, ...`) came at 60.2 s and never again. MQTT's state carries `"fs":"exFAT"` and `shared.aborted` "card is exFAT: not read". Nothing reached the share, and oxidrive wrote no block | passes |
+| `external_oxidrive_refuses_exfat_car_writes_in_a_window` | The window opened at 61.2 s. The car's first command after the take (a READ looking up its folders) was refused with 2/3A/00 within 1 ms. No block of the car's reached the card in the window (61.2-72.3 s). The window archived the older event and held back the newer; the car met UNIT ATTENTION and recorded; fsck is clean | passes |
+| `external_oxidrive_archives_a_card_the_car_formats_exfat` | A FAT32 card. The car recorded an event, then formatted the card exFAT over USB at 0.54-0.87 s (exfatprogs' layout and order, `format_exfat`). At 1.15 s the firmware logged `fs: the car rewrote the volume's layout; now ExFat`. It refused the shared pass once (60.3 s). The window at 121.3 s archived the older exFAT event, read back as it does for the first clips of a boot. It did not upload the FAT32 event the format had erased, and held back the newer one. fsck is clean | passes |
+| `external_oxidrive_forced_window_drops_a_writeback_cars_metadata` | The car recorded two events on the card the first window had prepared. `force_open` 15 s after its last write opened a window (83.7 s) while the car still held 20 metadata pages. The window found no event and closed in 1.0 s. At its poll inside it, the car dropped the 20 pages; neither event's folder ever reached the card, though their data did | passes (asserts today's behaviour) |
+| `external_oxidrive_exfat_trace_matches_the_cars_ground_truth` | The car recorded the Sentry workload for 200 s, then small clips every 15 s until a flush came after its last write. 5 trace files: 4,463 writes over 298 s, 12 boot-sector contents, none lost. Every trace write lies inside a write the car landed (the emulator's clock is the firmware's plus 62.2 ms). The trace's data sectors equal the car's (279,220): esp_tinyusb writes each 64 KiB WRITE(10) as two 32 KiB card writes. `oxi trace --writes` gives every write the regions the car's layout gives it, with the card image and without (where it calls directory clusters `data`, root-dir excepted), and the boot class (`state`) of all 12 boot-sector writes | passes |
+
+Findings for oxidrive:
+
+1. **The window's own exFAT writes are sound** on a fresh card: TeslaCam and its three folders,
+   their four clusters zeroed, one bitmap sector, one root-directory sector, TeslaCam's entries; no
+   FAT write; VolumeFlags left clean. `fsck_exfat` passes the card and the car mounts it.
+2. **A window holds back the newest event**, on exFAT as on FAT32, so a single window after a
+   session archives every event but the last; the next window takes it.
+3. **A forced window can lose a writeback car's last events.** A window that opens on its own waits
+   for a minute of quiet, longer than the car's metadata lag (35 s at most). `force_open` does not:
+   a window forced within the lag refuses the car's writeback, and the car drops what it held,
+   the events' folders and entries with it. The data of the clips is on the card, unreachable. A
+   force that waits for the card to have been quiet as long as a natural window would avoid it.
+4. **The policy's cooldown is 1,200 s** after a window, so on exFAT, where shared passes are
+   refused, a car's clips wait up to 20 minutes for the next window.
+
+`OXI_BIN` is the `oxi` CLI built from oxidrive's repository; `OXIDRIVE_EXFAT_OUT` keeps the trace
+and the card image of the trace test for `oxi trace` by hand (never commit either). The oxi used
+here was built at 037647d, whose trace code matches b905a73's.
+
 ### Limits
 
 - **The writer is Tesla's guess.** How many files the car writes at once, in what chunks, and
@@ -2289,7 +2329,11 @@ being pinned; a gated window's unit attention saves it); a port reset and a bulk
 - **The cluster size** of the car's own format is not known: 32 KiB and 128 KiB bracket
   exfatprogs' choices for cards above 256 MiB.
 - **Writeback** is testkit's model ("The writeback model"), as for FAT32. Inode writeback is
-  modelled at the write.
+  modelled at the write. Linux writes a dirty inode back about 30 s after it was dirtied, and
+  `__exfat_write_inode` sets VolumeFlags dirty. While the car records, allocation keeps the flag
+  dirty all the same. After its last unlink, though, Linux's deferred inode writebacks set it
+  dirty again about 30 s later (written at once if the unlink's clean has landed by then). So a
+  car at rest most likely leaves the medium dirty, where the model leaves it clean.
 - **fsck**: whether the car runs fsck.exfat, and with which options, is not known.
 - **Not modelled**: rename, rmdir, truncate other than to 0, TexFAT's second FAT, sectors other
   than 512 bytes, the up-case table's full contents (the image's is the mandatory part).
