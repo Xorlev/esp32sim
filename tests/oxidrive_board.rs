@@ -58,14 +58,44 @@ pub fn boot(card_name: &str, write_through: bool) -> (esp32p4::Machine, String, 
 
 /// `boot` with a card of `size` bytes instead of the board card's size.
 pub fn boot_card(card_name: &str, write_through: bool, size: Option<u64>) -> (esp32p4::Machine, String, std::path::PathBuf) {
-    let dir = dir();
+    boot_in(&dir(), card_name, write_through, CardOpts { size, ..Default::default() })
+}
+
+/// The card a boot puts in the socket.
+#[derive(Default)]
+pub struct CardOpts {
+    /// bytes, else the board card's size
+    pub size: Option<u64>,
+    /// a prepared image copied in place of a freshly formatted one
+    pub image: Option<std::path::PathBuf>,
+    /// the card's programming time (`SdCardConfig::prg_ns`), else `OXIDRIVE_SD_PRG_US`, else 0
+    pub prg_us: Option<u64>,
+    /// the SD bus timed, else `OXIDRIVE_SD_TIMING=1`
+    pub timed: Option<bool>,
+    /// every block the card is written, in order
+    pub log: Option<std::rc::Rc<std::cell::RefCell<Vec<u64>>>>,
+}
+
+/// The card's blocks as written, logged.
+pub struct LoggedStore { pub inner: Box<dyn esp_periph::sdmmc::SdStore>, pub log: std::rc::Rc<std::cell::RefCell<Vec<u64>>> }
+impl esp_periph::sdmmc::SdStore for LoggedStore {
+    fn len(&self) -> u64 { self.inner.len() }
+    fn read(&mut self, lba: u64, buf: &mut [u8; 512]) -> std::io::Result<()> { self.inner.read(lba, buf) }
+    fn write(&mut self, lba: u64, data: &[u8; 512]) -> std::io::Result<()> { self.log.borrow_mut().push(lba); self.inner.write(lba, data) }
+    fn erase(&mut self, lo: u64, hi: u64) -> std::io::Result<()> { self.log.borrow_mut().extend(lo..=hi); self.inner.erase(lo, hi) }
+    fn describe(&self) -> String { self.inner.describe() }
+}
+
+/// `boot` from the images in `dir`, its card as `o` says. `board-boot.log` is optional: without
+/// it the MAC is `OXIDRIVE_MAC` or the synthetic default and the card is `o.size` bytes.
+pub fn boot_in(dir: &str, card_name: &str, write_through: bool, o: CardOpts) -> (esp32p4::Machine, String, std::path::PathBuf) {
     let file = |name: &str| std::fs::read(format!("{dir}/{name}")).unwrap_or_else(|e| panic!("{dir}/{name}: {e} (set OXIDRIVE_DIR to the directory holding bootloader.bin, partition-table.bin, app.bin and board-boot.log)"));
     // espflash wrote the flash mode it was given (QIO, as the board's `SPI mode:QIO` line shows)
     // into the bootloader's header and re-digested the image.
     let mut bootloader = file("bootloader.bin");
     bootloader[2] = 0;
     if bootloader[23] == 1 { let n = bootloader.len() - 32; let digest = sha256(&bootloader[..n]); bootloader[n..].copy_from_slice(&digest); }
-    let board_log = String::from_utf8_lossy(&file("board-boot.log")).to_string();
+    let board_log = std::fs::read(format!("{dir}/board-boot.log")).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default();
     let mut m = esp32p4::machine(board_mac(&board_log), 32 << 20);
     esp_soc::SocBus::set_flash_size(&mut m.bus, 32 << 20);
     esp_soc::SocBus::set_psram_size(&mut m.bus, 32 << 20).unwrap();
@@ -73,12 +103,17 @@ pub fn boot_card(card_name: &str, write_through: bool, size: Option<u64>) -> (es
     for (off, data) in [(0x2000, bootloader), (0x8000, file("partition-table.bin")), (0x30000, file("app.bin"))] { m.write_flash(off, &data).unwrap(); }
     let card = tmp(card_name);
     let (board_size, serial) = board_card(&board_log);
-    sd_image::fat32(&card, size.unwrap_or(board_size), 32 << 10, "ESP32SIM").unwrap();
-    let timed_bus = std::env::var("OXIDRIVE_SD_TIMING").is_ok_and(|v| v == "1");
-    let config = esp_periph::sdmmc::SdCardConfig { serial, timed_bus, ..Default::default() };
+    match &o.image {
+        Some(src) => { std::fs::copy(src, &card).unwrap_or_else(|e| panic!("{}: {e}", src.display())); }
+        None => sd_image::fat32(&card, o.size.unwrap_or(board_size), 32 << 10, "ESP32SIM").unwrap(),
+    }
+    let timed_bus = o.timed.unwrap_or_else(|| std::env::var("OXIDRIVE_SD_TIMING").is_ok_and(|v| v == "1"));
+    let prg_us = o.prg_us.or_else(|| std::env::var("OXIDRIVE_SD_PRG_US").ok().and_then(|v| v.parse().ok())).unwrap_or(0);
+    let config = esp_periph::sdmmc::SdCardConfig { serial, timed_bus, prg_ns: prg_us * 1000, ..Default::default() };
     let path = card.to_str().unwrap();
     let store = if write_through { esp_periph::sdmmc::FileStore::write_through(path) } else { esp_periph::sdmmc::FileStore::copy_on_write(path) };
-    let what = esp_soc::SocBus::attach_sd_card(&mut m.bus, Box::new(store.unwrap()), config).unwrap();
+    let store: Box<dyn esp_periph::sdmmc::SdStore> = match o.log { Some(log) => Box::new(LoggedStore { inner: Box::new(store.unwrap()), log }), None => Box::new(store.unwrap()) };
+    let what = esp_soc::SocBus::attach_sd_card(&mut m.bus, store, config).unwrap();
     eprintln!("[oxidrive] SD card: {what}");
     m.boot_rom();
     m.console.capture = true;
@@ -121,6 +156,12 @@ pub fn compare(emu: &[String], board: &[String]) -> Comparison {
 /// The firmware's directory: `OXIDRIVE_DIR`, else the fixtures' default.
 pub fn dir() -> String {
     std::env::var("OXIDRIVE_DIR").unwrap_or_else(|_| format!("{}/Code/dlp/sim-fixtures/esp32p4/oxidrive-46a5472", std::env::var("HOME").unwrap_or_default()))
+}
+
+/// A later build of the firmware for the tests that need one: `OXIDRIVE_CURRENT_DIR`, else the
+/// fixtures' default.
+pub fn current_dir() -> String {
+    std::env::var("OXIDRIVE_CURRENT_DIR").unwrap_or_else(|_| format!("{}/Code/dlp/sim-fixtures/esp32p4/oxidrive-728b71f", std::env::var("HOME").unwrap_or_default()))
 }
 
 /// Offset and size of the first NVS data partition (type 0x01, subtype 0x02) in an ESP-IDF
