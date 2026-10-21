@@ -11,6 +11,7 @@
 //! REMOVAL) and SBC-3 (READ CAPACITY(10), READ(10), WRITE(10), START STOP UNIT, SYNCHRONIZE
 //! CACHE(10)).
 use super::fat32::BlockDevice;
+use super::timing::CmdTime;
 use super::{setup_packet, UsbError, UsbHost};
 
 pub const CBW_SIGNATURE: u32 = 0x4342_5355;
@@ -128,6 +129,8 @@ pub struct Msc<'p> {
     pub timeout_ns: u64,
     pub recovery: Recovery,
     pub stats: MscStats,
+    /// each command's submission and completion while `Some`; `None` keeps nothing
+    pub times: Option<Vec<CmdTime>>,
 }
 
 fn be32(b: &[u8]) -> u32 { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) }
@@ -144,7 +147,7 @@ impl<'p> Msc<'p> {
         let bulk = |dir_in: bool| f.endpoints.iter().find(|e| e.attributes & 3 == 2 && (e.address & 0x80 != 0) == dir_in).copied();
         let (i, o) = (bulk(true).ok_or_else(|| MscError::NotMsc("no bulk IN endpoint".into()))?, bulk(false).ok_or_else(|| MscError::NotMsc("no bulk OUT endpoint".into()))?);
         let mut m = Msc { interface: f.number, ep_in: i.address, ep_out: o.address, mps_in: i.mps, mps_out: o.mps, host, lun: 0, max_lun: 0, tag: 0,
-                          block_size: 512, blocks: 0, max_blocks: 240, timeout_ns: 30_000_000_000, recovery: Recovery::Linux, stats: MscStats::default() };
+                          block_size: 512, blocks: 0, max_blocks: 240, timeout_ns: 30_000_000_000, recovery: Recovery::Linux, stats: MscStats::default(), times: None };
         m.max_lun = match m.host.control(setup_packet(0xa1, GET_MAX_LUN, 0, m.interface as u16, 1), Vec::new()) {
             Ok(d) => d.first().copied().unwrap_or(0),
             Err(UsbError::Stall(_)) => 0,
@@ -203,8 +206,19 @@ impl<'p> Msc<'p> {
     }
 
     /// One command through bulk-only transport (BOT §5.3, the host side of §6.7), recovered as
-    /// `recovery` says when it fails.
+    /// `recovery` says when it fails; timed into `times` when that is kept.
     pub fn command(&mut self, cdb: &[u8], dir: Dir) -> Result<Reply, MscError> {
+        let submit_ns = self.host.now_ns();
+        let r = self.untimed_command(cdb, dir);
+        if self.times.is_some() {
+            let done_ns = self.host.now_ns();
+            let ok = matches!(&r, Ok(reply) if reply.csw.status == 0);
+            if let Some(t) = self.times.as_mut() { t.push(CmdTime::new(cdb, submit_ns, done_ns, ok)); }
+        }
+        r
+    }
+
+    fn untimed_command(&mut self, cdb: &[u8], dir: Dir) -> Result<Reply, MscError> {
         match self.transport(cdb, dir) {
             Ok(r) => Ok(r),
             Err(Failure::Fatal(e)) => Err(e.into()),
