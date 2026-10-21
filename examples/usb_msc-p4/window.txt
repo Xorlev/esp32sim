@@ -1,0 +1,31 @@
+# A car that keeps writing after the application took the card (--usb-host, with --sd-timing and a
+# card that programs for 1.5 ms): esp_tinyusb answers TEST UNIT READY with MEDIUM NOT PRESENT while
+# the application holds the card, but writes every WRITE(10) and serves every READ(10) all the
+# same. The application writes README.MD meanwhile.
+attach
+msc
+ready 100 5000
+capacity
+mount
+write 120000 16 c3
+# the REPL is up after a second
+idle 1000
+eject
+poll 100 200
+uart0 write
+write 120016 16 c3
+write 120032 16 c3
+write 120048 16 c3
+write 120064 16 c3
+verify 120000 80 c3
+idle 100
+uart0 read
+idle 200
+uart0 status
+idle 50
+uart0 expose
+ready 100 5000
+mount
+ls
+verify 120000 80 c3
+detach

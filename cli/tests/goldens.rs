@@ -375,6 +375,37 @@ fn usb_msc_p4_faults() {
     expect_u64("usbmsc-p4-faults.insns", r.insns);
 }
 
+/// The example with a car that writes after the application took the card
+/// (examples/usb_msc-p4/window.txt), the SD bus timed and the card programming for 1.5 ms: the
+/// car ejects, the application holds the card (TEST UNIT READY: MEDIUM NOT PRESENT) and writes
+/// README.MD, and the car writes four times 16 blocks and reads them back meanwhile. esp_tinyusb's
+/// READ(10) and WRITE(10) callbacks serve the card whoever holds it (esp_tinyusb 2.4.0
+/// tinyusb_msc.c; oxidrive's 2.2.1 copy has the same callbacks), so the car's writes are
+/// answered GOOD and are on the card under the application's FatFs.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn usb_msc_p4_window() {
+    let card = tmp("usbmsc-p4-window.img");
+    sd_image::fat32(&card, 64 << 20, 512, "").unwrap();
+    let rom = rom("esp32p4_rev0");
+    let r = run(BIN_P4, &["--rom", rom.to_str().unwrap(), "--flash-mb", "4", "--bootloader", &format!("{FW}/p4-usbmsc-bootloader.bin"),
+        "--ptable", &format!("{FW}/p4-usbmsc-ptable.bin"), "--app", &format!("{FW}/p4-usbmsc.bin"), "--sd-rw", card.to_str().unwrap(),
+        "--sd-timing", "--sd-prg-us", "1500", "--usb-host", "examples/usb_msc-p4/window.txt", "--max-seconds", "3"]);
+    let host: String = r.stderr.lines().filter(|l| l.starts_with("[usb-host]")).map(|l| format!("{l}\n")).collect();
+    let after = host.split("ejected").nth(1).unwrap_or_else(|| panic!("no eject:\n{host}"));
+    let before_expose = after.split("console: expose").next().unwrap();
+    assert!(before_expose.contains("TEST UNIT READY: sense 2/3a/00 (MEDIUM NOT PRESENT)"), "{host}");
+    assert_eq!(before_expose.matches("WRITE(10) 16 blocks of c3").count(), 4, "four writes answered GOOD while the application held the card:\n{host}");
+    assert!(before_expose.contains("verify 80 blocks at 120000: all c3") && after.contains("root: README.MD (379)"), "{host}");
+    let owner: Vec<&str> = r.stdout.lines().filter_map(|l| l.split("Storage mounted to application: ").nth(1)).collect();
+    assert_eq!(owner, ["Yes", "No", "Yes", "No", "Yes"], "boot, configured, the eject, expose, VBUS off:\n{}", r.stdout);
+    assert!(r.stdout.contains("README.MD doesn't exist yet, creating"), "{}", r.stdout);
+    let image = std::fs::read(&card).unwrap();
+    assert!(image[120000 * 512..120080 * 512].iter().all(|&b| b == 0xc3), "the car's blocks on the card");
+    expect_text("usbmsc-p4-window.console.txt", &r.stdout);
+    expect_text("usbmsc-p4-window.host.txt", &host);
+    expect_u64("usbmsc-p4-window.insns", r.insns);
+}
+
 /// `--max-insns` bounds the host's script as it bounds a run: the script stops at the limit and
 /// the run ends there.
 #[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
