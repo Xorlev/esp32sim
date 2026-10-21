@@ -17,7 +17,8 @@
 //! inject vbus-off <ms>            VBUS goes that long from now, whatever the host is doing
 //! ready <interval_ms> <timeout_ms>  TEST UNIT READY until it passes, REQUEST SENSE after each failure
 //! poll <interval_ms> <ms>         TEST UNIT READY every interval for a while, as a car does
-//!                                 (a NOT READY seen by either drops the mounted volume)
+//!                                 (a NOT READY or UNIT ATTENTION seen by either drops the
+//!                                 mounted volume)
 //! capacity | mode-sense | prevent | allow | sync | eject
 //! read <lba> <count>              READ(10), prints the data's hash
 //! write <lba> <count> <byte>      WRITE(10) of one byte value
@@ -180,7 +181,8 @@ impl<'p> Runner<'p> {
                     m.host.idle_ns(iv * ms).map_err(u)?;
                 }
                 m.host.say(format_args!("polled: {ok} ready, {bad} not ready"));
-                if bad > 0 { self.medium_changed(); }
+                let changed = m.take_changed();
+                if bad > 0 || changed { self.medium_changed(); }
             }
             Cmd::Capacity => {
                 let m = self.msc()?;

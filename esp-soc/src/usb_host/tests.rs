@@ -51,6 +51,12 @@ struct FakeMsc {
     windows: Vec<FakeWindow>,
     /// when each WRITE(10) of `writes` came
     write_at: Vec<u64>,
+    /// Serve `windows` as oxidrive's gated esp_tinyusb does: READ CAPACITY, READ(10) and WRITE(10)
+    /// refused with MEDIUM NOT PRESENT as TEST UNIT READY is, and after each window UNIT ATTENTION
+    /// 6/28/00 for the first command but INQUIRY and REQUEST SENSE.
+    gated: bool,
+    /// windows whose unit attention has been reported
+    attended: usize,
 }
 
 /// A window as esp_tinyusb serves one: while the application holds the card TEST UNIT READY
@@ -74,7 +80,7 @@ fn string(s: &str) -> Vec<u8> { let mut v = vec![2 + 2 * s.len() as u8, 3]; for 
 impl FakeMsc {
     fn new(blocks: usize) -> Self {
         FakeMsc { disk: vec![0; blocks * 512], vbus: false, setup: [0; 8], ctrl_in: Vec::new(), ctrl_pos: 0, ctrl_stall: false, ep0_pid: true, configured: false,
-                  pid: [false; 2], halt: [false; 2], bot: Bot::Idle, tag: 0, want: 0, sense: Sense::default(), knobs: Knobs::default(), bot_resets: 0, clear_halts: 0, commands: Vec::new(), write_lba: 0, writes: Vec::new(), bus_resets: 0, hang_after: None, now: 0, windows: Vec::new(), write_at: Vec::new() }
+                  pid: [false; 2], halt: [false; 2], bot: Bot::Idle, tag: 0, want: 0, sense: Sense::default(), knobs: Knobs::default(), bot_resets: 0, clear_halts: 0, commands: Vec::new(), write_lba: 0, writes: Vec::new(), bus_resets: 0, hang_after: None, now: 0, windows: Vec::new(), write_at: Vec::new(), gated: false, attended: 0 }
     }
     fn csw(&self, residue: u32, status: u8) -> [u8; 13] {
         let mut c = [0u8; 13];
@@ -99,6 +105,12 @@ impl FakeMsc {
         let lba = u32::from_be_bytes(cb[2..6].try_into().unwrap()) as usize;
         let n = u16::from_be_bytes([cb[7], cb[8]]) as usize;
         if self.knobs.phase_on == Some(opc) { self.bot = Bot::Status(self.csw(0, 2)); return; }
+        if self.gated {
+            let ended = self.windows.iter().filter(|w| w.to <= self.now).count();
+            if ended > self.attended && !matches!(opc, op::INQUIRY | op::REQUEST_SENSE) { self.attended = ended; return self.fail(sense::UNIT_ATTENTION, 0x28, dir_in); }
+            let held = self.windows.iter().any(|w| (w.from..w.to).contains(&self.now));
+            if held && matches!(opc, op::READ_CAPACITY10 | op::READ10 | op::WRITE10) { return self.fail(sense::NOT_READY, sense::MEDIUM_NOT_PRESENT, dir_in); }
+        }
         let reply = match opc {
             op::TEST_UNIT_READY => {
                 if self.knobs.not_ready > 0 { self.knobs.not_ready -= 1; return self.fail(sense::NOT_READY, sense::MEDIUM_NOT_PRESENT, false); }
@@ -704,6 +716,82 @@ fn a_caching_car_writes_over_what_a_window_between_its_polls_wrote() {
             assert_eq!(names("TeslaCam", &mut mem).unwrap(), ["SavedClips", "RecentClips"]);
         }
     }
+}
+
+/// The window of `a_car_keeps_writing_into_a_window_until_its_next_poll`, gated: the car's first
+/// WRITE(10) after the window opens is refused with MEDIUM NOT PRESENT, so nothing of it reaches
+/// the card and the clip is cut at once; its poll then finds the medium gone, and the first poll
+/// after the window meets the UNIT ATTENTION and revalidates (READ CAPACITY, MODE SENSE, the
+/// volume).
+#[test]
+fn a_gated_window_refuses_the_car_and_its_unit_attention_revalidates() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("window-gated");
+    dev.windows.push(FakeWindow { from: 500_000_000, to: 3_000_000_000, app: None });
+    dev.gated = true;
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut car = Car::new(PageCache::new(m), CarCfg::default());
+    car.mount().unwrap();
+    let clip = mp4_bytes("event", 8 << 20);
+    let r = car.record("TeslaCam/RecentClips/clip.mp4", &clip).unwrap();
+    let Recorded::WriteFailed { written, error } = r else { panic!("{r:?}") };
+    assert!(error.contains("2/3a/00") && written < 2 << 20, "refused at the window's start, about 0.33 s of the camera written: {written}, {error}");
+    car.idle(4_500_000_000).unwrap();
+    assert_eq!((car.stats.unit_attentions, car.stats.media_changes, car.stats.mounts), (1, 2, 2), "gone at a poll, back at the unit attention: {:?}", car.stats);
+    assert!(car.present && car.log.iter().any(|l| l.1.contains("NOT READY TO READY CHANGE")));
+    drop(car);
+    assert!(port.dev.write_at.iter().all(|&t| !(500_000_000..3_000_000_000).contains(&t)), "no WRITE(10) reached the card in the window");
+    let after: Vec<u8> = port.dev.commands.iter().rev().take(12).copied().collect();
+    assert!(after.contains(&op::MODE_SENSE6) && after.contains(&op::READ_CAPACITY10), "the revalidation's commands: {after:02x?}");
+}
+
+/// `a_caching_car_writes_over_what_a_window_between_its_polls_wrote`, gated: the window still
+/// falls between the 5 s car's polls, but that poll meets the UNIT ATTENTION, so the car drops
+/// its cached root and FAT and reads the volume again before it makes its folder.
+#[test]
+fn a_caching_car_reads_again_what_a_gated_window_between_its_polls_wrote() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("window-short-gated");
+    dev.windows.push(FakeWindow { from: 1_000_000_000, to: 1_500_000_000, app: Some(app_mkdir("TeslaCam/SavedClips")) });
+    dev.gated = true;
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut car = Car::new(PageCache::keeping_meta(m), CarCfg { poll_ns: 5_000_000_000, ..CarCfg::default() });
+    car.mount().unwrap();
+    assert!(car.fs.clone().unwrap().stat(&mut car.disk, "TeslaCam").unwrap().is_none());
+    car.idle(6_000_000_000).unwrap();
+    assert_eq!((car.stats.polls, car.stats.unit_attentions, car.stats.media_changes), (1, 1, 1), "the one poll met the unit attention");
+    let fs = car.fs.as_mut().unwrap();
+    fs.mkdir_all(&mut car.disk, "TeslaCam/RecentClips").unwrap();
+    drop(car);
+    let mut mem = MemDisk(port.dev.disk.clone());
+    let fs = Fat32::mount(&mut mem).unwrap();
+    let names: Vec<String> = fs.list(&mut mem, "TeslaCam").unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(names, ["SavedClips", "RecentClips"], "the application's folder kept");
+}
+
+/// A writeback car whose pages land while a gated window holds the card, and after it: the first
+/// landing after the window meets the UNIT ATTENTION, which marks the device changed, so the rest
+/// are refused by the host itself (sd.c:1340-1343) and lost, none reaching the card, and the next
+/// poll revalidates. A landing the drive refuses is not the error of the pause that woke it.
+#[test]
+fn a_writeback_car_loses_its_pages_to_a_gated_window_and_revalidates() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("window-writeback-gated");
+    dev.windows.push(FakeWindow { from: 1_000_000_000, to: 1_500_000_000, app: None });
+    dev.gated = true;
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut car = Car::new(PageCache::writeback(m, WritebackCfg::default()), CarCfg { poll_ns: 5_000_000_000, linux_entries: true, ..CarCfg::default() });
+    car.mount().unwrap();
+    let r = car.record("TeslaCam/RecentClips/clip.mp4", &mp4_bytes("c", 1 << 20)).unwrap();
+    assert!(matches!(r, Recorded::Closed { .. }), "{r:?}");
+    car.idle(6_000_000_000).unwrap();
+    assert_eq!((car.stats.unit_attentions, car.stats.media_changes), (1, 1), "{:?}", car.stats);
+    assert!(car.disk.stats.write_errors > 1 && car.disk.dirty_pages() == 0, "{:?}", car.disk.stats);
+    drop(car);
+    assert!(port.dev.write_at.iter().all(|&t| t < 1_000_000_000), "nothing landed in or after the window: {:?}", port.dev.write_at);
 }
 
 /// A recorder on Linux's writeback, the firmware's `WritebackCfg` defaults: each chunk's data in

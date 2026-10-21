@@ -147,24 +147,26 @@ fn fsck_report(card: &std::path::Path) -> (bool, String) {
     match sd_image::fsck(card) { Ok(o) => (true, o), Err(e) => (false, e) }
 }
 
-/// Item 1. A car recording when a window opens keeps writing until its next poll: esp_tinyusb
-/// answers TEST UNIT READY with MEDIUM NOT PRESENT once oxidrive holds the card, but its
-/// WRITE(10) callback writes whatever the mount point (oxidrive's esp_tinyusb 2.2.1
-/// components/esp_tinyusb/tinyusb_msc.c, `tud_msc_write10_cb` and
-/// `msc_storage_write_sector_deferred`), so the car's writes between the take and its poll land
-/// on the card under oxidrive's FatFs and are acknowledged GOOD. The car (2 s polls, a vfat-like
-/// writer) records two saved events, idles a minute so a window opens to take the newer one, and
-/// starts a Sentry event the moment it does. Asserted, as the firmware behaves today: the car's
-/// writes after the take reach the card; when the car's poll falls inside the window the clip it
-/// was writing is left as clusters no entry reaches, and when it does not the window ended within
-/// the poll interval having archived nothing.
+/// Item 1, as fixed by oxidrive's window gate (teslausb-p4 5633fc2). 728b71f's esp_tinyusb answered
+/// TEST UNIT READY with MEDIUM NOT PRESENT once oxidrive held the card but served READ(10) and
+/// WRITE(10) whatever the mount point, so a car recording when a window opened wrote the card under
+/// oxidrive's FatFs until its next poll (4 to 7 MiB in each of eight runs) and broke the window's
+/// reads. The gated copy (components/esp_tinyusb/tinyusb_msc.c, `msc_host_access`) refuses
+/// READ(10) and WRITE(10) like TEST UNIT READY while oxidrive holds the card, and the take waits
+/// for the writes it already acknowledged. The car (2 s polls, a vfat-like writer) records two
+/// saved events, idles a minute so a window opens to take the newer one, and starts a Sentry event
+/// the moment it does. Asserted: the car's first command after the take is refused with 2/3A/00
+/// and none of its writes reaches the card while oxidrive holds it; the window archives the newer
+/// event as the car wrote it and finishes clean, with no read error and no event missing from a
+/// listing (finding 2 in docs/esp32p4.md); after the window the car meets UNIT ATTENTION 6/28/00, reads the
+/// volume again and records; every closed clip is on the card as written and fsck is clean.
 #[test]
-#[ignore = "needs the oxidrive 728b71f images and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
-fn external_oxidrive_takes_car_writes_into_a_window() {
+#[ignore = "needs an oxidrive build with the window gate (51ae822 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
+fn external_oxidrive_refuses_car_writes_in_a_window() {
     let mut r = hazard_rig("hazard-window-writes.img", None);
     let shared = r.shared.clone();
     let wall = std::time::Instant::now();
-    let (files, landings, gone_at, sentry, stats, rec) = {
+    let (files, landings, gone_at, sentry, stats, rec, refused_in) = {
         let mut car = car_on(&mut r, PageCache::new, CarCfg::default());
         for e in 0..2 {
             let p = event_path("SavedClips", e);
@@ -175,16 +177,22 @@ fn external_oxidrive_takes_car_writes_into_a_window() {
         let sentry = event_path("SentryClips", 2);
         let start = car.now();
         eprintln!("[hazard] window taken at {}; the car starts a Sentry clip at {}, its next poll due at {}", secs(taken), secs(start), secs(car.next_poll_ns));
-        let rec = car.record(&sentry, &mp4_bytes(&sentry, 16 << 20)).unwrap();
-        let gone_at = car.log.iter().rev().find(|l| l.1.contains("medium gone")).map_or(u64::MAX, |l| l.0);
-        eprintln!("[hazard] the Sentry clip: {rec:?}; the medium seen gone at {}", secs(gone_at));
+        // refused: a write that fails cuts the clip, a read that fails (a directory looked up) ends it with the error
+        let rec = car.record(&sentry, &mp4_bytes(&sentry, 16 << 20));
+        let refused_in = car.now() - start;
+        eprintln!("[hazard] the Sentry clip: {rec:?} after {}", secs(refused_in));
+        idle_until_line(&mut car, &shared, "supervisor: card returned to the car", 100 * MS, 400 * S).expect("the card never came back");
+        car.idle(2 * S + 100 * MS).unwrap();
         while !car.present && car.now() < 400 * S { car.idle(100 * MS).unwrap(); }
+        let gone_at = car.log.iter().find(|l| l.0 >= start && l.1.contains("medium gone")).map_or(u64::MAX, |l| l.0);
+        eprintln!("[hazard] the medium seen gone at {}", secs(gone_at));
         assert!(car.present, "the medium never came back");
         car.idle(5 * S).unwrap();
         let after = event_path("SavedClips", 5);
-        car.record(&after, &mp4_bytes(&after, 2 << 20)).unwrap();
+        let st = car.record(&after, &mp4_bytes(&after, 2 << 20)).unwrap();
+        assert!(matches!(st, Recorded::Closed { .. }), "the car records after the window: {st:?}");
         car.idle(4 * S).unwrap();
-        (car.files.clone(), car.disk.landings.clone(), gone_at, sentry, car.stats, rec)
+        (car.files.clone(), car.disk.landings.clone(), gone_at, sentry, car.stats, rec, refused_in)
     };
     r.report(10);
     eprintln!("[hazard] {:.0} s wall for {} emulated; car: {stats:?}", wall.elapsed().as_secs_f64(), secs(r.cs.now_ns));
@@ -193,43 +201,42 @@ fn external_oxidrive_takes_car_writes_into_a_window() {
     let ws = windows(&sh);
     let (taken, returned) = *ws.first().expect("a window");
     eprintln!("[hazard] the window: {} to {} ({})", secs(taken), secs(returned), secs(returned.saturating_sub(taken)));
-    let into: Vec<&Landing> = landings.iter().filter(|l| (taken..gone_at.min(returned)).contains(&l.at_ns)).collect();
+    // a slice's writes carry its end time, as the take's console line does: the window is (taken, returned)
+    let held = |t: u64| t > taken && t < returned;
+    let into: Vec<&Landing> = landings.iter().filter(|l| held(l.at_ns)).collect();
     let blocks: u64 = into.iter().map(|l| l.count as u64).sum();
-    eprintln!("[hazard] car WRITE(10)s answered GOOD while oxidrive held the card: {} commands, {} KiB, from {} to {}", into.len(), blocks / 2,
-              secs(into.first().map_or(0, |l| l.at_ns)), secs(into.last().map_or(0, |l| l.at_ns)));
+    eprintln!("[hazard] car WRITE(10)s answered GOOD while oxidrive held the card: {} commands, {} KiB", into.len(), blocks / 2);
     let mut disk = FileDisk(std::fs::File::open(&r.card).unwrap());
     let fs = Fat32::mount(&mut disk).unwrap();
-    let on_card: u64 = sh.writes.iter().filter(|w| (taken..gone_at.min(returned).saturating_add(S)).contains(&w.at_ns)).map(|w| w.count).sum();
+    let on_card: u64 = sh.writes.iter().filter(|w| held(w.at_ns)).map(|w| w.count).sum();
     let ours = device_writes(&sh.writes, &landings);
-    let in_window: Vec<&CardWrite> = ours.iter().filter(|w| (taken..=returned).contains(&w.at_ns)).collect();
-    eprintln!("[hazard] the card took {on_card} blocks then; blocks oxidrive wrote itself in the window: {}", in_window.iter().map(|w| w.count).sum::<u64>());
+    let in_window: Vec<&CardWrite> = ours.iter().filter(|w| held(w.at_ns)).collect();
+    eprintln!("[hazard] the card took {on_card} blocks in the window; blocks oxidrive wrote itself: {}", in_window.iter().map(|w| w.count).sum::<u64>());
     for w in &in_window { eprintln!("[hazard]   {} {} blocks at {} ({})", secs(w.at_ns), w.count, w.lba, region(&fs, w.lba)); }
-    let e = fs.stat(&mut disk, &sentry).unwrap();
-    eprintln!("[hazard] the cut Sentry clip on the card: {e:?}");
+    // its folder may not exist either: the car's mkdir was refused
+    let e = fs.stat(&mut disk, &sentry).unwrap_or(None);
+    eprintln!("[hazard] the refused Sentry clip on the card: {e:?}");
     let (clean, out) = fsck_report(&r.card);
     eprintln!("[hazard] fsck: {}", out.trim().replace('\n', "; "));
-    for (p, v) in archived(&r.smb.path(), &files) { eprintln!("[hazard] {p}: {v:?} ({})", path_of_upload(&sh, p.strip_prefix("TeslaCam/").unwrap())); }
+    let ups = archived(&r.smb.path(), &files);
+    for (p, v) in &ups { eprintln!("[hazard] {p}: {v:?} ({})", path_of_upload(&sh, p.strip_prefix("TeslaCam/").unwrap())); }
     let failed = sh.when("window: finished with failures").is_some_and(|t| (taken..=returned).contains(&t));
-    let io_error = sh.lines.iter().any(|(t, l)| (taken..=returned).contains(t) && l.contains("Input/output error") || (taken..=returned).contains(t) && l.contains("I/O error"));
+    let io_error = sh.lines.iter().any(|(t, l)| (taken..=returned).contains(t) && (l.contains("Input/output error") || l.contains("I/O error") || l.contains("listing cut short")));
     eprintln!("[hazard] outcome: the car {} at its poll; the window {}{}", if gone_at < u64::MAX { "saw the medium go" } else { "never saw the medium go" },
-              if failed { "finished with failures" } else { "finished clean" }, if io_error { ", after an I/O error reading the card" } else { "" });
+              if failed { "finished with failures" } else { "finished clean" }, if io_error { ", after an error reading the card" } else { "" });
     for (p, f) in files.iter().filter(|f| f.1.complete) {
         assert!(fs.read_path(&mut disk, p).unwrap() == f.data, "{p}: a closed clip differs on the card");
     }
-    assert!(!into.is_empty() && on_card >= blocks, "the car's writes after the take reached the card: {blocks} blocks written, {on_card} taken");
-    if gone_at < u64::MAX {
-        // the car learned at its poll: its clip is cut, its clusters orphaned
-        assert!(gone_at - taken <= 2 * S + 50 * MS, "the car learns at its next poll, within 2 s of the take");
-        assert!(matches!(rec, Recorded::MediumGone { .. }));
-        assert_eq!(e.map(|e| (e.size, e.cluster)), Some((0, 0)), "the cut clip keeps its empty entry");
-        assert!(!clean, "fsck finds the cut clip's clusters, which no entry reaches");
-    } else {
-        // the window ended before the car's poll, having archived nothing: the car never knew
-        let newer = event_path("SavedClips", 1);
-        assert!(returned - taken < 2 * S, "a window the car missed ended within its poll interval");
-        assert_eq!(archived(&r.smb.path(), &files).into_iter().find(|f| f.0 == newer).map(|f| f.1), Some(Archived::Absent), "the window took the newer event");
-        assert!(matches!(rec, Recorded::Closed { .. }) && clean);
-    }
+    let refusal = match &rec { Ok(Recorded::WriteFailed { written, error }) => (*written, error.clone()), Err(e) => (0, e.clone()), Ok(r) => panic!("the Sentry clip was not refused: {r:?}") };
+    assert!(refusal.1.contains("2/3a/00") && refusal.0 == 0 && refused_in < 100 * MS, "the car's first command after the take is refused: {refusal:?} after {}", secs(refused_in));
+    assert!(into.is_empty() && on_card == 0, "none of the car's writes reached the card while oxidrive held it: {} landings, {on_card} blocks on the card", into.len());
+    assert!(e.as_ref().is_none_or(|e| (e.size, e.cluster) == (0, 0)), "nothing of the refused clip on the card: {e:?}");
+    let newer = event_path("SavedClips", 1);
+    assert_eq!(ups.iter().find(|f| f.0 == newer).map(|f| f.1.clone()), Some(Archived::Same), "the newer event archived as the car wrote it");
+    assert!(ups.iter().all(|(_, v)| matches!(v, Archived::Same | Archived::Absent)), "an upload differs from the car's file");
+    assert!(!failed && !io_error, "the window finished clean, every listing read");
+    assert!(stats.unit_attentions >= 1, "the car met UNIT ATTENTION after the window: {stats:?}");
+    assert!(clean, "fsck");
 }
 
 /// Item 2. A car that keeps its FAT and directories between polls, as Linux's buffer cache does,
@@ -294,7 +301,7 @@ fn external_oxidrive_caching_car_through_windows_it_sees() {
 }
 
 /// What one run of `short_windows` saw.
-struct ShortWindow { poll_ns: u64, window: (u64, u64), missed: bool, oxidrive_wrote: Vec<CardWrite>, teslacam: Vec<String>, fsck: (bool, String) }
+struct ShortWindow { poll_ns: u64, window: (u64, u64), missed: bool, oxidrive_wrote: Vec<CardWrite>, teslacam: Vec<String>, fsck: (bool, String), unit_attentions: u64, not_ready: u64 }
 
 /// A fresh card (FAT32, nothing on it), a car that keeps its FAT and directories and has looked
 /// for TeslaCam before the window, polling every `poll_ns`. oxidrive's first window finds no
@@ -327,31 +334,99 @@ fn short_window_run(name: &str, poll_ns: u64) -> ShortWindow {
     for w in &oxidrive_wrote { eprintln!("[hazard]   oxidrive wrote {} blocks at {} ({}) at {}", w.count, w.lba, region(&fs, w.lba), secs(w.at_ns)); }
     eprintln!("[hazard]   TeslaCam afterwards: {teslacam:?}; root: {:?}", fs.list_root(&mut disk).unwrap().iter().map(|e| (e.name.clone(), e.cluster)).collect::<Vec<_>>());
     eprintln!("[hazard]   fsck: {}", fsck.1.trim().replace('\n', "; "));
-    ShortWindow { poll_ns, window, missed: stats.media_changes == 0, oxidrive_wrote, teslacam, fsck }
+    ShortWindow { poll_ns, window, missed: stats.media_changes == 0, oxidrive_wrote, teslacam, fsck, unit_attentions: stats.unit_attentions, not_ready: stats.not_ready }
 }
 
-/// Item 3. Windows shorter than the poll: a window on a fresh card takes the card and gives it
-/// back in about 1.4 s, so a car polling every 5 s, or every 2 s as udev polls a removable disk
-/// (systemd v256 rules.d/60-block.rules), sees it only if a poll falls inside it. A car that
-/// misses it still holds the root and the FAT it read before the window, with no TeslaCam and
-/// the clusters oxidrive took marked free. Asserted, as oxidrive 728b71f behaves: the window
-/// writes the card (TeslaCam and its three folders, their FAT entries in both FATs, FSInfo); a car
-/// that missed it makes its own TeslaCam in the same root slot and cluster, so oxidrive's
-/// SavedClips and SentryClips are gone, and fsck finds nothing wrong; a car that saw it reads the
-/// volume again and keeps them. At least one of the two cars misses the window.
+/// Item 3, as fixed by oxidrive's window gate (teslausb-p4 5633fc2). A window on a fresh card takes
+/// the card and gives it back in about 1.4 s, so a car polling every 5 s, or every 2 s as udev
+/// polls a removable disk (systemd v256 rules.d/60-block.rules), sees NOT READY only if a poll
+/// falls inside it; with 728b71f a caching car that missed it wrote over oxidrive's SavedClips and
+/// SentryClips from the root and FAT it held. The gated esp_tinyusb leaves UNIT ATTENTION 6/28/00
+/// for the car's first command after the card comes back, which the car takes as a media change,
+/// as Linux does (v6.12 drivers/scsi/scsi_lib.c:2391-2399, sd.c:1765-1775). Asserted: the window
+/// writes the card (TeslaCam and its three folders); each car meets the unit attention whether or
+/// not a poll fell inside the window, reads the volume again, keeps oxidrive's SavedClips and
+/// SentryClips and makes its RecentClips beside them; fsck is clean.
 #[test]
-#[ignore = "needs the oxidrive 728b71f images and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
-fn external_oxidrive_window_between_polls_is_overwritten_by_a_caching_car() {
+#[ignore = "needs an oxidrive build with the window gate (51ae822 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba, mosquitto and a FAT checker"]
+fn external_oxidrive_window_between_polls_reaches_a_caching_car_as_a_unit_attention() {
     let slow = short_window_run("hazard-short-5s.img", env_u64("OXIDRIVE_CAR_POLL_MS", 5000) * MS);
     let fast = short_window_run("hazard-short-2s.img", 2 * S);
-    for w in [&slow, &fast] { eprintln!("[hazard] poll {}: a window of {} missed {}, TeslaCam {:?}, fsck clean {}", secs(w.poll_ns), secs(w.window.1 - w.window.0), w.missed, w.teslacam, w.fsck.0); }
+    for w in [&slow, &fast] { eprintln!("[hazard] poll {}: a window of {}, NOT READY at {} polls, {} UNIT ATTENTION, TeslaCam {:?}, fsck clean {}", secs(w.poll_ns), secs(w.window.1 - w.window.0), w.not_ready, w.unit_attentions, w.teslacam, w.fsck.0); }
     for w in [&slow, &fast] {
         assert!(!w.oxidrive_wrote.is_empty(), "the window wrote the card");
+        assert!(w.unit_attentions >= 1 && !w.missed, "poll {}: the car met the unit attention and saw a media change", secs(w.poll_ns));
         let kept = w.teslacam.iter().any(|n| n == "SavedClips") && w.teslacam.iter().any(|n| n == "SentryClips");
-        assert_eq!(kept, !w.missed, "poll {}: oxidrive's folders survive exactly when the car saw the window: {:?}", secs(w.poll_ns), w.teslacam);
-        assert!(w.teslacam.iter().any(|n| n == "RecentClips") && w.fsck.0, "the car's folder is there and fsck passes either way");
+        assert!(kept, "poll {}: oxidrive's folders survive: {:?}", secs(w.poll_ns), w.teslacam);
+        assert!(w.teslacam.iter().any(|n| n == "RecentClips") && w.fsck.0, "the car's folder is there and fsck passes");
     }
-    assert!(slow.missed || fast.missed, "neither car missed the window");
+}
+
+/// Fill the free slots of `dir`'s first cluster with deleted entries and zero its FAT1 entry: FatFs
+/// reads every entry there, then fails to step to a next cluster (IDF v5.5.3 fatfs/src/ff.c:1773-1774,
+/// `dir_next`: `get_fat` gives 0, FR_INT_ERR), so a readdir fails after the last live entry.
+fn break_dir_chain(image: &std::path::Path, dir: &str) {
+    let mut f = FileDisk(std::fs::OpenOptions::new().read(true).write(true).open(image).unwrap());
+    let fs = Fat32::mount(&mut f).unwrap();
+    let c = fs.stat(&mut f, dir).unwrap().unwrap_or_else(|| panic!("{dir}")).cluster as u64;
+    let lba = fs.data_lba + (c - 2) * (fs.cluster_bytes() / 512) as u64;
+    let mut buf = vec![0u8; fs.cluster_bytes()];
+    f.read_blocks(lba, &mut buf).unwrap();
+    for e in buf.chunks_mut(32).filter(|e| e[0] == 0) { e[0] = 0xe5; e[1..11].fill(b' '); }
+    f.write_blocks(lba, &buf).unwrap();
+    let fat = fs.volume_lba + fs.reserved as u64 + c / 128;
+    let mut s = [0u8; 512];
+    f.read_blocks(fat, &mut s).unwrap();
+    s[(c % 128) as usize * 4..(c % 128) as usize * 4 + 4].fill(0);
+    f.write_blocks(fat, &s).unwrap();
+}
+
+/// Finding 2 of "Findings for oxidrive" in docs/esp32p4.md, as fixed in teslausb-p4 (63024af, worded
+/// as now in 51ae822). A readdir error ends that directory's listing (std's ReadDir stops after
+/// one; IDF's vfs_fat_readdir returns no entry), and with 728b71f the window went on as if it had
+/// read everything: three of item 1's eight runs ended "clean" with an event missing. The window
+/// gate removes that read error's cause (the car's writes keeping the card programming), so a
+/// broken directory chain stands in for it: two saved events, then SavedClips' first cluster
+/// filled with deleted entries and its FAT1 entry zeroed (`break_dir_chain`), so each readdir of
+/// SavedClips fails after the events. Asserted: the window counts the listing cut short and
+/// finishes with failures.
+#[test]
+#[ignore = "needs an oxidrive build with the window gate (51ae822 or later) and nvs.csv under OXIDRIVE_CURRENT_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxidrive_window_counts_a_listing_cut_short_as_a_failure() {
+    use esp_soc::usb_host::car::Offline;
+    let proto = common::tmp("hazard-unreadable-proto.img");
+    sd_image::fat32(&proto, env_u64("OXIDRIVE_CARD_MIB", 4096) << 20, 32 << 10, "ESP32SIM").unwrap();
+    let files = {
+        let dev = Offline { dev: FileDisk(std::fs::OpenOptions::new().read(true).write(true).open(&proto).unwrap()), now: 0 };
+        let mut car = Car::new(PageCache::new(dev), CarCfg { poll_ns: 0, ..CarCfg::default() });
+        car.mount().unwrap();
+        for d in ["TeslaCam/RecentClips", "TeslaCam/SentryClips"] { car.fs.as_mut().unwrap().mkdir_all(&mut car.disk, d).unwrap(); }
+        for e in 0..2 {
+            let p = event_path("SavedClips", e);
+            assert!(matches!(car.record(&p, &mp4_bytes(&p, 2 << 20)).unwrap(), Recorded::Closed { .. }));
+        }
+        car.files.clone()
+    };
+    break_dir_chain(&proto, "TeslaCam/SavedClips");
+    let mut r = hazard_rig("hazard-unreadable.img", Some(proto));
+    let shared = r.shared.clone();
+    {
+        let mut car = car_on(&mut r, PageCache::new, CarCfg::default());
+        idle_until_line(&mut car, &shared, "supervisor: card returned to the car", 100 * MS, 200 * S).expect("no window within 200 s");
+        car.idle(2 * S).unwrap();
+    }
+    r.report(10);
+    console(&shared.borrow());
+    let sh = shared.borrow();
+    let (taken, returned) = *windows(&sh).first().expect("a window");
+    let in_window = |s: &str| sh.lines.iter().any(|(t, l)| (taken..=returned).contains(t) && l.contains(s));
+    let ups = archived(&r.smb.path(), &files);
+    for (p, v) in &ups { eprintln!("[hazard] {p}: {v:?} ({})", path_of_upload(&sh, p.strip_prefix("TeslaCam/").unwrap())); }
+    let counted = in_window("SavedClips: listing cut short; read errors: 1");
+    let failed = in_window("window: finished with failures");
+    eprintln!("[hazard] the window {} to {}: the listing cut short {}; the window {}", secs(taken), secs(returned), if counted { "counted" } else { "not counted" }, if failed { "finished with failures" } else { "finished clean" });
+    assert!(ups.iter().all(|(_, v)| matches!(v, Archived::Same | Archived::Absent)), "an upload differs from the car's file");
+    assert!(counted && failed, "the window counts the listing cut short, and does not report a clean drain");
 }
 
 const CAMS: [&str; 4] = ["front", "back", "left_repeater", "right_repeater"];

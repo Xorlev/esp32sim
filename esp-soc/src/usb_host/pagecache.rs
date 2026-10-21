@@ -190,13 +190,16 @@ impl<D: BlockDevice> PageCache<D> {
         match first_err { Some(e) => Err(e), None => Ok(pages.len()) }
     }
 
-    /// Land the pages that are due now.
+    /// Land the pages that are due now. A landing the drive refuses loses its pages and counts in
+    /// `write_errors`; it is not the error of the read, write or pause that woke the flusher, as
+    /// Linux's writeback keeps such an error for fsync (v6.12 include/linux/pagemap.h:238-248
+    /// `mapping_set_error`, called for a failed buffer write at fs/buffer.c:1210-1217).
     pub fn flush_due(&mut self) -> Result<usize, String> {
         if self.dirty.is_empty() { return Ok(0); }
         let now = self.dev.now_ns();
         let due: Vec<u64> = self.dirty.iter().filter(|(_, p)| p.due <= now).map(|(&k, _)| k).collect();
         if due.is_empty() { return Ok(0); }
-        self.land(due)
+        Ok(self.land(due).unwrap_or(0))
     }
 
     /// Land every dirty page now, as sync(2) or an unmount does.

@@ -8,8 +8,14 @@
 //! change. A medium gone has capacity 0 (`set_media_not_present`, 1671-1680), so the writes the car
 //! still holds cannot reach it: they are dropped. When the medium is back the car reads the volume
 //! again. Between polls nothing tells the car the medium went, so its writes keep going to the
-//! drive, which may accept them (esp_tinyusb's WRITE(10) callback does not look at who holds the
-//! card).
+//! drive, which may accept them (stock esp_tinyusb's WRITE(10) callback does not look at who holds
+//! the card).
+//!
+//! A UNIT ATTENTION on a READ(10) or WRITE(10) fails that command and marks the device changed
+//! (`Msc::changed`, v6.12 drivers/scsi/scsi_lib.c:803-811); sd then refuses reads and writes until
+//! the next poll, which reports the media change (sd.c:1340-1343, 1765-1775). Every media change
+//! revalidates as `sd_revalidate_disk` does (sd.c:3698-3763): READ CAPACITY, MODE SENSE, then the
+//! volume read again.
 //!
 //! What the car keeps of the volume between polls, and when its writes land, is its
 //! `pagecache::PageCache`.
@@ -27,6 +33,10 @@ pub trait Drive: BlockDevice {
     fn test_unit_ready(&mut self) -> Ready;
     /// READ CAPACITY, before a volume is read.
     fn capacity(&mut self) -> Result<(), String> { Ok(()) }
+    /// MODE SENSE, when the medium changed.
+    fn mode_sense(&mut self) -> Result<(), String> { Ok(()) }
+    /// Whether a UNIT ATTENTION came since the last poll, which clears it.
+    fn take_changed(&mut self) -> bool { false }
 }
 
 impl Drive for Msc<'_> {
@@ -34,6 +44,8 @@ impl Drive for Msc<'_> {
         match Msc::test_unit_ready(self) { Ok(()) => Ready::Ready, Err(MscError::Check(s)) => Ready::Check(s), Err(e) => Ready::Failed(e.to_string()) }
     }
     fn capacity(&mut self) -> Result<(), String> { self.read_capacity().map(|_| ()).map_err(|e| e.to_string()) }
+    fn mode_sense(&mut self) -> Result<(), String> { Msc::mode_sense(self).map(|_| ()).map_err(|e| e.to_string()) }
+    fn take_changed(&mut self) -> bool { Msc::take_changed(self) }
 }
 
 /// A block device with a clock of its own and a medium always there, for a car run without
@@ -142,10 +154,20 @@ impl<D: Drive> Car<D> {
 
     /// Read the volume, after an fsck when it is marked dirty and the car runs one; with the
     /// dirty flag kept, mark it in use.
-    pub fn mount(&mut self) -> Result<(), String> {
+    pub fn mount(&mut self) -> Result<(), String> { self.mount_after(false) }
+
+    /// A media change: what the car held is dropped, then `sd_revalidate_disk`'s READ CAPACITY
+    /// and MODE SENSE (sd.c:3734, 3762; a MODE SENSE that fails is taken as write enabled), then
+    /// the volume read as `mount` reads it.
+    pub fn revalidate(&mut self) -> Result<(), String> { self.mount_after(true) }
+
+    fn mount_after(&mut self, mode_sense: bool) -> Result<(), String> {
         self.disk.drop_dirty();
         self.disk.invalidate();
         self.disk.dev.capacity()?;
+        if mode_sense {
+            if let Err(e) = self.disk.dev.mode_sense() { self.say(format!("MODE SENSE failed, write enabled assumed: {e}")); }
+        }
         let mut fs = Fat32::mount(&mut self.disk)?;
         if let Some(mode) = self.fsck_at_mount {
             if fs.dirty(&mut self.disk)? {
@@ -187,6 +209,7 @@ impl<D: Drive> Car<D> {
     pub fn poll(&mut self) -> Result<Ready, String> {
         self.stats.polls += 1;
         let r = self.disk.dev.test_unit_ready();
+        let changed = self.disk.dev.take_changed();
         let t = self.now();
         self.next_poll_ns = t + self.cfg.poll_ns;
         match &r {
@@ -194,7 +217,13 @@ impl<D: Drive> Car<D> {
                 self.present = true;
                 self.stats.media_changes += 1;
                 self.say("TEST UNIT READY: ready again, a medium change: the volume read again".into());
-                self.mount()?;
+                self.revalidate()?;
+            }
+            Ready::Ready if changed => {
+                self.stats.unit_attentions += 1;
+                self.stats.media_changes += 1;
+                self.say("TEST UNIT READY: ready, after a UNIT ATTENTION on a read or write: a medium change: the volume read again".into());
+                self.revalidate()?;
             }
             Ready::Ready => {}
             Ready::Check(s) if s.asc == sense::MEDIUM_NOT_PRESENT && matches!(s.key, sense::NOT_READY | sense::UNIT_ATTENTION) => {
@@ -208,11 +237,13 @@ impl<D: Drive> Car<D> {
                     self.say(format!("TEST UNIT READY: {s}: medium gone, {lost} dirty pages dropped"));
                 }
             }
+            // scsi_test_unit_ready retries past it (scsi_lib.c:2391-2399): the medium is there
             Ready::Check(s) if s.key == sense::UNIT_ATTENTION => {
+                self.present = true;
                 self.stats.unit_attentions += 1;
                 self.stats.media_changes += 1;
                 self.say(format!("TEST UNIT READY: {s}: a medium change: the volume read again"));
-                self.mount()?;
+                self.revalidate()?;
             }
             Ready::Check(s) => self.say(format!("TEST UNIT READY: {s}")),
             Ready::Failed(e) => self.say(format!("TEST UNIT READY failed: {e}")),
