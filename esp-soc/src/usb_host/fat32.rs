@@ -2,12 +2,15 @@
 //! records to: mount (an MBR's first FAT32 partition, or a volume from LBA 0), list, read, and
 //! write files in a vfat-like pattern: the directory entry first, the data in chunks as it comes,
 //! the FAT sectors covering each chunk's clusters (both copies), and at the end the entry's size
-//! and first cluster and FSInfo. It is not Linux's writeback order (page-cache batches, buffered
-//! metadata, periodic inode writeback, FSInfo at sync or unmount): a file cut off mid-write here
-//! keeps size 0 and no cluster, its data orphaned. Paths reach subdirectories (`mkdir_all`), and
-//! a name that is not an upper-case 8.3 name gets long-name entries before its short one, as
-//! Windows writes them. Field offsets: Microsoft FAT32 File System Specification 1.03
-//! (fatgen103), "FAT Directory Structure" and "FAT Long Directory Entries".
+//! and first cluster and FSInfo. A file cut off mid-write here keeps size 0 and no cluster, its
+//! data orphaned. `FileWriter::linux` rewrites the entry and FSInfo after every chunk, and the
+//! metadata goes through `BlockDevice::read_meta` and `write_meta`, so a `pagecache::PageCache`
+//! underneath gives Linux's writeback order (data in batches, metadata held back, intermediate
+//! entry sizes). Files are deleted as Linux unlinks them, the dirty flag kept, and fsck run as
+//! dosfstools does. Paths reach subdirectories (`mkdir_all`), and a name that is not an upper-case
+//! 8.3 name gets long-name entries before its short one, as Windows writes them. Field offsets:
+//! Microsoft FAT32 File System Specification 1.03 (fatgen103), "FAT Directory Structure" and "FAT
+//! Long Directory Entries".
 
 /// Blocks on the other end, by number.
 pub trait BlockDevice {
@@ -15,6 +18,10 @@ pub trait BlockDevice {
     fn blocks(&self) -> u64;
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), String>;
     fn write_blocks(&mut self, lba: u64, data: &[u8]) -> Result<(), String>;
+    /// Filesystem metadata (boot sector, FSInfo, FAT, directories), which a cache may keep
+    /// (`pagecache::PageCache`); a plain device reads and writes it as blocks.
+    fn read_meta(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), String> { self.read_blocks(lba, buf) }
+    fn write_meta(&mut self, lba: u64, data: &[u8]) -> Result<(), String> { self.write_blocks(lba, data) }
     /// Let time pass with nothing to do (a camera filling the next chunk).
     fn pause_ns(&mut self, _ns: u64) -> Result<(), String> { Ok(()) }
     /// Emulated time, for pacing; a device without a clock stays at 0.
@@ -120,6 +127,8 @@ pub struct Fat32 {
     /// and FatFs keep the last allocated one there; a search that starts at it covers both)
     allocated: u32,
     hint: u32,
+    /// clusters freed since FSInfo was last written
+    freed: u32,
 }
 
 /// `name.ext` as the 11 bytes of a short directory entry, upper case.
@@ -229,6 +238,9 @@ fn long_entries(name: &str, short: &[u8; 11]) -> Result<Vec<[u8; 32]>, String> {
     }).collect())
 }
 
+/// Where a directory entry sits: its sector and its slot of 16 in it.
+type Slot = (u64, usize);
+
 /// A directory entry as `Fat32::dir_entries` finds it, with its short name.
 #[derive(Clone, Debug)]
 struct Found { entry: DirEntry, short: [u8; 11] }
@@ -239,13 +251,13 @@ impl Fat32 {
     pub fn mount(dev: &mut dyn BlockDevice) -> Result<Self, String> {
         if dev.block_size() != 512 { return Err(format!("{}-byte blocks: only 512 is supported", dev.block_size())); }
         let mut s = [0u8; 512];
-        dev.read_blocks(0, &mut s)?;
+        dev.read_meta(0, &mut s)?;
         // An MBR's partition entries at 446; a FAT32 volume boot record starts with a jump.
         let mut volume = 0u64;
         if s[510..512] == [0x55, 0xaa] && !(s[0] == 0xeb || s[0] == 0xe9) {
             let p = (0..4).map(|i| &s[446 + 16 * i..462 + 16 * i]).find(|e| matches!(e[4], 0x0b | 0x0c)).ok_or("no FAT32 partition in the MBR")?;
             volume = get32(p, 8) as u64;
-            dev.read_blocks(volume, &mut s)?;
+            dev.read_meta(volume, &mut s)?;
         }
         if get16(&s, 11) != 512 || s[510..512] != [0x55, 0xaa] { return Err("no FAT32 boot sector".into()); }
         let (spc, reserved, fats) = (s[13] as u32, get16(&s, 14) as u32, s[16] as u32);
@@ -255,9 +267,9 @@ impl Fat32 {
         let data_lba = volume + reserved as u64 + (fats * fat_sectors) as u64;
         let clusters = (total - reserved - fats * fat_sectors) / spc;
         let mut fs = Fat32 { volume_lba: volume, sectors_per_cluster: spc, reserved, fats, fat_sectors, root_cluster: get32(&s, 44), fsinfo: get16(&s, 48) as u32,
-                             clusters, data_lba, label: String::from_utf8_lossy(&s[71..82]).trim_end().to_string(), allocated: 0, hint: 2 };
+                             clusters, data_lba, label: String::from_utf8_lossy(&s[71..82]).trim_end().to_string(), allocated: 0, hint: 2, freed: 0 };
         let mut info = [0u8; 512];
-        dev.read_blocks(volume + fs.fsinfo as u64, &mut info)?;
+        dev.read_meta(volume + fs.fsinfo as u64, &mut info)?;
         if get32(&info, 0) == 0x4161_5252 && get32(&info, 484) == 0x6141_7272 {
             let hint = get32(&info, 492);
             if (2..clusters + 2).contains(&hint) { fs.hint = hint; }
@@ -266,6 +278,10 @@ impl Fat32 {
     }
 
     pub fn cluster_bytes(&self) -> usize { self.sectors_per_cluster as usize * 512 }
+    /// The cluster a data-area sector belongs to.
+    pub fn cluster_of_lba(&self, lba: u64) -> Option<u32> { (lba >= self.data_lba).then(|| ((lba - self.data_lba) / self.sectors_per_cluster as u64) as u32 + 2).filter(|&c| c < self.clusters + 2) }
+    /// The sector of the first FAT a sector is, by its number in that FAT.
+    pub fn fat_sector_of_lba(&self, lba: u64) -> Option<u64> { let fat = self.volume_lba + self.reserved as u64; (fat..fat + self.fat_sectors as u64).contains(&lba).then(|| lba - fat) }
     fn cluster_lba(&self, c: u32) -> u64 { self.data_lba + (c as u64 - 2) * self.sectors_per_cluster as u64 }
     fn fat_lba(&self, copy: u32, c: u32) -> u64 { self.volume_lba + self.reserved as u64 + (copy * self.fat_sectors) as u64 + (c / 128) as u64 }
 
@@ -277,7 +293,7 @@ impl Fat32 {
         while (2..0x0fff_fff8).contains(&c) {
             if out.len() > self.clusters as usize { return Err("a cluster chain loops".into()); }
             out.push(c);
-            if c / 128 != loaded { dev.read_blocks(self.fat_lba(0, c), &mut s)?; loaded = c / 128; }
+            if c / 128 != loaded { dev.read_meta(self.fat_lba(0, c), &mut s)?; loaded = c / 128; }
             c = get32(&s, (c % 128) as usize * 4) & 0x0fff_ffff;
         }
         Ok(out)
@@ -290,13 +306,13 @@ impl Fat32 {
         sectors.dedup();
         for sec in sectors {
             let mut s = [0u8; 512];
-            dev.read_blocks(self.fat_lba(0, sec * 128), &mut s)?;
+            dev.read_meta(self.fat_lba(0, sec * 128), &mut s)?;
             for &(c, v) in entries.iter().filter(|(c, _)| c / 128 == sec) {
                 let at = (c % 128) as usize * 4;
                 let old = get32(&s, at);
                 put32(&mut s, at, (old & 0xf000_0000) | (v & 0x0fff_ffff));
             }
-            for copy in 0..self.fats { dev.write_blocks(self.fat_lba(copy, sec * 128), &s)?; }
+            for copy in 0..self.fats { dev.write_meta(self.fat_lba(copy, sec * 128), &s)?; }
         }
         Ok(())
     }
@@ -311,7 +327,7 @@ impl Fat32 {
         while out.len() < n {
             if seen >= self.clusters { return Err("the volume is full".into()); }
             if c >= self.clusters + 2 { c = 2; }
-            if c / 128 != loaded { dev.read_blocks(self.fat_lba(0, c), &mut s)?; loaded = c / 128; }
+            if c / 128 != loaded { dev.read_meta(self.fat_lba(0, c), &mut s)?; loaded = c / 128; }
             if get32(&s, (c % 128) as usize * 4) & 0x0fff_ffff == FREE { out.push(c); }
             c += 1;
             seen += 1;
@@ -330,7 +346,7 @@ impl Fat32 {
         let mut out = Vec::new();
         for lba in self.root_sectors(dev)? {
             let mut s = [0u8; 512];
-            dev.read_blocks(lba, &mut s)?;
+            dev.read_meta(lba, &mut s)?;
             for e in s.as_chunks::<32>().0 {
                 if e[0] == 0 { return Ok(out); }
                 if e[0] == 0xe5 || e[11] & 0x0f == 0x0f { continue; }
@@ -367,7 +383,7 @@ impl Fat32 {
         if self.list_root(dev)?.iter().any(|e| e.name == display_name(&raw)) { return Err(format!("{name}: exists")); }
         for lba in self.root_sectors(dev)? {
             let mut s = [0u8; 512];
-            dev.read_blocks(lba, &mut s)?;
+            dev.read_meta(lba, &mut s)?;
             if let Some(slot) = s.as_chunks::<32>().0.iter().position(|e| e[0] == 0 || e[0] == 0xe5) {
                 let e = &mut s[slot * 32..slot * 32 + 32];
                 e.fill(0);
@@ -376,8 +392,8 @@ impl Fat32 {
                 // a fixed time stamp, 2024-01-01 00:00, so the image is the same on every run
                 let date = ((2024 - 1980) << 9 | 1 << 5 | 1) as u16;
                 for at in [16, 18, 24] { e[at..at + 2].copy_from_slice(&date.to_le_bytes()); }
-                dev.write_blocks(lba, &s)?;
-                return Ok(FileWriter { dir_lba: lba, dir_slot: slot, first: 0, last: 0, size: 0, pending: Vec::new(), fat_every: 1, chunks: 0 });
+                dev.write_meta(lba, &s)?;
+                return Ok(FileWriter::new(lba, slot));
             }
         }
         Err("the root directory is full (it is not extended)".into())
@@ -389,12 +405,13 @@ impl Fat32 {
     pub fn write_fsinfo(&mut self, dev: &mut dyn BlockDevice) -> Result<(), String> {
         let lba = self.volume_lba + self.fsinfo as u64;
         let mut s = [0u8; 512];
-        dev.read_blocks(lba, &mut s)?;
+        dev.read_meta(lba, &mut s)?;
         let free = get32(&s, 488);
-        if free != u32::MAX { put32(&mut s, 488, free.saturating_sub(self.allocated)); }
+        if free != u32::MAX { put32(&mut s, 488, free.saturating_sub(self.allocated).saturating_add(self.freed).min(self.clusters)); }
         put32(&mut s, 492, self.hint);
         self.allocated = 0;
-        dev.write_blocks(lba, &s)
+        self.freed = 0;
+        dev.write_meta(lba, &s)
     }
 
     fn dir_sectors(&self, dev: &mut dyn BlockDevice, cluster: u32) -> Result<Vec<u64>, String> {
@@ -410,7 +427,7 @@ impl Fat32 {
         let mut long: Option<Long> = None;
         for lba in self.dir_sectors(dev, cluster)? {
             let mut s = [0u8; 512];
-            dev.read_blocks(lba, &mut s)?;
+            dev.read_meta(lba, &mut s)?;
             for e in s.as_chunks::<32>().0 {
                 if e[0] == 0 { return Ok(out); }
                 if e[0] == 0xe5 { long = None; continue; }
@@ -507,7 +524,7 @@ impl Fat32 {
         let (mut start, mut run, mut ended) = (0, 0, false);
         'scan: for (i, &lba) in sectors.iter().enumerate() {
             let mut s = [0u8; 512];
-            dev.read_blocks(lba, &mut s)?;
+            dev.read_meta(lba, &mut s)?;
             cache.push((lba, s));
             for slot in 0..16 {
                 let first = s[slot * 32];
@@ -525,7 +542,7 @@ impl Fat32 {
             cache[at / 16].1[at % 16 * 32..at % 16 * 32 + 32].copy_from_slice(e);
         }
         let (first, last) = (start / 16, (start + entries.len() - 1) / 16);
-        for (lba, s) in &cache[first..=last] { dev.write_blocks(*lba, s)?; }
+        for (lba, s) in &cache[first..=last] { dev.write_meta(*lba, s)?; }
         let end = start + entries.len() - 1;
         Ok((sectors[end / 16], end % 16))
     }
@@ -546,7 +563,7 @@ impl Fat32 {
             let mut buf = vec![0u8; self.cluster_bytes()];
             buf[..32].copy_from_slice(&short_entry(b".          ", ATTR_DIRECTORY, new));
             buf[32..64].copy_from_slice(&short_entry(b"..         ", ATTR_DIRECTORY, if dir == self.root_cluster { 0 } else { dir }));
-            dev.write_blocks(self.cluster_lba(new), &buf)?;
+            dev.write_meta(self.cluster_lba(new), &buf)?;
             let entries = self.name_entries(dev, dir, c, ATTR_DIRECTORY, new)?;
             self.put_entries(dev, dir, &entries)?;
             self.write_fsinfo(dev)?;
@@ -565,7 +582,219 @@ impl Fat32 {
         if self.find(dev, dir, name)?.is_some() { return Err(format!("{path}: exists")); }
         let entries = self.name_entries(dev, dir, name, ATTR_ARCHIVE, 0)?;
         let (dir_lba, dir_slot) = self.put_entries(dev, dir, &entries)?;
-        Ok(FileWriter { dir_lba, dir_slot, first: 0, last: 0, size: 0, pending: Vec::new(), fat_every: 1, chunks: 0 })
+        Ok(FileWriter::new(dir_lba, dir_slot))
+    }
+
+    /// The entry named `name` in the directory at `dir`, and where its long-name entries and its
+    /// short entry sit, short entry last.
+    fn slots_of(&self, dev: &mut dyn BlockDevice, dir: u32, name: &str) -> Result<Option<(Found, Vec<Slot>)>, String> {
+        let Some(f) = self.find(dev, dir, name)? else { return Ok(None) };
+        let sum = lfn_checksum(&f.short);
+        let mut run: Vec<(u64, usize)> = Vec::new();
+        for lba in self.dir_sectors(dev, dir)? {
+            let mut s = [0u8; 512];
+            dev.read_meta(lba, &mut s)?;
+            for (slot, e) in s.as_chunks::<32>().0.iter().enumerate() {
+                if e[0] == 0 { return Ok(None); }
+                let live = e[0] != 0xe5;
+                if live && e[11] & 0x3f == ATTR_LONG_NAME && e[13] == sum { run.push((lba, slot)); continue; }
+                if live && e[..11] == f.short { run.push((lba, slot)); return Ok(Some((f, run))); }
+                run.clear();
+            }
+        }
+        Ok(None)
+    }
+
+    /// Delete the file at `path` as Linux's vfat unlinks one: its entries marked deleted (0xE5),
+    /// then its chain freed in every FAT when the inode is evicted, then FSInfo (v6.12
+    /// fs/fat/namei_vfat.c `vfat_unlink`, fs/fat/inode.c `fat_evict_inode`, fs/fat/fatent.c
+    /// `fat_free_clusters`). Returns the clusters freed, which a later allocation reuses once it
+    /// comes round to them.
+    pub fn delete_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u32>, String> {
+        let comps = components(path);
+        let Some((name, parents)) = comps.split_last() else { return Err("a file needs a name".into()) };
+        let dir = self.dir_of(dev, parents)?;
+        let (f, slots) = self.slots_of(dev, dir, name)?.ok_or_else(|| format!("{path}: no such file"))?;
+        if f.entry.attr & (ATTR_DIRECTORY | ATTR_VOLUME_ID) != 0 { return Err(format!("{path}: not a file")); }
+        let mut sectors: Vec<u64> = slots.iter().map(|s| s.0).collect();
+        sectors.dedup();
+        for lba in sectors {
+            let mut s = [0u8; 512];
+            dev.read_meta(lba, &mut s)?;
+            for &(_, slot) in slots.iter().filter(|x| x.0 == lba) { s[slot * 32] = 0xe5; }
+            dev.write_meta(lba, &s)?;
+        }
+        let chain = if f.entry.cluster == 0 { Vec::new() } else { self.chain(dev, f.entry.cluster)? };
+        let entries: Vec<(u32, u32)> = chain.iter().map(|&c| (c, FREE)).collect();
+        self.write_fat(dev, &entries)?;
+        self.freed += chain.len() as u32;
+        self.write_fsinfo(dev)?;
+        Ok(chain)
+    }
+
+    /// The volume's dirty flag: bit 0 of the FAT32 boot sector's byte 65 (BS_Reserved1), which
+    /// Linux keeps as `state` (v6.12 include/uapi/linux/msdos_fs.h FAT_STATE_DIRTY). Linux sets it
+    /// at a read-write mount and clears it at a clean unmount (fs/fat/inode.c `fat_set_state`,
+    /// `fat_put_super`); a volume cut off without one is dirty at the next mount.
+    pub fn dirty(&self, dev: &mut dyn BlockDevice) -> Result<bool, String> {
+        let mut s = [0u8; 512];
+        dev.read_meta(self.volume_lba, &mut s)?;
+        Ok(s[65] & 1 != 0)
+    }
+
+    pub fn set_dirty(&self, dev: &mut dyn BlockDevice, dirty: bool) -> Result<(), String> {
+        let mut s = [0u8; 512];
+        dev.read_meta(self.volume_lba, &mut s)?;
+        if (s[65] & 1 != 0) == dirty { return Ok(()); }
+        s[65] = if dirty { s[65] | 1 } else { s[65] & !1 };
+        dev.write_meta(self.volume_lba, &s)
+    }
+
+    /// Check and repair the volume the way dosfstools 4.2's `fsck.fat -a` does it (src/fat.c,
+    /// src/check.c): both FATs read whole; every file's chain walked from its entry, a chain longer
+    /// than the size cut at the size (check.c:528-537), a size past the chain cut to the chain
+    /// (629-640), a chain into a free, bad or already owned cluster cut before it; clusters no
+    /// entry reaches freed (`reclaim_free`, fat.c:420; without -f, which keeps them as FSCKnnnn.REC
+    /// files); FSInfo's free count; the dirty flag cleared (check.c:1065-1080). How the FATs are
+    /// written is `write`.
+    pub fn fsck(&mut self, dev: &mut dyn BlockDevice, write: FsckWrite) -> Result<FsckReport, String> {
+        let mut r = FsckReport::default();
+        let fat_lba = self.volume_lba + self.reserved as u64;
+        let bytes = self.fat_sectors as usize * 512;
+        let read_fat = |dev: &mut dyn BlockDevice, copy: u32| -> Result<Vec<u8>, String> {
+            let mut raw = vec![0u8; bytes];
+            for (i, part) in raw.chunks_mut(2048 * 512).enumerate() { dev.read_meta(fat_lba + (copy * self.fat_sectors) as u64 + i as u64 * 2048, part)?; }
+            Ok(raw)
+        };
+        let first = read_fat(dev, 0)?;
+        let second = if self.fats > 1 { Some(read_fat(dev, 1)?) } else { None };
+        r.fat_bytes_read = bytes as u64 * self.fats as u64;
+        r.fats_differ = second.as_ref().is_some_and(|s| *s != first);
+        let n = self.clusters as usize + 2;
+        let mut fat: Vec<u32> = (0..n).map(|c| get32(&first, c * 4) & 0x0fff_ffff).collect();
+        let mut owned = vec![false; n];
+        let cb = self.cluster_bytes() as u64;
+        // directories to visit: their first cluster
+        let mut dirs = vec![self.root_cluster];
+        while let Some(dir) = dirs.pop() {
+            // the directory's own chain, cut where it leaves the volume or meets a cluster owned
+            let mut chain = Vec::new();
+            let mut c = dir;
+            while (2..n as u32).contains(&c) && !owned[c as usize] { owned[c as usize] = true; chain.push(c); c = fat[c as usize]; if c >= 0x0fff_fff8 { break; } }
+            for lba in chain.iter().flat_map(|&c| { let l = self.cluster_lba(c); (0..self.sectors_per_cluster as u64).map(move |i| l + i) }) {
+                let mut s = [0u8; 512];
+                dev.read_meta(lba, &mut s)?;
+                let mut changed = false;
+                for slot in 0..16 {
+                    let e = &mut s[slot * 32..slot * 32 + 32];
+                    if e[0] == 0 || e[0] == 0xe5 || e[11] & 0x3f == ATTR_LONG_NAME || e[11] & ATTR_VOLUME_ID != 0 || e[0] == b'.' { continue; }
+                    let start = (get16(e, 20) as u32) << 16 | get16(e, 26) as u32;
+                    let size = get32(e, 28) as u64;
+                    let is_dir = e[11] & ATTR_DIRECTORY != 0;
+                    let name = display_name(&e[..11]);
+                    if is_dir { if (2..n as u32).contains(&start) { dirs.push(start); } continue; }
+                    r.files += 1;
+                    let want = size.div_ceil(cb);
+                    let (mut prev, mut c, mut k) = (0u32, start, 0u64);
+                    while c != 0 && c < 0x0fff_fff8 {
+                        let bad = !(2..n as u32).contains(&c) || fat[c as usize] == FREE || owned[c as usize];
+                        if bad || k >= want {
+                            // cut before `c`: the chain ends at `prev`, or the file holds none
+                            if prev == 0 { e[20..22].fill(0); e[26..28].fill(0); changed = true; } else { fat[prev as usize] = EOC; }
+                            if bad { r.cross_or_broken.push(name.clone()); } else { r.truncated.push(name.clone()); }
+                            break;
+                        }
+                        owned[c as usize] = true;
+                        k += 1;
+                        prev = c;
+                        c = fat[c as usize];
+                    }
+                    if size > k * cb {
+                        put32(e, 28, (k * cb) as u32);
+                        r.resized.push(name.clone());
+                        changed = true;
+                    }
+                }
+                if changed { dev.write_meta(lba, &s)?; r.dir_sectors_written += 1; }
+            }
+        }
+        for c in 2..n {
+            if !owned[c] && fat[c] != FREE && fat[c] != 0x0fff_fff7 { fat[c] = FREE; r.lost_clusters += 1; }
+        }
+        let mut out = first.clone();
+        for (c, &v) in fat.iter().enumerate().skip(2) { let old = get32(&out, c * 4); put32(&mut out, c * 4, (old & 0xf000_0000) | v); }
+        let changed: Vec<usize> = (0..self.fat_sectors as usize).filter(|&i| out[i * 512..i * 512 + 512] != first[i * 512..i * 512 + 512]).collect();
+        let write_copy = |dev: &mut dyn BlockDevice, copy: u32, data: &[u8]| -> Result<(), String> {
+            for (i, part) in data.chunks(2048 * 512).enumerate() { dev.write_meta(fat_lba + (copy * self.fat_sectors) as u64 + i as u64 * 2048, part)?; }
+            Ok(())
+        };
+        match write {
+            FsckWrite::Bulk => {
+                for copy in 0..self.fats { write_copy(dev, copy, &out)?; }
+                r.fat_bytes_written = bytes as u64 * self.fats as u64;
+            }
+            FsckWrite::Changed => {
+                for &i in &changed {
+                    for copy in 0..self.fats { dev.write_meta(fat_lba + (copy * self.fat_sectors) as u64 + i as u64, &out[i * 512..i * 512 + 512])?; }
+                }
+                r.fat_bytes_written = changed.len() as u64 * 512 * self.fats as u64;
+                // copies that differ: the second rewritten whole from the first (fat.c:160-186)
+                if r.fats_differ {
+                    for copy in 1..self.fats { write_copy(dev, copy, &out)?; }
+                    r.fat_bytes_written += bytes as u64 * (self.fats as u64 - 1);
+                }
+            }
+        }
+        r.fat_sectors_changed = changed.len() as u64;
+        let free = fat.iter().skip(2).filter(|&&v| v == FREE).count() as u32;
+        let lba = self.volume_lba + self.fsinfo as u64;
+        let mut s = [0u8; 512];
+        dev.read_meta(lba, &mut s)?;
+        if get32(&s, 0) == 0x4161_5252 && get32(&s, 484) == 0x6141_7272 && get32(&s, 488) != free { put32(&mut s, 488, free); dev.write_meta(lba, &s)?; }
+        self.allocated = 0;
+        self.freed = 0;
+        r.dirty_cleared = self.dirty(dev)?;
+        self.set_dirty(dev, false)?;
+        Ok(r)
+    }
+}
+
+/// How `Fat32::fsck` writes the FATs back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsckWrite {
+    /// Each FAT sector holding a changed entry, in every copy, and the second copy whole when the
+    /// copies differed, as dosfstools 4.2 does (src/fat.c `set_fat`, 160-186).
+    Changed,
+    /// Every FAT whole, the first copy first: a bulk rewrite of FAT1 (the shared-reading plan's
+    /// assumption for the car's fsck, not dosfstools' own pattern).
+    Bulk,
+}
+
+/// What `Fat32::fsck` found and wrote.
+#[derive(Clone, Debug, Default)]
+pub struct FsckReport {
+    pub files: usize,
+    /// a chain longer than the size, cut at the size
+    pub truncated: Vec<String>,
+    /// a size past the chain, cut to the chain
+    pub resized: Vec<String>,
+    /// a chain into a free, bad or already owned cluster, cut before it
+    pub cross_or_broken: Vec<String>,
+    pub lost_clusters: u32,
+    pub fats_differ: bool,
+    pub fat_sectors_changed: u64,
+    pub fat_bytes_read: u64,
+    pub fat_bytes_written: u64,
+    pub dir_sectors_written: u64,
+    /// the volume was marked dirty
+    pub dirty_cleared: bool,
+}
+
+impl FsckReport {
+    pub fn summary(&self) -> String {
+        format!("{} files: {} truncated to their size, {} sizes cut to their chain, {} chains broken or cross-linked, {} lost clusters freed; FATs {}; {} FAT sectors changed, {} KiB of FAT read and {} KiB written, {} directory sectors written; {}",
+                self.files, self.truncated.len(), self.resized.len(), self.cross_or_broken.len(), self.lost_clusters, if self.fats_differ { "differed" } else { "agreed" },
+                self.fat_sectors_changed, self.fat_bytes_read >> 10, self.fat_bytes_written >> 10, self.dir_sectors_written, if self.dirty_cleared { "dirty flag cleared" } else { "the volume was clean" })
     }
 }
 
@@ -581,9 +810,23 @@ pub struct FileWriter {
     /// write the FAT after this many chunks
     pub fat_every: u32,
     chunks: u32,
+    /// Linux's order: the entry's first cluster and size, and FSInfo, written again after every
+    /// chunk, as inode writeback finds the inode and FSInfo dirty (v6.12 fs/fat/inode.c
+    /// `__fat_write_inode`, fatent.c `mark_fsinfo_dirty`); a writeback cache keeps the latest
+    /// and lands it late, so the medium sees intermediate sizes
+    pub linux: bool,
 }
 
 impl FileWriter {
+    fn new(dir_lba: u64, dir_slot: usize) -> Self {
+        FileWriter { dir_lba, dir_slot, first: 0, last: 0, size: 0, pending: Vec::new(), fat_every: 1, chunks: 0, linux: false }
+    }
+
+    /// Bytes written so far.
+    pub fn size(&self) -> u64 { self.size }
+    /// The first cluster, 0 before the first chunk.
+    pub fn first_cluster(&self) -> u32 { self.first }
+
     /// Append `data` (a whole number of clusters, except for the file's last chunk): clusters
     /// from the volume's free ones, the data in one write per contiguous run, then the FAT
     /// sectors for them every `fat_every` chunks.
@@ -610,6 +853,10 @@ impl FileWriter {
         self.size += data.len() as u64;
         self.chunks += 1;
         if self.chunks.is_multiple_of(self.fat_every.max(1)) { self.flush_fat(fs, dev)?; }
+        if self.linux {
+            self.write_entry(dev)?;
+            fs.write_fsinfo(dev)?;
+        }
         Ok(())
     }
 
@@ -622,16 +869,21 @@ impl FileWriter {
         Ok(())
     }
 
-    /// The FAT left, the directory entry's first cluster and size, FSInfo.
-    pub fn close(mut self, fs: &mut Fat32, dev: &mut dyn BlockDevice) -> Result<u64, String> {
-        self.flush_fat(fs, dev)?;
+    /// The directory entry's first cluster and size as they stand.
+    fn write_entry(&self, dev: &mut dyn BlockDevice) -> Result<(), String> {
         let mut s = [0u8; 512];
-        dev.read_blocks(self.dir_lba, &mut s)?;
+        dev.read_meta(self.dir_lba, &mut s)?;
         let e = &mut s[self.dir_slot * 32..self.dir_slot * 32 + 32];
         e[20..22].copy_from_slice(&((self.first >> 16) as u16).to_le_bytes());
         e[26..28].copy_from_slice(&(self.first as u16).to_le_bytes());
         put32(e, 28, self.size as u32);
-        dev.write_blocks(self.dir_lba, &s)?;
+        dev.write_meta(self.dir_lba, &s)
+    }
+
+    /// The FAT left, the directory entry's first cluster and size, FSInfo.
+    pub fn close(mut self, fs: &mut Fat32, dev: &mut dyn BlockDevice) -> Result<u64, String> {
+        self.flush_fat(fs, dev)?;
+        self.write_entry(dev)?;
         fs.write_fsinfo(dev)?;
         Ok(self.size)
     }

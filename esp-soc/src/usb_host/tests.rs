@@ -45,7 +45,21 @@ struct FakeMsc {
     bus_resets: u32,
     /// stop answering bulk IN after this many more IN data packets
     hang_after: Option<u32>,
+    /// the port's time, set before each service
+    now: u64,
+    /// when the application holds the card
+    windows: Vec<FakeWindow>,
+    /// when each WRITE(10) of `writes` came
+    write_at: Vec<u64>,
 }
+
+/// A window as esp_tinyusb serves one: while the application holds the card TEST UNIT READY
+/// answers MEDIUM NOT PRESENT, and READ(10) and WRITE(10) still reach the card (tinyusb_msc.c
+/// `tud_msc_test_unit_ready_cb`, `tud_msc_read10_cb`, `tud_msc_write10_cb`). `app` changes the card
+/// once, at the window's start.
+struct FakeWindow { from: u64, to: u64, app: Option<AppWrite> }
+/// What the application does to the card's bytes.
+type AppWrite = Box<dyn FnMut(&mut Vec<u8>)>;
 
 const DEVICE: [u8; 18] = [18, 1, 0x00, 0x02, 0xef, 2, 1, 64, 0x3a, 0x30, 0x02, 0x40, 0x00, 0x01, 1, 2, 3, 1];
 fn config() -> Vec<u8> {
@@ -60,7 +74,7 @@ fn string(s: &str) -> Vec<u8> { let mut v = vec![2 + 2 * s.len() as u8, 3]; for 
 impl FakeMsc {
     fn new(blocks: usize) -> Self {
         FakeMsc { disk: vec![0; blocks * 512], vbus: false, setup: [0; 8], ctrl_in: Vec::new(), ctrl_pos: 0, ctrl_stall: false, ep0_pid: true, configured: false,
-                  pid: [false; 2], halt: [false; 2], bot: Bot::Idle, tag: 0, want: 0, sense: Sense::default(), knobs: Knobs::default(), bot_resets: 0, clear_halts: 0, commands: Vec::new(), write_lba: 0, writes: Vec::new(), bus_resets: 0, hang_after: None }
+                  pid: [false; 2], halt: [false; 2], bot: Bot::Idle, tag: 0, want: 0, sense: Sense::default(), knobs: Knobs::default(), bot_resets: 0, clear_halts: 0, commands: Vec::new(), write_lba: 0, writes: Vec::new(), bus_resets: 0, hang_after: None, now: 0, windows: Vec::new(), write_at: Vec::new() }
     }
     fn csw(&self, residue: u32, status: u8) -> [u8; 13] {
         let mut c = [0u8; 13];
@@ -88,6 +102,7 @@ impl FakeMsc {
         let reply = match opc {
             op::TEST_UNIT_READY => {
                 if self.knobs.not_ready > 0 { self.knobs.not_ready -= 1; return self.fail(sense::NOT_READY, sense::MEDIUM_NOT_PRESENT, false); }
+                if self.windows.iter().any(|w| (w.from..w.to).contains(&self.now)) { return self.fail(sense::NOT_READY, sense::MEDIUM_NOT_PRESENT, false); }
                 None
             }
             op::REQUEST_SENSE => { let mut s = vec![0u8; 18]; s[0] = 0x70; s[2] = self.sense.key; s[7] = 10; s[12] = self.sense.asc; s[13] = self.sense.ascq; self.sense = Sense::default(); Some(s) }
@@ -96,7 +111,7 @@ impl FakeMsc {
             op::MODE_SENSE6 => Some(vec![3, 0, 0, 0]),
             op::PREVENT_ALLOW | op::START_STOP_UNIT | op::SYNCHRONIZE_CACHE10 => None,
             op::READ10 => { if (lba + n) * 512 > self.disk.len() { return self.fail(sense::ILLEGAL_REQUEST, 0x21, true); } Some(self.disk[lba * 512..(lba + n) * 512].to_vec()) }
-            op::WRITE10 => { self.write_lba = lba; self.writes.push((lba, n)); self.bot = Bot::DataOut(n * 512, Vec::new()); return; }
+            op::WRITE10 => { self.write_lba = lba; self.writes.push((lba, n)); self.write_at.push(self.now); self.bot = Bot::DataOut(n * 512, Vec::new()); return; }
             _ => return self.fail(sense::ILLEGAL_REQUEST, sense::INVALID_OPCODE, dir_in),
         };
         match reply {
@@ -211,11 +226,14 @@ impl UsbPort for FakePort {
     fn link(&mut self) -> Option<&mut UsbLink> { Some(&mut self.link) }
     fn run_until(&mut self, t_ns: u64) -> Result<(), String> {
         loop {
+            self.dev.now = self.now;
+            for w in self.dev.windows.iter_mut().filter(|w| w.from <= self.now) { if let Some(mut app) = w.app.take() { app(&mut self.dev.disk); } }
             if self.link.tick_to(self.now) { self.link.service(self.now, &mut self.dev, &mut NoMem); }
             let p = self.dev.pullup();
             if p != self.pullup { self.pullup = p; self.link.device_pullup(self.now, p); continue; }
             if self.now >= t_ns { return Ok(()); }
-            self.now = self.link.wake_at().map_or(t_ns, |w| w.max(self.now + 1)).min(t_ns);
+            let next_window = self.dev.windows.iter().filter(|w| w.app.is_some() && w.from > self.now).map(|w| w.from).min().unwrap_or(u64::MAX);
+            self.now = self.link.wake_at().map_or(t_ns, |w| w.max(self.now + 1)).min(t_ns).min(next_window);
         }
     }
 }
@@ -559,4 +577,242 @@ impl super::fat32::BlockDevice for FileDisk {
         self.0.seek(std::io::SeekFrom::Start(lba * 512)).map_err(|e| e.to_string())?;
         self.0.write_all(data).map_err(|e| e.to_string())
     }
+}
+
+use super::car::{Car, CarCfg, Offline, Recorded};
+use super::fat32::{mp4_bytes, FsckWrite};
+use super::pagecache::{PageCache, WritebackCfg};
+
+/// A 64 MiB FAT32 image of 512-byte clusters, in memory.
+fn small_volume(tag: &str) -> Vec<u8> {
+    let img = std::env::temp_dir().join(format!("usbhost-{tag}-{}.img", std::process::id()));
+    sd_image::fat32(&img, 64 << 20, 512, "").unwrap();
+    let d = std::fs::read(&img).unwrap();
+    let _ = std::fs::remove_file(&img);
+    d
+}
+
+/// The application's FatFs making a directory on the card, as oxidrive's TeslaCam self-heal does
+/// in a window: a cluster from FSInfo's hint, the entry in the root, FSInfo.
+fn app_mkdir(path: &'static str) -> AppWrite {
+    Box::new(move |disk: &mut Vec<u8>| {
+        let mut m = MemDisk(std::mem::take(disk));
+        let mut fs = Fat32::mount(&mut m).unwrap();
+        fs.mkdir_all(&mut m, path).unwrap();
+        *disk = m.0;
+    })
+}
+
+/// esp_tinyusb answers TEST UNIT READY with MEDIUM NOT PRESENT while the application holds the
+/// card but writes every WRITE(10) to the card all the same, so a car recording when a window
+/// opens keeps writing into it until its next poll: here 2 s polls, a window from 0.5 s, the
+/// writes between it and the poll at 2.16 s on the card, the clip cut there. When the window ends
+/// the car sees the medium again and reads the volume anew.
+#[test]
+fn a_car_keeps_writing_into_a_window_until_its_next_poll() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("window-writes");
+    dev.windows.push(FakeWindow { from: 500_000_000, to: 3_000_000_000, app: None });
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut car = Car::new(PageCache::new(m), CarCfg::default());
+    car.mount().unwrap();
+    let mounted = car.now();
+    let clip = mp4_bytes("event", 8 << 20);
+    let r = car.record("TeslaCam/RecentClips/clip.mp4", &clip).unwrap();
+    let Recorded::MediumGone { written } = r else { panic!("{r:?}") };
+    let gone = car.log.iter().find(|l| l.1.contains("medium gone")).unwrap().0;
+    assert!((mounted + 2_000_000_000..mounted + 2_010_000_000).contains(&gone), "the poll 2 s after the mount saw it: {gone}");
+    assert!(written > 6 << 20 && written < 8 << 20, "about 2 s of a 4.1 MB/s camera written: {written}");
+    assert!(!car.present && car.fs.is_none());
+    car.idle(2_000_000_000).unwrap();
+    assert!(car.present && car.stats.mounts == 2 && car.stats.media_changes == 2, "{:?}", car.stats);
+    drop(car);
+    let in_window: Vec<_> = port.dev.writes.iter().zip(&port.dev.write_at).filter(|(_, &t)| (500_000_000..gone).contains(&t)).collect();
+    let blocks: usize = in_window.iter().map(|(w, _)| w.1).sum();
+    assert!(in_window.len() > 90 && blocks * 512 > 6 << 20, "{} WRITE(10)s, {blocks} blocks reached the card under the application", in_window.len());
+    // vfat-like order: the cut clip's entry still says 0 bytes and no cluster, its data orphaned
+    let mut mem = MemDisk(port.dev.disk.clone());
+    let fs = Fat32::mount(&mut mem).unwrap();
+    let e = fs.stat(&mut mem, "TeslaCam/RecentClips/clip.mp4").unwrap().unwrap();
+    assert_eq!((e.size, e.cluster), (0, 0));
+}
+
+/// A car that keeps the FAT and the directories it read (Linux's buffer cache), polling every 5 s,
+/// does not see a window that opens and closes between two polls: the application's directory,
+/// made in the window, is not in the car's cached root and FAT, so the car's own directory takes
+/// the same root slot and the same cluster. A car that reads the volume again sees it and uses it.
+#[test]
+fn a_caching_car_writes_over_what_a_window_between_its_polls_wrote() {
+    for keep in [true, false] {
+        let mut dev = FakeMsc::new(0);
+        dev.disk = small_volume("window-short");
+        dev.windows.push(FakeWindow { from: 1_000_000_000, to: 1_500_000_000, app: Some(app_mkdir("TeslaCam/SavedClips")) });
+        let mut port = FakePort::new(dev);
+        let m = msc(&mut port);
+        let disk = if keep { PageCache::keeping_meta(m) } else { PageCache::new(m) };
+        let mut car = Car::new(disk, CarCfg { poll_ns: 5_000_000_000, ..CarCfg::default() });
+        car.mount().unwrap();
+        // the car looks for its folder before the window: the root and the FAT read
+        assert!(car.fs.clone().unwrap().stat(&mut car.disk, "TeslaCam").unwrap().is_none());
+        car.idle(6_000_000_000).unwrap();
+        assert_eq!((car.stats.polls, car.stats.media_changes), (1, 0), "the one poll, at 5.16 s, found the medium there");
+        let fs = car.fs.as_mut().unwrap();
+        fs.mkdir_all(&mut car.disk, "TeslaCam/RecentClips").unwrap();
+        drop(car);
+        let mut mem = MemDisk(port.dev.disk.clone());
+        let fs = Fat32::mount(&mut mem).unwrap();
+        let names = |p: &str, mem: &mut MemDisk| fs.list(mem, p).map(|v| v.into_iter().map(|e| e.name).collect::<Vec<_>>());
+        if keep {
+            assert_eq!(names("TeslaCam", &mut mem).unwrap(), ["RecentClips"], "the application's SavedClips is gone: the car's TeslaCam took its cluster");
+            assert_eq!(fs.list_root(&mut mem).unwrap().len(), 1, "one TESLACAM in the root, in the same slot");
+        } else {
+            assert_eq!(names("TeslaCam", &mut mem).unwrap(), ["SavedClips", "RecentClips"]);
+        }
+    }
+}
+
+/// A recorder on Linux's writeback, the firmware's `WritebackCfg` defaults: each chunk's data in
+/// one batch 50 ms to 5 s after it was written, metadata pages held back 30 s about 96 times in
+/// 100, the entry rewritten as the file grows, so the medium sees intermediate sizes; after a
+/// sync the medium is what the car believes.
+#[test]
+fn writeback_lands_data_in_batches_and_holds_the_metadata_back() {
+    let disk = PageCache::writeback(Offline { dev: MemDisk(small_volume("writeback")), now: 0 }, WritebackCfg::default());
+    // 64 KiB a second: each clip records for 48 s, longer than the metadata lag
+    let mut car = Car::new(disk, CarCfg { poll_ns: 0, linux_entries: true, gap_ns: 1_000_000_000, ..CarCfg::default() });
+    car.disk.record = true;
+    car.mount().unwrap();
+    let clips: Vec<(String, Vec<u8>)> = (0..6).map(|i| (format!("TeslaCam/SavedClips/e{i}/front.mp4"), mp4_bytes(&format!("c{i}"), 3 << 20))).collect();
+    for (p, c) in &clips { assert!(matches!(car.record(p, c).unwrap(), Recorded::Closed { .. })); }
+    car.idle(40_000_000_000).unwrap();
+    assert_eq!(car.disk.dirty_pages(), 0, "everything landed within the lag and a flusher wake");
+    let fs = car.fs.clone().unwrap();
+    let data: Vec<_> = car.disk.landings.iter().filter(|l| !l.meta).collect();
+    let lag = |l: &&super::pagecache::Landing| l.at_ns - l.dirtied_ns;
+    assert!(data.iter().all(|l| (50_000_000..=5_100_000_000).contains(&lag(l))), "data lands within a flusher wake");
+    assert!(data.iter().all(|l| l.count >= 128 || l.lba + l.count as u64 > fs.data_lba), "a 64 KiB chunk lands in one write");
+    let meta: Vec<_> = car.disk.landings.iter().filter(|l| l.meta).collect();
+    let held = meta.iter().filter(|l| lag(l) >= 30_000_000_000).count();
+    assert!(held * 100 >= meta.len() * 85, "{held} of {} metadata writes trailed 30 s", meta.len());
+    let (first, entry_first) = super::pagecache::data_first(&car.disk.landings, &fs);
+    eprintln!("data first in {first} clusters, the entry first in {entry_first} ({:.1}% data first); {held} of {} metadata writes held back", first as f64 * 100.0 / (first + entry_first) as f64, meta.len());
+    assert!(first > 0 && entry_first > 0 && first * 100 > (first + entry_first) * 95, "data before its FAT entry in {first} clusters, the entry first in {entry_first}");
+    // the medium mid-recording: some entry sizes landed between 0 and the clip's size
+    let sizes = landed_entry_sizes(&car.disk.meta_landed);
+    assert!(sizes.iter().any(|&(_, s)| s > 0 && s < 3 << 20), "an intermediate size reached the medium: {sizes:?}");
+    car.disk.sync().unwrap();
+    let mut m = std::mem::replace(&mut car.disk.dev.dev, MemDisk(Vec::new()));
+    let fs = Fat32::mount(&mut m).unwrap();
+    for (p, c) in &clips { assert_eq!(fs.read_path(&mut m, p).unwrap(), *c, "{p}"); }
+}
+
+/// Power gone mid-recording: what had not landed is lost. The medium keeps a torn volume, which
+/// is dirty because the car never unmounted it; fsck cuts the files to what their chains hold,
+/// frees the clusters nothing reaches, and a second run finds nothing to do.
+#[test]
+fn a_power_cut_leaves_a_dirty_torn_volume_that_fsck_repairs() {
+    let disk = PageCache::writeback(Offline { dev: MemDisk(small_volume("powercut")), now: 0 }, WritebackCfg::default());
+    let mut car = Car::new(disk, CarCfg { poll_ns: 0, linux_entries: true, dirty_flag: true, ..CarCfg::default() });
+    car.mount().unwrap();
+    for i in 0..3 { car.record(&format!("TeslaCam/RecentClips/c{i}.mp4"), &mp4_bytes(&format!("c{i}"), 2 << 20)).unwrap(); }
+    car.idle(3_000_000_000).unwrap();
+    let lost = car.power_cut();
+    assert!(lost > 0);
+    let mut m = Offline { dev: std::mem::replace(&mut car.disk.dev.dev, MemDisk(Vec::new())), now: 0 };
+    let mut fs = Fat32::mount(&mut m).unwrap();
+    assert!(fs.dirty(&mut m).unwrap(), "no clean unmount");
+    let r = fs.fsck(&mut m, FsckWrite::Changed).unwrap();
+    assert!(r.dirty_cleared && r.lost_clusters + r.truncated.len() as u32 + r.resized.len() as u32 > 0, "{}", r.summary());
+    let again = fs.fsck(&mut m, FsckWrite::Changed).unwrap();
+    assert!(!again.dirty_cleared && again.lost_clusters == 0 && again.truncated.is_empty() && again.resized.is_empty() && again.fat_sectors_changed == 0, "{}", again.summary());
+}
+
+/// A car's RecentClips ring on a full volume: deleting the oldest clip frees its clusters, and the
+/// next clip, allocated from the hint as Linux's `fat_alloc_clusters` does once it has come round,
+/// takes them.
+#[test]
+fn rotation_on_a_full_volume_reuses_the_clusters_it_frees() {
+    let mut mem = MemDisk(small_volume("rotation"));
+    let mut fs = Fat32::mount(&mut mem).unwrap();
+    // fill the volume but for three clips and the two directories they go in
+    let fill = fs.clusters as usize - 1 - (3 * (1 << 20) / 512 + 2);
+    let mut w = fs.create(&mut mem, "FILLER.BIN").unwrap();
+    for n in (0..fill).step_by(2048).map(|at| (fill - at).min(2048)) { w.write(&mut fs, &mut mem, &vec![0u8; n * 512]).unwrap(); }
+    w.close(&mut fs, &mut mem).unwrap();
+    let mut car = Car::new(PageCache::new(Offline { dev: mem, now: 0 }), CarCfg { poll_ns: 0, gap_ns: 0, ..CarCfg::default() });
+    car.mount().unwrap();
+    let path = |i: usize| format!("TeslaCam/RecentClips/c{i}.mp4");
+    let mut chains = Vec::new();
+    for i in 0..6 {
+        if i >= 3 { car.delete(&path(i - 3)).unwrap(); }
+        car.record(&path(i), &mp4_bytes(&path(i), 1 << 20)).unwrap();
+        let fs = car.fs.clone().unwrap();
+        let e = fs.stat(&mut car.disk, &path(i)).unwrap().unwrap();
+        chains.push(fs.chain(&mut car.disk, e.cluster).unwrap());
+    }
+    for i in 3..6 { assert_eq!(chains[i], chains[i - 3], "clip {i} takes clip {}'s clusters", i - 3); }
+    assert_eq!(car.read(&path(5)).unwrap(), mp4_bytes(&path(5), 1 << 20));
+}
+
+/// The (name, size) of every file entry in the directory sectors that landed, in landing order.
+fn landed_entry_sizes(landed: &[(u64, u64, Vec<u8>)]) -> Vec<(String, u32)> {
+    landed.iter().flat_map(|(_, _, d)| d.chunks(32).filter(|e| e[0] != 0 && e[0] != 0xe5 && e[11] == 0x20).map(|e| (String::from_utf8_lossy(&e[..11]).to_string(), u32::from_le_bytes(e[28..32].try_into().unwrap()))).collect::<Vec<_>>()).collect()
+}
+
+/// A RecentClips ring of long-named clips in one directory: each deletion leaves its entries
+/// free (0xE5), and the next clip's long name and short entry take them, so the directory's one
+/// cluster holds the ring for good.
+#[test]
+fn a_ring_of_long_names_reuses_its_directory_slots() {
+    let img = std::env::temp_dir().join(format!("usbhost-ring-{}.img", std::process::id()));
+    sd_image::fat32(&img, 3 << 30, 32 << 10, "").unwrap();
+    let file = FileDisk(std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap());
+    let mut car = Car::new(PageCache::writeback(Offline { dev: file, now: 0 }, WritebackCfg::default()), CarCfg { poll_ns: 0, gap_ns: 0, linux_entries: true, ..CarCfg::default() });
+    car.mount().unwrap();
+    let cams = ["front", "back", "left_repeater", "right_repeater"];
+    let mut ring = std::collections::VecDeque::new();
+    for m in 0..300u32 {
+        let paths: Vec<String> = cams.iter().map(|c| format!("TeslaCam/RecentClips/2026-01-01_{:02}-{:02}-00-{c}.mp4", m / 60, m % 60)).collect();
+        let datas: Vec<Vec<u8>> = paths.iter().map(|p| mp4_bytes(p, 40_000)).collect();
+        let set: Vec<(&str, &[u8])> = paths.iter().map(|p| p.as_str()).zip(datas.iter().map(|d| d.as_slice())).collect();
+        car.record_set(&set, 100_000_000).unwrap_or_else(|e| panic!("set {m}: {e}"));
+        ring.push_back(paths);
+        if ring.len() > 12 { for p in ring.pop_front().unwrap() { car.delete(&p).unwrap(); } }
+    }
+    car.disk.sync().unwrap();
+    let fs = car.fs.clone().unwrap();
+    let e = fs.stat(&mut car.disk, "TeslaCam/RecentClips").unwrap().unwrap();
+    assert_eq!(fs.chain(&mut car.disk, e.cluster).unwrap().len(), 1, "one cluster");
+    assert_eq!(fs.list(&mut car.disk, "TeslaCam/RecentClips").unwrap().len(), 48);
+    drop(car);
+    let _ = std::fs::remove_file(&img);
+}
+
+/// A USB reset without power loss, then the car's fsck with the FATs rewritten whole: the port
+/// reset as Linux's `usb_reset_device` does it, every sector of both FATs written, FAT1 first, in
+/// commands of 240 blocks, and the volume read again afterwards.
+#[test]
+fn a_reset_then_a_bulk_fsck_rewrites_both_fats_whole() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("bulk-fsck");
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut car = Car::new(PageCache::new(m), CarCfg { poll_ns: 0, gap_ns: 0, ..CarCfg::default() });
+    car.mount().unwrap();
+    car.record("TeslaCam/RecentClips/a.mp4", &mp4_bytes("a", 300_000)).unwrap();
+    car.disk.dev.host.reset_device().unwrap();
+    let fs = car.fs.clone().unwrap();
+    let r = car.fsck_now(super::fat32::FsckWrite::Bulk).unwrap();
+    assert_eq!((r.files, r.lost_clusters, r.fat_bytes_written), (1, 0, 2 * fs.fat_sectors as u64 * 512), "{}", r.summary());
+    assert_eq!(car.read("TeslaCam/RecentClips/a.mp4").unwrap(), mp4_bytes("a", 300_000));
+    drop(car);
+    let fat1 = 2048 + fs.reserved as usize;
+    let fat2 = fat1 + fs.fat_sectors as usize;
+    let w = &port.dev.writes;
+    let first = w.iter().position(|x| x.0 == fat1 && x.1 == 240).expect("FAT1 rewritten from its first sector");
+    let blocks = |lo: usize, hi: usize| w[first..].iter().filter(|x| (lo..hi).contains(&x.0)).map(|x| x.1).sum::<usize>();
+    assert_eq!((blocks(fat1, fat2), blocks(fat2, fat2 + fs.fat_sectors as usize)), (fs.fat_sectors as usize, fs.fat_sectors as usize));
+    assert!(w[first..].iter().take_while(|x| x.0 < fat2).all(|x| (fat1..fat2).contains(&x.0)), "FAT1 whole before FAT2");
+    assert_eq!(port.dev.bus_resets, 3, "the enumeration's reset and the port reset's two");
 }

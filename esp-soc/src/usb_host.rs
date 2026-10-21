@@ -6,13 +6,17 @@
 //! enumerates it (USB 2.0 §9.1.2, chapter 9 requests), then moves control and bulk transfers.
 //! `msc::Msc` runs SCSI over bulk-only transport on top, `fat32` writes and reads files on the
 //! volume the device presents, `script` drives all of it from a command file (`--usb-host`).
+//! `pagecache` puts Linux's caches between the filesystem and the drive, and `car` records and
+//! polls the drive as a car does.
 //!
 //! Time: the host learns that a request finished at the next microframe boundary after it did
 //! (the one-microframe interrupt threshold Linux's EHCI driver programs, USBCMD.ITC) and submits
 //! the next one there; host-side waits (debounce, reset recovery) are emulated time. The port
 //! the host runs on (`UsbPort`) lets emulated time pass: a `Machine` runs its firmware meanwhile.
+pub mod car;
 pub mod fat32;
 pub mod msc;
+pub mod pagecache;
 pub mod script;
 #[cfg(test)]
 mod tests;
