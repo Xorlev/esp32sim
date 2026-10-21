@@ -580,6 +580,23 @@ fn snapshot(card: &std::path::Path, dir: &std::path::Path, n: usize, at_ns: u64)
     p
 }
 
+/// Beside the snapshots, for judging them offline: `truth.tsv` (every file the car made: path,
+/// bytes, CRC-32 of its clip), `snap-NNN-<t>s.tsv` (what the car knew of each file then: bytes
+/// written, closed, deleted) and `writes.tsv` (every run of blocks the card was written, with its
+/// time: a dirty log no window hides).
+fn dump_truth(dir: &std::path::Path, files: &BTreeMap<String, CarFile>, snaps: &[(std::path::PathBuf, u64, BTreeMap<String, FileState>)], writes: &[CardWrite]) {
+    let crc = |d: &[u8]| !d.iter().fold(!0u32, |c, &b| (0..8).fold(c ^ b as u32, |c, _| if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 }));
+    let truth: String = files.iter().map(|(p, f)| format!("{p}\t{}\t{:08x}\n", f.data.len(), crc(&f.data))).collect();
+    std::fs::write(dir.join("truth.tsv"), format!("path\tbytes\tcrc32\n{truth}")).unwrap();
+    for (img, _, state) in snaps {
+        let rows: String = state.iter().map(|(p, f)| format!("{p}\t{}\t{}\t{}\n", f.written, f.complete, f.deleted)).collect();
+        std::fs::write(img.with_extension("tsv"), format!("path\twritten\tclosed\tdeleted\n{rows}")).unwrap();
+    }
+    let rows: String = writes.iter().map(|w| format!("{}\t{}\t{}\n", w.at_ns, w.lba, w.count)).collect();
+    std::fs::write(dir.join("writes.tsv"), format!("at_ns\tlba\tcount\n{rows}")).unwrap();
+    eprintln!("[hazard] the car's truth, its state at each snapshot and the card's writes are in {}", dir.display());
+}
+
 /// What `judge_snapshot` counts, summed over snapshots.
 fn sum_counts(cs: &[RuleCount]) -> RuleCount {
     cs.iter().fold(RuleCount::default(), |mut a, c| {
@@ -620,22 +637,33 @@ fn external_oxidrive_archives_no_torn_clip_from_a_writeback_car() {
     let (cmd, mqtt) = (format!("oxidrive/{}/cmd", r.id), r.mqtt.client.clone());
     let wall = std::time::Instant::now();
     let record_secs = env_u64("OXIDRIVE_RECORD_SECS", 120);
-    let mut taken_snaps: Vec<(std::path::PathBuf, u64, BTreeMap<String, FileState>)> = Vec::new();
+    let taken_snaps: Vec<(std::path::PathBuf, u64, BTreeMap<String, FileState>)>;
     let (files, landings, stats, cache, fsck) = {
         let cfg = WritebackCfg::default();
         let mut car = car_on_with(&mut r, |m| PageCache::writeback(m, cfg), CarCfg { linux_entries: true, dirty_flag: true, ..CarCfg::default() }, Some(FsckWrite::Changed));
         let fsck = car.last_fsck.clone();
         for (p, f) in &hist.files { car.files.entry(p.clone()).or_insert_with(|| f.clone()); }
+        // the medium copied every `OXIDRIVE_SNAPSHOT_MS` while the car records, mid-write included
+        let every = env_u64("OXIDRIVE_SNAPSHOT_MS", 1000) * MS;
+        let hooked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (h, c, d) = (hooked.clone(), card.clone(), snaps.clone());
+        let mut next = 0u64;
         let mut tesla = Tesla::new(hist.minute);
         tesla.resume(&mut car);
         for phase in 0..2 {
+            let (h, c, d) = (h.clone(), c.clone(), d.clone());
+            car.on_tick = Some(Box::new(move |t, files| {
+                if t < next { return; }
+                next = t + every;
+                let n = h.borrow().len();
+                h.borrow_mut().push((snapshot(&c, &d, n, t), t, file_states(files)));
+            }));
             let end = car.now() + record_secs * S;
             while car.now() < end {
                 let st = tesla.step(&mut car).unwrap();
-                let t = car.now();
-                taken_snaps.push((snapshot(&card, &snaps, taken_snaps.len(), t), t, file_states(&car.files)));
-                if !matches!(st, Recorded::Closed { .. }) { eprintln!("[hazard] a set was cut at {}: {st:?}", secs(t)); }
+                if !matches!(st, Recorded::Closed { .. }) { eprintln!("[hazard] a set was cut at {}: {st:?}", secs(car.now())); }
             }
+            car.on_tick = None;
             // quiet: a window when oxidrive's policy allows (the card nearly full overrides the
             // cooldown), forced after the first
             let windows_before = shared.borrow().all("supervisor: card taken for archiving").len();
@@ -646,8 +674,10 @@ fn external_oxidrive_archives_no_torn_clip_from_a_writeback_car() {
             }
             car.idle(10 * S).unwrap();
             let t = car.now();
-            taken_snaps.push((snapshot(&card, &snaps, taken_snaps.len(), t), t, file_states(&car.files)));
+            let n = hooked.borrow().len();
+            hooked.borrow_mut().push((snapshot(&card, &snaps, n, t), t, file_states(&car.files)));
         }
+        taken_snaps = hooked.take();
         car.unmount().unwrap();
         (car.files.clone(), car.disk.landings.clone(), car.stats, car.disk.stats, fsck)
     };
@@ -688,6 +718,8 @@ fn external_oxidrive_archives_no_torn_clip_from_a_writeback_car() {
     }
     let total = sum_counts(&counts);
     eprintln!("[hazard] over all snapshots: {total:?}");
+    if std::env::var_os("OXIDRIVE_SNAPSHOT_DIR").is_some() { dump_truth(&snaps, &files, &taken_snaps, &sh.writes); }
+    assert!(total.read_on_sight.1 > 0, "no torn clip on the medium in any snapshot: nothing for a rule to catch");
     let torn: u64 = per.iter().filter(|(k, _)| k.1 != "same").map(|(_, n)| n).sum();
     let same: u64 = per.iter().filter(|(k, _)| k.1 == "same").map(|(_, n)| n).sum();
     assert!(same > 0, "nothing archived");

@@ -118,12 +118,18 @@ pub struct Car<D: Drive> {
     /// at a mount of a volume marked dirty: run fsck first, writing the FATs this way
     pub fsck_at_mount: Option<FsckWrite>,
     pub last_fsck: Option<(u64, u64, FsckReport)>,
+    /// Called as time passes, between the car's commands, with the time and what the car
+    /// believes of its files: a test's look at the medium mid-recording.
+    pub on_tick: Option<TickHook>,
 }
+
+/// See `Car::on_tick`.
+pub type TickHook = Box<dyn FnMut(u64, &BTreeMap<String, CarFile>)>;
 
 impl<D: Drive> Car<D> {
     /// A car on `disk`; nothing read yet.
     pub fn new(disk: PageCache<D>, cfg: CarCfg) -> Self {
-        Car { disk, fs: None, cfg, present: true, next_poll_ns: 0, files: BTreeMap::new(), stats: CarStats::default(), log: Vec::new(), echo: false, fsck_at_mount: None, last_fsck: None }
+        Car { disk, fs: None, cfg, present: true, next_poll_ns: 0, files: BTreeMap::new(), stats: CarStats::default(), log: Vec::new(), echo: false, fsck_at_mount: None, last_fsck: None, on_tick: None }
     }
 
     pub fn now(&mut self) -> u64 { self.disk.now_ns() }
@@ -218,6 +224,8 @@ impl<D: Drive> Car<D> {
     pub fn wait_until(&mut self, t_ns: u64) -> Result<(), String> {
         loop {
             let now = self.now();
+            let files = &self.files;
+            if let Some(f) = self.on_tick.as_mut() { f(now, files); }
             if self.cfg.poll_ns > 0 && now >= self.next_poll_ns { self.poll()?; continue; }
             if now >= t_ns { return Ok(()); }
             let next = if self.cfg.poll_ns > 0 { t_ns.min(self.next_poll_ns) } else { t_ns };
