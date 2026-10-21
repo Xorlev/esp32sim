@@ -753,6 +753,44 @@ fn a_timed_bus_raises_command_and_data_done_when_the_bits_are_through() {
     assert_eq!(h.read(reg::RINTSTS), int::CMD_DONE | int::DATA_OVER | int::BCI);
 }
 
+/// On a timed bus the auto-stop reaches the card after the data phase, so a multi-block write
+/// programs from its end: BCI after that, and a read meanwhile is not answered.
+#[test]
+fn a_timed_multi_block_write_programs_from_its_auto_stop() {
+    let mut h = Sdmmc::new(SdmmcLayout::Esp32p4);
+    let c = SdCard::with_config(Box::new(MemStore(image())), SdCardConfig { prg_ns: 50_000, ..Default::default() }).unwrap();
+    let i = h.attach(Box::new(c));
+    h.route[1] = Some(i);
+    let mut m = Ram(vec![0; 64 << 10]);
+    host_to_tran(&mut h, &mut m);
+    (h.timed, h.ciu_hz) = (true, 160_000_000);
+    h.write(reg::CLKSRC, 1 << 2);
+    h.write(reg::CLKDIV, 2 << 8);
+    h.write(reg::CARDTHRCTL, 1 << 1);
+    let t0 = 1_000_000;
+    h.now_ns = t0;
+    m.desc(RAM, des0::OWN | des0::CH | des0::LD, 3 * 512, RAM + 0x1000, 0);
+    arm(&mut h, 3 * 512, RAM);
+    h.write(reg::CMDARG, 40);
+    h.write(reg::CMD, CMD_START | 1 << 16 | CMD_RESP | CMD_DATA | CMD_WRITE | CMD_AUTO_STOP | 25);
+    h.run(&mut m);
+    // the command, then three blocks with their CRC status on one line
+    let data_end = t0 + 2_650 + 3 * (4116 + 7) * 25;
+    h.advance(data_end + 2_650);
+    assert_eq!(h.read(reg::RINTSTS), int::CMD_DONE | int::DATA_OVER | int::ACD, "programming: no BCI yet");
+    assert_eq!(h.next_event_ns(), Some(data_end + 50_000), "programmed from the auto-stop on, not from the command");
+    h.write(reg::RINTSTS, int::ALL);
+    h.now_ns = data_end + 40_000;
+    h.write(reg::CMDARG, 40);
+    h.write(reg::CMD, CMD_START | 1 << 16 | CMD_RESP | 17);
+    h.run(&mut m);
+    h.advance(data_end + 45_000);
+    assert_eq!(h.read(reg::RINTSTS) & int::RTO, int::RTO, "a read while the card programs gets no response");
+    h.write(reg::RINTSTS, int::ALL);
+    h.advance(data_end + 50_000);
+    assert_eq!(h.read(reg::RINTSTS), int::BCI);
+}
+
 /// An SDIO function whose interrupt the test sets.
 struct Function(std::rc::Rc<std::cell::Cell<bool>>);
 impl SdDevice for Function {

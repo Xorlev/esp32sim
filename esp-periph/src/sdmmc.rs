@@ -434,8 +434,11 @@ impl Sdmmc {
         self.tcbcnt = x.total - x.card_left;
         self.tbbcnt = x.moved;
         if x.auto_stop {
-            if let Ok(SdResponse::Short(v)) = self.send(x.slot, 12, 0) { self.resp[1] = v; self.resp_index = 12; }
-            let at = if self.timed { self.data_due + self.bus_ns(x.slot, 48 + 2 + 48 + 8) } else { self.now_ns };
+            // On a timed bus the auto-stop follows the data phase; a multi-block write programs from it.
+            let sent = if self.timed { self.data_due } else { self.now_ns };
+            let r = self.device(x.slot).map_or(Err(SdCmdError::NoResponse), |d| d.command(sent, 12, 0));
+            if let Ok(SdResponse::Short(v)) = r { self.resp[1] = v; self.resp_index = 12; }
+            let at = if self.timed { sent + self.bus_ns(x.slot, 48 + 2 + 48 + 8) } else { self.now_ns };
             self.raise(at, int::ACD);
         }
         if x.write && self.ram.read(reg::CARDTHRCTL) & CARDTHRCTL_BUSY_CLR_INT_EN != 0 { self.bci_slot = Some(x.slot); self.busy_clear(); }
