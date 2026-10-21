@@ -601,3 +601,46 @@ use crate::usb_host::pagecache::Landing;
 fn meta_changes32(c: &Car<Offline<FileDisk>, Fat32>, fs: &Fat32, base: &HashMap<u64, [u8; 512]>) -> std::collections::BTreeMap<R, Changes> {
     writelog::meta_changes(&c.disk.meta_landed, |x| writelog::fat32_region(fs, x, true), |x| base.get(&x).copied().unwrap_or([0u8; 512]))
 }
+
+/// The fsck burst at a mount on exFAT: a car that lost power left the volume dirty, so the next
+/// car's mount runs fsck (exfatprogs 1.0.4's way) before it reads the volume, and the volume it
+/// mounts is clean.
+#[test]
+fn an_exfat_car_runs_fsck_at_the_mount_of_a_dirty_volume() {
+    let disk = PageCache::writeback(Offline { dev: MemDisk(volume("fsck-mount", 64 << 20, 4096)), now: 0 }, WritebackCfg::default());
+    let mut car = Car::<_, ExFat>::on(disk, CarCfg { poll_ns: 0, linux_entries: true, dirty_flag: true, ..CarCfg::default() });
+    car.mount().unwrap();
+    for i in 0..2 { car.record(&format!("TeslaCam/RecentClips/c{i}.mp4"), &mp4_bytes(&format!("c{i}"), 2 << 20)).unwrap(); }
+    car.idle(2 * S).unwrap();
+    car.power_cut();
+    let dev = std::mem::replace(&mut car.disk.dev.dev, MemDisk(Vec::new()));
+    let mut next = Car::<_, ExFat>::on(PageCache::writeback(Offline { dev, now: 0 }, WritebackCfg::default()), CarCfg { poll_ns: 0, linux_entries: true, dirty_flag: true, ..CarCfg::default() });
+    next.fsck_at_mount = Some(FsckWrite::Changed);
+    next.mount().unwrap();
+    let (_, _, r) = next.last_fsck.clone().expect("fsck ran at the mount");
+    assert!(r.dirty_cleared && r.bitmap_bytes_read > 0, "{}", r.summary());
+    assert!(!next.fs.clone().unwrap().dirty(&mut next.disk).unwrap());
+    assert!(matches!(next.record("TeslaCam/RecentClips/c2.mp4", &mp4_bytes("c2", 1 << 20)).unwrap(), Recorded::Closed { .. }));
+}
+
+/// A USB reset, then the car's fsck with the FAT and bitmap written whole (`FsckWrite::Bulk`, the
+/// assumption the FAT32 test makes), on exFAT: every FAT sector and every bitmap sector written,
+/// and the volume read again.
+#[test]
+fn a_reset_then_a_bulk_fsck_rewrites_the_exfat_fat_and_bitmap_whole() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = exfat_disk("bulk-fsck");
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut car = Car::<_, ExFat>::on(PageCache::new(m), CarCfg { poll_ns: 0, gap_ns: 0, ..CarCfg::default() });
+    car.mount().unwrap();
+    car.record("TeslaCam/RecentClips/a.mp4", &mp4_bytes("a", 300_000)).unwrap();
+    car.disk.dev.host.reset_device().unwrap();
+    let l = car.fs.clone().unwrap().layout;
+    let r = car.fsck_now(FsckWrite::Bulk).unwrap();
+    assert_eq!((r.files, r.fat_bytes_written, r.bitmap_bytes_written), (1, l.fat_sectors as u64 * 512, l.bitmap_bytes.next_multiple_of(512)), "{}", r.summary());
+    assert_eq!(car.read("TeslaCam/RecentClips/a.mp4").unwrap(), mp4_bytes("a", 300_000));
+    drop(car);
+    let blocks = |lo: u64, n: u64| port.dev.writes.iter().filter(|x| (lo..lo + n).contains(&(x.0 as u64))).map(|x| x.1 as u64).sum::<u64>();
+    assert!(blocks(l.fat_lba, l.fat_sectors as u64) >= l.fat_sectors as u64);
+}

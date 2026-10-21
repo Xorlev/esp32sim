@@ -9,8 +9,9 @@
 //! - **Allocation at write() time.** `exfat_write_begin` maps each page through `exfat_get_block`
 //!   (`cont_write_begin`, no delayed allocation), which allocates one cluster as the file's pages
 //!   cross into it (inode.c `exfat_map_cluster`, 104-262). The hint is the file's last cluster + 1
-//!   (inode.c:171-172), or the volume's search pointer for an empty file (fatent.c:323-332); the
-//!   search pointer becomes the last hint used (403). A file stays NoFatChain (contiguous, no FAT
+//!   (inode.c:171-172), or the first free cluster from the volume's search pointer for an empty
+//!   file (fatent.c:335-345); the search pointer becomes the last hint used (403) and goes back to
+//!   cluster 2 at every mount (super.c:512). A file stays NoFatChain (contiguous, no FAT
 //!   entries) while each new cluster is its last + 1. The first that is not converts the whole
 //!   file to a FAT chain: its clusters so far are chained in the FAT (inode.c:203-210
 //!   `exfat_chain_cont_cluster`), the new one linked after them, and its Stream Extension rewritten
@@ -24,7 +25,8 @@
 //!   Nothing is written at mount. `exfat_set_vol_flags` (super.c:100-131) writes only on a change:
 //!   dirty with `sync_dirty_buffer` (REQ_SYNC: an immediate WRITE(10) of the boot sector, without
 //!   FUA) when the boot sector's buffer was clean, otherwise it marks the buffer dirty for writeback.
-//!   The unmount sets them clean (super.c:42-55) and the device's last sync lands it. The boot
+//!   The unmount sets them clean (super.c:42-55) and the device's last sync lands it; sync(2)
+//!   lands what is dirty, then only marks them clean (super.c:57-71). The boot
 //!   checksum leaves VolumeFlags and PercentInUse out (misc.c:150-162); 5.8 never writes
 //!   PercentInUse.
 //! - **Directory entry sets**: a File entry, a Stream Extension and one File Name entry per 15
@@ -40,7 +42,9 @@
 //! Linux's page cache applies as for vfat (`pagecache::PageCache`): data and metadata go through
 //! `BlockDevice::write_blocks` and `write_meta`; the boot sector's synchronous writes through
 //! `BlockDevice::sync_meta`. The allocation bitmap is read whole at the mount and kept, as the
-//! driver pins its buffers (balloc.c:56-102); FAT and directory sectors are read as needed. Every
+//! driver pins its buffers for the mount's life (balloc.c:56-102): a car whose cache reads the
+//! directories afresh still allocates from the bitmap it mounted. FAT and directory sectors are
+//! read as needed. Every
 //! file's allocation, conversion, close and deletion goes to the ground truth (`Truth`), with the
 //! VolumeFlags writes, for checking a trace of the car's writes against.
 use super::fat32::{BlockDevice, DirEntry, FsckReport, FsckWrite};
@@ -229,10 +233,10 @@ struct Pending { order: Vec<u64>, data: BTreeMap<u64, Box<[u8; SECTOR]>> }
 
 impl Pending {
     fn get(&mut self, dev: &mut dyn BlockDevice, lba: u64) -> Result<&mut [u8; SECTOR], String> {
-        if !self.data.contains_key(&lba) {
+        if let std::collections::btree_map::Entry::Vacant(v) = self.data.entry(lba) {
             let mut s = Box::new([0u8; SECTOR]);
             dev.read_meta(lba, &mut s[..])?;
-            self.data.insert(lba, s);
+            v.insert(s);
         }
         Ok(self.data.get_mut(&lba).unwrap())
     }
@@ -658,10 +662,12 @@ impl ExFat {
     /// `exfat_init_dir_entry` and `exfat_init_ext_entry` do (dir.c:434-563): the File entry's type,
     /// attributes and times, the Stream Extension's flags, cluster and sizes, the count of
     /// secondary entries, the name's length and hash, the name entries, then the checksum.
-    fn init_set(&self, dev: &mut dyn BlockDevice, p: &mut Pending, dir: u32, index: u32, name: &str, is_dir: bool, start: u32, size: u64) -> Result<u32, String> {
+    /// `new_dir` is the cluster of a new directory, None for a file.
+    fn init_set(&self, dev: &mut dyn BlockDevice, p: &mut Pending, dir: u32, index: u32, name: &str, new_dir: Option<u32>) -> Result<u32, String> {
         let units: Vec<u16> = name.encode_utf16().collect();
         if units.is_empty() || units.len() > 255 { return Err(format!("{name}: a name holds 1 to 255 characters")); }
-        let n = (units.len() - 1) / NAME_UNITS as usize + 3;
+        let (is_dir, start, size) = match new_dir { Some(c) => (true, c, self.cluster_bytes() as u64), None => (false, 0, 0) };
+        let n = (units.len() - 1) / NAME_UNITS + 3;
         let chain = self.dir(dir).chain;
         let mut slot = |p: &mut Pending, k: usize, f: &mut dyn FnMut(&mut [u8])| -> Result<(), String> {
             let (lba, off) = self.entry_lba(dev, chain, index + k as u32)?;
@@ -744,8 +750,7 @@ impl ExFat {
             let index = self.find_empty(dev, &mut p, d.chain.first, n)?;
             let (new, _) = self.alloc_one(dev, &mut p, EOF, ALLOC_NO_FAT_CHAIN)?;
             self.zero_cluster(&mut p, new);
-            let cb = self.cluster_bytes() as u64;
-            self.init_set(dev, &mut p, d.chain.first, index, c, true, new, cb)?;
+            self.init_set(dev, &mut p, d.chain.first, index, c, Some(new))?;
             let set_lbas = self.set_lbas(dev, d.chain, index, n)?;
             let set_offset = self.entry_lba(dev, d.chain, index)?.1;
             p.flush(dev)?;
@@ -780,7 +785,7 @@ impl ExFat {
         let n = (name.encode_utf16().count() as u32).saturating_sub(1) / NAME_UNITS as u32 + 3;
         let index = self.find_empty(dev, &mut p, d.chain.first, n)?;
         let d = self.dir(d.chain.first);
-        self.init_set(dev, &mut p, d.chain.first, index, name, false, 0, 0)?;
+        self.init_set(dev, &mut p, d.chain.first, index, name, None)?;
         let set_lbas = self.set_lbas(dev, d.chain, index, n)?;
         let set_offset = self.entry_lba(dev, d.chain, index)?.1;
         p.flush(dev)?;

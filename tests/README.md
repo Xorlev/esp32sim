@@ -69,7 +69,10 @@ and the die temperature after a restart (esp32p4.md, "The car's hazards").
 card (`OXIDRIVE_SD_PRG_US`, `LATENCY_*`; esp32p4.md, "Car write latency under a shared reader").
 `sd_image::fsck` checks a card image's volume with the system's FAT checker (`fsck_msdos -n`,
 `fsck.fat -n`, or `FSCK_FAT`); `external_fat32_tree_passes_fsck` holds the car's long-name and
-directory writes to it.
+directory writes to it. `sd_image::exfat` lays out an exFAT card, and `fsck` sends an exFAT
+image to macOS's `fsck_exfat -n` (the image attached read-only with `hdiutil`), exfatprogs'
+`fsck.exfat -n`, or `FSCK_EXFAT`; `external_exfat_tree_passes_fsck` holds the car's exFAT writes
+to it (esp32p4.md, "An exFAT car").
 
 Use `--release`: the debug build runs the same scenarios ~30x slower. On a mismatch the actual
 output is left next to the golden as `*.actual` for diffing.

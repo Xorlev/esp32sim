@@ -2116,6 +2116,184 @@ events) is not simulated.
 - **The safety check** uses the car's own record, which the device does not have. It says the
   saved discards were whole clips here, not that a timing rule on the device would know.
 
+## An exFAT car
+
+A Tesla can format its card exFAT. Its Linux then writes the card with exfat-linux 5.8-1arter97,
+a backport of Linux v5.8's fs/exfat that teslamotors/buildroot builds as a module
+(buildroot-2021.02, package/exfat-linux; the tag's tarball matches the package's SHA-256). The car
+of "The car's hazards" now records on either filesystem (`car::CarFs`): FAT32 as before, or exFAT
+as that driver writes it (`usb_host::exfat`). `Car::new` still makes a FAT32 car;
+`Car::<_, ExFat>::on` makes an exFAT one. Every golden and every FAT32 test is unchanged. Line
+numbers below are the 5.8-1arter97 tag's; it differs from v5.8 in option parsing, in
+compatibility code, and in the two places noted.
+
+### What the driver writes
+
+| | FAT32 (vfat, as modelled) | exFAT (5.8-1arter97) |
+| --- | --- | --- |
+| when a cluster is taken | after FSInfo's hint | at write() time, one cluster as the pages reach it (inode.c:104-262 `exfat_map_cluster`, through `cont_write_begin`) |
+| which cluster | the next free after the hint | the file's last cluster + 1 (inode.c:171-172); for an empty file, the first free from the search pointer (fatent.c:335-345), which goes back to cluster 2 at every mount (super.c:512) |
+| the chain | always in the FAT | none while each cluster is the last + 1 (NoFatChain); the first cluster that is not converts the file: its clusters so far chained in the FAT, the new one linked, the Stream Extension rewritten (fatent.c:366-372, inode.c:203-241) |
+| a free | the chain zeroed in both FATs | allocation-bitmap bits cleared; the FAT is not written (fatent.c:153-198) |
+| the dirty flag | set at a mount, cleared at a clean unmount | VolumeFlags dirty at the start of every change and clean at the end of each create, unlink, mkdir and truncate (namei.c:563/566, 835/844, 874/877; file.c:107/218); allocation (inode.c:169) and inode writeback (inode.c:40) set it dirty; nothing at a mount |
+| how the flag is written | at once | a change to dirty with `sync_dirty_buffer` when the boot sector's buffer is clean (super.c:120-129): an immediate WRITE(10), REQ_SYNC, without FUA; every other change only marks the buffer dirty for writeback. The unmount's clean lands at the device's last sync (super.c:42-55) |
+| entries | an 8.3 entry and long-name entries | a File entry, a Stream Extension and a name entry per 15 characters (dir.c:327-337): a 29-character Tesla name is four entries, 128 bytes, and can straddle a sector. SetChecksum rewritten with every write of the set (dir.c:587-602); ValidDataLength written equal to DataLength (inode.c:74-75, 236-238) |
+| a new file's entry | size 0, no cluster | a FAT-chain flag, no cluster, size 0 (dir.c:434-480); the first allocation rewrites it NoFatChain with the cluster and the size then, 0 for the first page (inode.c:227-238) |
+
+Five details that set the write pattern and are easy to read otherwise:
+
+- **VolumeFlags is not written at a mount**, nor with FUA. It flips at every create, unlink and
+  mkdir, and a write goes out at once only on a change to dirty while the boot sector is not
+  waiting for writeback. `exfat_sync_fs` (sync(2)) lands what is dirty, then only marks the flag
+  clean (super.c:57-71). Later kernels write it at once with REQ_FUA and REQ_PREFLUSH (v6.1
+  fs/exfat/super.c:124); 5.8 and v5.10 do not.
+- **PercentInUse is never written** by 5.8.
+- **A name entry is written up to its terminating 0** (dir.c:418-432); v5.8 zeroes the rest of
+  the entry, 5.8-1arter97 leaves what a reused slot held.
+- **The allocation bitmap is pinned for the mount's life** (balloc.c:56-102): the driver
+  allocates from the bitmap it read at the mount, whatever its buffer cache drops. A car that
+  misses a window that allocated clusters takes them again
+  (`an_exfat_car_and_a_window_between_its_polls`).
+- **The search pointer starts at cluster 2 at every mount**, so the first file after a mount
+  takes the lowest free cluster; FAT32 continues from FSInfo's hint.
+
+### The model
+
+- `exfat::ExFat` mounts (the boot region and its checksum, the up-case table, the bitmap whole),
+  lists, reads, makes directories, writes and deletes files in the driver's order. Writes go
+  through `PageCache` as for FAT32: data with `write_blocks`, the FAT, the bitmap, directory
+  sectors and the boot sector with `write_meta`, a synchronous VolumeFlags write with the new
+  `BlockDevice::sync_meta`, which `PageCache` writes at once and takes off its dirty list. A
+  directory grows by a cluster hinted after its last, and is chained when that cluster is taken
+  (namei.c:302-398).
+- A chunk is any whole number of sectors; a cluster is taken when a chunk reaches one the file does
+  not have (`CarFs::write_unit`). The FAT32 car still rounds a chunk up to a cluster.
+- `CarCfg::linux_entries` rewrites the entry set after every chunk, as inode writeback finds the
+  inode dirty, and `dirty_flag` keeps VolumeFlags as above. Inode writeback is modelled at the
+  write, not 30 s later; the write lands with the metadata lag all the same, but VolumeFlags
+  changes to dirty a little earlier than on the car. Allocation sets it dirty at the same time
+  anyway while a file grows.
+- `ExFat::fsck` follows exfatprogs 1.0.4's `fsck.exfat -y`, the version in Tesla's buildroot:
+  VolumeFlags dirty at once; every chain walked; a chain into a free or owned cluster, or longer
+  or shorter than its size, cut; checksums and ValidDataLength fixed; when a file was cut, the FAT
+  read whole with the stale entries of free clusters zeroed, and the bitmap's differing sectors
+  written; VolumeFlags clean. Clusters the bitmap marks that no file holds are freed only when a
+  file was cut, as in 1.0.4. Whether the car runs it is not known.
+- `tests/sd_image.rs` lays out an exFAT card as exfatprogs' mkfs does (1.2.5, mkfs/mkfs.c):
+  partition from LBA 2048, the FAT and the cluster heap on 1 MiB boundaries, one FAT, the bitmap,
+  a 60-byte up-case table (a-z to A-Z, the rest to themselves) and the root in the heap's first
+  clusters. exfatprogs picks 4 KiB clusters up to 256 MiB, 32 KiB to 32 GiB, 128 KiB above
+  (lib/libexfat.c:121-130); the car's own format is not known, so the cluster is a parameter.
+  `sd_image::fsck` sends an exFAT image to macOS's `fsck_exfat -n` on the image attached
+  read-only with `hdiutil` (it checks devices, not files), to exfatprogs' `fsck.exfat -n`, or to
+  `FSCK_EXFAT`. macOS `fsck_exfat` passes the images at 4 KiB and 32 KiB clusters and a
+  writeback car's 3 GiB tree (`external_exfat_tree_passes_fsck`), and fails an image with one
+  bitmap bit flipped.
+
+### Ground truth
+
+`usb_host::writelog` turns what the car landed (`PageCache::landings` and `meta_landed`, with
+`record` set) and its record (`Car::truth`, an `exfat::Truth`) into what a trace analyzer should
+find:
+
+- per write: its sectors by region, in `oxi trace --writes`' names (`mbr`, `pre-volume`,
+  `boot-sector`, `boot-region`, `backup-boot`, `fat`, `fat2`, `bitmap`, `upcase`, `root-dir`,
+  `dir`, `data`, `unknown`, `outside`; FAT32 adds `fsinfo` and `reserved`); for a write over the
+  boot sector, VolumeFlags as it left them, whether only VolumeFlags and PercentInUse changed
+  (`state`) or more (`structural`), and whether it went at once or by writeback;
+- per file: chained or not, when and after how many clusters, its clusters and fragments, when it
+  was made, closed and deleted, when its data first landed and when every cluster had, and when
+  its entry set first landed and first held its final cluster, flags and size.
+
+### FAT32 and exFAT on one workload
+
+`one_sentry_workload_on_fat32_and_exfat` runs the Sentry-like recorder of "Shared-pass refusals
+by cause" (`recorder::Sentry`, the same steps: four cameras, a set every 20 s, a ring of six
+sets, an event every fourth set copied beside the live sets, six events kept) with the same
+writeback car (`WritebackCfg`'s defaults, Linux's entry order, the dirty flag kept), on a 4 GiB
+card filled but for what the recorder needs, once on FAT32 and once on exFAT, offline. It counts
+from what landed, then 40 s for the writeback. The run is seeded and has no firmware, so it gives
+the same numbers every time. 8 MiB clips, 900 s (`EXFAT_CMP_SECS=900 EXFAT_CMP_CLIP_KIB=8192`,
+`EXFAT_CMP_EXFAT_CLUSTER_KIB` 32 and 128; the CI run is 240 s of 2 MiB clips); 15.9 minutes in
+all, 46 sets, 11 events:
+
+| | FAT32, 32 KiB clusters | exFAT, 32 KiB | exFAT, 128 KiB |
+| --- | --- | --- | --- |
+| camera clips FAT-chained | 316 of 316 (FAT32 always chains) | 316 of 316 | 316 of 316 |
+| clips chained after | | 2 clusters (the first chunk) | 1 cluster |
+| `event.json`, `thumb.png` (one cluster, written alone) chained | all | 0 of 22 | 0 of 22 |
+| fragments a clip: median, max | 128, 256 | 128, 256 | 64, 64 |
+| FAT sector writes | 1,699 in FAT1 + 1,689 in FAT2 | 905 | 242 |
+| of them: entries linked / entries zeroed / both / no change | 844 / 791 / 64 / 0 (FAT1) | 891 / 0 / 0 / 14 | 238 / 0 / 0 / 4 |
+| FAT sector writes a minute | 213 | 57 | 15 |
+| bitmap sector writes: bits set / cleared / both | | 106: 51 / 49 / 6 | 52: 20 / 15 / 17 |
+| bitmap sector writes a minute | | 7 | 3 |
+| FAT sectors holding live entries of files written together: shared by two or more | 950 of 952 (99.8%) | 935 of 940 (99.5%) | 273 of 273 (100%) |
+| boot-sector writes while recording | 0 (the flag at the mount and the unmount only) | 25: 24 landed dirty, 1 clean; 1 at once | 25: 24 dirty, 1 clean; 1 at once |
+| boot-sector writes a minute | 0 | 1.57 | 1.57 |
+| directory writes a minute | 11 | 13 | 34 |
+| data writes a minute | 2,695 | 2,695 | 2,548 |
+
+A write's count is a landing (`PageCache::landings`, one per contiguous run, as WRITE(10)s of up
+to 240 blocks); a sector write is one sector of a landing. "Entries zeroed" and "bits cleared"
+are the frees; "linked" and "set" the allocations, conversions included. On exFAT, "no change"
+writes rewrite entries a ring reusing the same clusters in the same pattern gave the same values,
+stale from the clip deleted before. 128 KiB clusters have twice the directory writes because a
+new event folder zeroes a 128 KiB cluster, which lands page by page.
+
+**The prediction** for a trace of the car writing exFAT, if the car writes as modelled:
+
+1. **Clips written together are FAT-chained.** Every camera clip recorded beside another is
+   converted as soon as it takes its second cluster run: after its first chunk at 32 KiB, after
+   its first cluster at 128 KiB. Only a file written alone stays NoFatChain. A trace shows each
+   conversion as a burst of FAT entries for the file's clusters so far, then its Stream Extension
+   rewritten with flags 0x01.
+2. **No FAT entry is ever zeroed.** FAT sectors are written only for chained allocation; the
+   rotation's frees write bitmap sectors only. FAT32 writes about as many FAT sectors for frees as
+   for allocation, in both copies.
+3. **About a quarter of FAT32's FAT writes at 32 KiB, 7% at 128 KiB**; the bitmap adds 3 to 7
+   sector writes a minute. One bitmap sector covers 4,096 clusters (128 MiB at 32 KiB), so files
+   written minutes apart share it.
+4. **FAT sectors are shared just as much**: every FAT sector a set writes holds entries of two
+   clips or more, as on FAT32. exFAT does not remove the FAT false sharing of "Shared-pass
+   refusals by cause" for chained clips; it removes the frees' share of it, and adds the bitmap's.
+5. **The boot sector is written about every 38 s while the car records** (1.57 a minute), by
+   writeback, nearly always holding VolumeFlags dirty: a create's clean is overtaken by the next
+   allocation's dirty before it lands. A write at once happens only on a change to dirty with
+   the buffer clean: the first change after a mount, and the first after an unlink's clean has
+   landed. Nothing is written at the mount. A trace showing a boot-sector write at the mount, or
+   with FUA, or one per create, would mean the car's driver is not this one.
+6. **An entry set lands before its file is whole**: NoFatChain, the first cluster and size 0
+   from the first allocation, then intermediate sizes (`writeback_lands_intermediate_entry_sets`).
+   fsck.exfat reads such an entry as "first cluster is wrong" (size 0 with a cluster).
+
+### What else the tests pin
+
+`esp-soc/src/usb_host/tests/exfat.rs`: the image's layout and checksum (VolumeFlags left out of
+it); a file written alone stays NoFatChain with no FAT entry; two files written in turn are
+chained after one chunk each and read back through the FAT; a deletion clears bits and leaves the
+FAT, and keeps the deleted set's bytes with the type's top bit cleared; checksums and name hashes
+of sets that straddle sectors; VolumeFlags under writeback; intermediate entry sets and the ground
+truth; a power cut that fsck repairs, and fsck at the mount of a dirty volume; a ring of 120
+sets, whose folder outgrows a 4 KiB cluster once and is chained; a directory that grows; on the
+fake drive, a car writing into a window until its poll, a gated window and its unit attention,
+and windows between polls (a caching or not caching car loses the window's folder, the bitmap
+being pinned; a gated window's unit attention saves it); a port reset and a bulk fsck.
+
+### Limits
+
+- **The writer is Tesla's guess.** How many files the car writes at once, in what chunks, and
+  whether it copies or renames event clips are the recorder's, not measured. Any interleaving of
+  two growing files chains both; a car that writes each clip whole before the next would chain
+  none.
+- **The cluster size** of the car's own format is not known: 32 KiB and 128 KiB bracket
+  exfatprogs' choices for cards above 256 MiB.
+- **Writeback** is testkit's model ("The writeback model"), as for FAT32. Inode writeback is
+  modelled at the write.
+- **fsck**: whether the car runs fsck.exfat, and with which options, is not known.
+- **Not modelled**: rename, rmdir, truncate other than to 0, TexFAT's second FAT, sectors other
+  than 512 bytes, the up-case table's full contents (the image's is the mandatory part).
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,
