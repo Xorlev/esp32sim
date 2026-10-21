@@ -1156,7 +1156,8 @@ card status `0x400e00`). `cli/tests/oxidrive_latency.rs` measures both (mileston
 
 - A reader transfer adds at most its own time on the bus to a car write that meets it: 0.8, 1.7,
   3.4 and 6.7 ms for 16, 32, 64 and 128 KiB at 4 bits and 40 MHz. The cost is linear in the
-  chunk, with no knee; the reader's rate is its 1 MB/s pacer's whatever the chunk.
+  chunk, with no knee, and the reader's rate does not depend on it (its 1 MB/s pacer and SMB set
+  it).
 - With the card programming for 1 or 2 ms after each write, 23 of 24 passes met that race and
   stopped, after at most 7.8 MB. When the race hits the boot-sector read a pass starts
   with, shared reading stays off until the next boot. No chunk size avoids it.
@@ -1210,7 +1211,8 @@ reads what the current firmware reads, aligned. None of the builds is in this re
   the 40 s from 0.5 s after the force. A tap on each SD device logs every command at its emulated
   time, so each WRITE(10) carries the bus time the firmware's own card reads (the reader) and the
   SDIO link took inside it.
-- Each cell ran twice (32 KiB at 0 µs three times), 41 runs of 2 to 4.5 minutes.
+- Each cell ran twice (32 KiB with no programming time three times): 39 runs of 2 to 4.5 minutes,
+  four at a time.
 
 What a WRITE(10)'s latency covers: esp_tinyusb takes it in 32 KiB halves and defers each half's
 card write to the TinyUSB task (`tud_msc_write10_cb`, `tinyusb_msc.c`), so the CSW follows the
