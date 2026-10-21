@@ -1888,6 +1888,234 @@ each write's programming time and libsmb2 then shares that core: at 2 ms each ph
 wrote, and as long as at 0 ms once the car stopped. The scratch builds have the branch's
 reader as of 6adb83d.
 
+## Shared-pass refusals by cause
+
+oxidrive's shared-reading plan proposes a reduced design for invalidation: a per-cluster
+last-write map in place of the 16K-entry dirty-log ring, and a comparison of the chain's FAT
+entries and of the clip's 32-byte entry and long name in place of whole-sector watches
+(shared-reading-plan.md, "Snapshot overlay: reviewed, reduced design", on oxidrive's
+snapshot-overlay-design branch). It can remove only the refusals the ring's wrap and metadata
+false sharing cause. `cli/tests/oxidrive_refusals.rs` measures how many of oxidrive's shared-pass
+refusals those are, by putting each refusal and discard into one of the causes below.
+
+### Method
+
+- **The firmware.** A scratch build of oxidrive 728b71f, 4bfea67 on oxidrive's sim-refusal-log
+  branch (not merged, not in this repository; `OXIDRIVE_REFUSAL_DIR`). It logs `RLOG` lines at
+  info level at these points: every listing refusal (the walk's facts and where the entry is),
+  every watch it arms (its spans, the directory entry's place), every re-check (the dirty log's
+  write count, entries lost, oldest and newest retained, its last four entries, and every
+  retained write that hit the watch, up to 24), every stalled read, every clip's outcome, and
+  the start and end of each pass. The rest of the diff is read-only accessors on `DirtyLog` and
+  `Watch`, and a field that holds the entry's place for the log. Two lines were removed. Both
+  were replaced by equivalent code: the re-check still makes one `with_log` call and matches on
+  the same `watch.revalidate` answer. The emulator's UART takes bytes at once, so the lines cost
+  CPU time only. The scan for hits runs only after a dirty answer. Info lines do not reach the
+  firmware's syslog while the car writes.
+- **The car.** The writeback car of "The writeback model" (`PageCache::writeback`,
+  `WritebackCfg`'s defaults, Linux's entry order, the dirty flag). A Sentry-like recorder:
+  - Four cameras record a set every 20 s, each camera's clip written in 64 KiB chunks.
+  - RecentClips keeps 6 sets, and the oldest is deleted as vfat unlinks.
+  - Every fourth set is an event. The car makes `SentryClips/<stamp>/`, writes `event.json` and
+    `thumb.png`, and copies the last two sets and the trigger set into the folder. The copies are
+    written four clips a step beside the live set, so the folder is a live write target for 60 s
+    at twice the camera rate.
+  - Six events are kept.
+  - The card is 4 GiB, filled with one file except for what the recorder needs, so rotation
+    reuses freed clusters.
+  - The run records continuously, so no window opens; every run checks that none did.
+- **The arms.** Three clip sizes per camera-set: 8, 4 and 2 MiB. While an event is copied the car
+  writes 3.4, 1.7 or 0.84 MB/s, and half that otherwise. The 8 MiB arm's write tap counted
+  91 writes a second, the rate oxidrive's dirty.rs assumes for a recording car (94).
+- **The bus.** The SD bus is timed (`--sd-timing`) and the card has no programming time
+  (`OXIDRIVE_SD_PRG_US=0`). With programming time, the bus race ("The bus race") ends nearly
+  every pass before refusals accumulate. A run with programming time, after the reader waits for
+  a ready card, is the follow-up.
+- **The network.** The NAT reaps a TCP flow idle for 120 s without telling either end
+  (`Nat::idle_close_us`). oxidrive keeps its SMB session between passes, and the first pilot lost
+  it that way: every upload waited on a dead connection. The test raises the limit to an hour,
+  as a NAS on the same LAN would keep the connection. samba runs with `server signing =
+  mandatory`, as everywhere else in these tests, or with `auto` (`SAMBA_SERVER_SIGNING`): signing
+  offered, not required. libsmb2 signs only when the server requires it (its `negotiate_cb`), so
+  under `auto` the firmware does not sign. The firmware is the same in both.
+- **Judging a discard.** The medium's history is the card image after the car's mount, plus
+  every write the car landed, with its time, and the bytes of every metadata page it landed
+  (`PageCache::meta_landed`; the car's FAT and directory writes all go through `write_meta`).
+  From that history, at the watch's start (`t0`) and at the re-check (`t1`), the test takes:
+  - the chain, walked through FAT copy 0 at `t0`;
+  - whether the car landed any write on one of the chain's clusters in (`t0`, `t1`];
+  - whether any of the chain's entries changed in either FAT copy;
+  - whether the clip's 8.3 entry or its long-name entries changed. The slots are found from where
+    the firmware listed the entry.
+
+  Any of the four is a change, and the reduced design would discard the clip too. That is (d).
+  Otherwise the discard is put down to the firmware's own answer (`Unknown` is (a)) and to where
+  the car's writes inside the watch landed during the window: every landing, not only the hits
+  the firmware logged, which stop at 24. The firmware's clock (esp_timer milliseconds) plus
+  60.4 to 60.6 ms is the emulator's. That is the median distance from each write the firmware
+  logged to the same blocks in the card's write log, over 298 to 1146 matches a run; the 10th
+  percentile is within 0.6 ms of it, and the tail is other writes to the same blocks (`clock:`
+  lines).
+- **Whether a saved discard was safe.** For every discard the reduced design would not make, the
+  test also checks two things against the car's own record. Had the car closed the file before
+  the read began? Had every cluster of the chain had data landed on it after the file was begun?
+  If either fails, accepting the clip could have published a clip that was not whole.
+
+Each test asserts that oxidrive wrote no block, that no window opened, that every clip on the
+share equals the car's file, and that every refusal falls in exactly one class.
+`REFUSAL_OUT` keeps a run (console, card writes, landings, metadata bytes, the car's record, the
+image after the mount). `external_oxidrive_refusals_judged_again` judges a kept run again from
+`REFUSAL_IN`. The recorder's knobs are `REFUSAL_CLIP_KIB` (8192), `REFUSAL_SET_SECS` (20),
+`REFUSAL_RING` (6), `REFUSAL_EVENT_EVERY` (4), `REFUSAL_PREROLL` (2), `REFUSAL_COPIES` (4),
+`REFUSAL_EVENTS_KEPT` (6), `REFUSAL_RECORD_SECS` (720), `REFUSAL_CARD_MIB` (4096) and
+`REFUSAL_FREE_MIB` (what the recorder needs); the network's are `REFUSAL_NAT_IDLE_S` (3600) and
+`SAMBA_SERVER_SIGNING`. The firmware's `app.bin` had SHA-256 `d432a04888ce58b64227f142177dee307e526556fc987b1bc123f21e9b4a9d0f`. Three runs at
+once took 4.4 to 5.2 times real time without signing and 1.8 times with it, when the passes read
+little.
+
+### The causes
+
+Each refusal or discard is in exactly one class.
+
+| class | what it is | does the reduced design remove it? |
+| --- | --- | --- |
+| (a) | the re-check answered `Unknown` (the ring had wrapped past the watch's start, or no answer), and nothing in (d) happened | yes |
+| (b) | a hit on a watched FAT sector, and the chain's entries in it (both copies) unchanged; includes sectors the watch's FAT range covers that hold none of the chain | yes |
+| (c) | a hit on the entry's sectors, and its 8.3 entry and long-name entries unchanged | yes |
+| (d) | the clip changed during the read: a write landed on one of its chain's clusters, a chain entry changed, or its entry changed | no |
+| (e) | refused at listing (chain against size: `ChainBroken`, `ChainAheadOfSize`, `ChainBehindSize`, `SizeUnset`; a walk that failed, `Unproven`), or not a finished MP4 when opened | no |
+| (f) | not a refusal: the pass stopped (the slow-write guard, a read the card refused, the 60 s budget) | n/a, counted per pass |
+| (g) | a hit inside the watch but outside the clip: a bounding run `Watch::add` made when the clip had more than 8 runs (data and the directory entry share one region), or a listing-time span the chain no longer holds; the clip unchanged | yes: the map is per cluster |
+
+(g) is not in the plan's list. It is the same false sharing in the data region. Where a discard
+had false hits of more than one kind, it is counted once, as (b) before (c) before (g); the
+results give the overlap.
+
+### Results
+
+**With signing required** (samba `mandatory`), every pass that read a clip was stopped by
+oxidrive's slow-write guard (`shared: the card went slow for the car (3 to 7 new writes over
+100 ms); stopping`). This happened at every rate tried, after 2.1 to 4.9 MB had been read, and
+37 of the 37 reading passes stopped this way. In 45 minutes of recording, 3 reads reached a
+re-check. The first two passes of each run had nothing to read yet.
+
+| arm | recorded | passes | stopped by the guard | re-checks: accepted / discarded | archived | refused at listing (e) | discards |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 8 MiB | 720 s | 12 | 10 | 0 / 0 | 0 | 36 | none |
+| 4 MiB | 900 s | 14 | 12 | 0 / 0 | 0 | 60 | none |
+| 2 MiB | 1080 s | 17 | 15 | 1 / 2 | 1 | 60 | (b) 1, (g) 1 |
+
+The mechanism is the priority inversion of "The stalls: a priority inversion": the reader's
+512-byte reads hold the SD host's mutex while libsmb2's signing holds core 0. That is what binds
+here, not the ring.
+
+**With signing offered but not required** (samba `auto`, so the firmware does not sign), passes
+read until their 60 s budget, and refusals accumulate. 900 s of recording per arm:
+
+| | 8 MiB | 4 MiB | 2 MiB |
+| --- | --- | --- | --- |
+| car's writes, as the write tap counts them | 91.1 a second | 46.1 a second | 23.4 a second |
+| passes: nothing to read / ended by the 60 s budget / ran out of clips | 2 / 11 / 0 | 2 / 10 / 1 | 2 / 5 / 6 |
+| re-checks: accepted / discarded | 26 / 19 | 40 / 47 | 113 / 34 |
+| watch, open to re-check: median, max | 13.3 s, 14.3 s | 7.0 s, 8.0 s | 3.9 s, 4.9 s |
+| read time spent on discarded reads | 258 of 611 s (42%) | 335 of 621 s (54%) | 133 of 576 s (23%) |
+| (a) ring wrapped or no answer | 0 | 0 | 0 |
+| (b) FAT sector false sharing | 17 (21.5%) | 30 (33.0%) | 22 (28.2%) |
+| (c) directory sector false sharing | 0 | 0 | 0 |
+| (d) the clip changed during the read | 0 | 0 | 0 |
+| (e) refused at listing | 60 (75.9%): `ChainBroken` 52, `ChainAheadOfSize` 4, `ChainBehindSize` 4 | 44 (48.4%): `ChainBroken` 40, `ChainAheadOfSize` 4 | 44 (56.4%): `ChainBroken` 20, `ChainBehindSize` 16, `ChainAheadOfSize` 8 |
+| (g) widened watch | 2 (2.5%) | 17 (18.7%) | 12 (15.4%) |
+| all refusals and discards | 79 | 91 | 78 |
+| **(a)+(b)+(c)** | **17 (21.5%)** | **30 (33.0%)** | **22 (28.2%)** |
+| (a)+(b)+(c)+(g) | 19 (24.1%) | 47 (51.6%) | 34 (43.6%) |
+| of the discards after a read | 19 of 19 | 47 of 47 | 34 of 34 |
+| discards with false hits of more than one kind | 1 | 16 | 6 |
+| removable discards of a clip that might not have been whole | 0 | 0 | 0 |
+| Sentry clips closed by the car / archived | 132 / 25 | 132 / 40 | 132 / 113 |
+| car's close to the upload: median, p90, max | 183 s, 212 s, 223 s | 162 s, 177 s, 185 s | 120 s, 166 s, 344 s |
+| (f) passes stopped by the guard or a refused read | 0 | 0 | 0 |
+
+Every clip on the share equals the car's file. oxidrive wrote no block, and no window opened.
+(e) counts a clip again at every pass that refuses it. Its refusals are clips still in flight:
+an event's copies whose FAT entries had not landed (the metadata lag), and the entry's size
+against the chain. Both designs make these refusals.
+
+- **(a) never happened, and cannot at these rates.** The pass budget bounds a watch: no watch
+  here lasted longer than 14.3 s, and the budget holds one to about 60 s. At 91 writes a second the
+  ring reached back 176.8 s or more at every re-check after it had wrapped (44 of 45), 12.4 times
+  the longest watch. At 23 writes a second it reached back 692 s. A watch would wrap the ring
+  only above about 270 writes a second.
+- **(b) is the interleaved allocation.** The car writes an event's copies and the live set
+  together, 64 KiB per file in turn, so one FAT sector holds entries of eight files. Rotation
+  deletes the RecentClips set two minutes later and frees its entries in those sectors. Worked
+  example (8 MiB, pass 3): `SentryClips/2026-01-01_00-03-00/2026-01-01_00-01-00-back.mp4`, a
+  256-cluster chain, was read for 13.3 s. Its watch covered FAT sectors 2879+17 and 3903+17. The
+  car wrote FAT1 sectors 2872-2879 and FAT2 sectors 3896-3903 during the read. Sector 2879
+  holds 6 of the clip's entries; 99 of its 128 entries changed in the window, none of them the
+  clip's. In the 2 MiB run's first discard, of the same file name, sector 3035 holds 6 of the
+  clip's entries; 67 of its entries changed, none of the clip's. Both were checked by hand against
+  the landed bytes.
+- **(g) is the 8-run cap.** Interleaved and reused clusters give a clip 32 to 256 runs, so
+  `Watch::add` collapses the data region into one bounding run. The directory entry is in the
+  data region and joins the same run. Worked example (4 MiB, pass 8):
+  `SentryClips/2026-01-01_00-19-00/2026-01-01_00-17-00-right_repeater.mp4`, a 128-cluster chain
+  spread over clusters 114115 to 130994. Its watch was one run of 1,080,320 sectors (527 MiB) over
+  those clusters, its directory sector inside it. 241 of the car's live writes hit it in 7 s, none on the clip's
+  clusters, its entry or its FAT.
+- **(c) did not happen.** Reads came minutes after their event's folder stopped changing, because
+  of the backlog and because the archiver holds back the newest set. An event's directory sectors
+  were quiet by then.
+- **(d) did not happen**: no read here met a change to its clip. The detector runs on the same
+  landings that the whole-clip check below finds for every cluster, so it is not blind.
+- **Safety of what would be saved.** Every removable discard was of a clip that the car had
+  closed before the read began, and every cluster of its chain had data landed after the file was
+  begun. Accepting them would have published whole clips in this model.
+
+**The counterfactual** (first order, the same reads and schedule): under the reduced design's
+rules every re-check here would have accepted its clip, because every discard was removable. The
+passes would have accepted 45 clips instead of 26 (8 MiB), 87 instead of 40 (4 MiB) and 147
+instead of 113 (2 MiB). The backlog held more closed clips than that, so the re-reads of
+discarded clips would have gone to others. Of the clips with a removable discard (18, 31, 18),
+3, 1 and 11 were archived later in the run, by a median of 36 s, 37 s and 100 s (at most 214 s)
+after the discard that refused them. The rest (15, 30, 7) were not archived by the end. A second
+order (which clips a faster pass would have reached, and the car's rotation deleting unarchived
+events) is not simulated.
+
+### What the data support
+
+- With the firmware as it stands and a NAS that requires signing, the reduced design changes
+  nothing measurable. At every car rate tried the slow-write guard stops a pass before a read
+  completes. The inversion and the 512-byte reads come first, then the bus race.
+- Once passes run to their budget, all the discards are false: 100% of them in all three arms,
+  and 21.5-33.0% of all refusals by the plan's taxonomy, (a)+(b)+(c). All of those are (b), FAT
+  false sharing; (a) and (c) are zero. With (g), 24-52% of all refusals. These discards
+  cost a quarter to half of the passes' read time.
+- What would remove them: FAT-entry comparison removes (b). (g) needs only a watch that does not
+  widen: a per-cluster map, or the directory entry in a region of its own and more runs. The
+  ring's replacement buys nothing here, because a watch never outlives the ring.
+
+### Limits
+
+- **The CPU.** One instruction a cycle, with no cache or PSRAM stalls. The inversion's stalls
+  would be longer on silicon.
+- **No programming time.** The bus race cannot happen here. With programming time, the race ends
+  the passes first ("The bus race"). The next step is a re-run with programming time, after the
+  reader's fix.
+- **The car is a model.** The writeback parameters are testkit's, and its allocation interleaves
+  files 64 KiB at a time in lock-step. Linux's vfat on the car may interleave differently, which
+  sets how many FAT sectors a clip shares.
+- **The recorder is scaled down.** It uses 20 s sets, clips of 2 to 8 MiB, and two sets of
+  pre-roll. A car's minute clips of 30-40 MB would make reads span passes (a resume re-reads from
+  the start), and watches reach the 60 s budget.
+- **SMB is slow here.** Uploads ran at about 0.5 MB/s against the board's 2 MB/s ("Upload
+  throughput"), so each read is held open longer than on the board.
+- **The NAS.** Whether the owner's NAS requires signing is not known. The NAT's idle reap was
+  raised to an hour.
+- **One run per arm.** The servers answer in host time. The counts are one sample each, and
+  differences of a few discards between arms are not resolved by one run each.
+- **The safety check** uses the car's own record, which the device does not have. It says the
+  saved discards were whole clips here, not that a timing rule on the device would know.
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,

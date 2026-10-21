@@ -173,12 +173,14 @@ fn samba_tool(var: &str, name: &str) -> Result<PathBuf, String> {
 }
 
 /// smbd's configuration: a standalone server on 127.0.0.1:`port`, every directory it keeps state
-/// in under `dir`, SMB 2.1 to 3.1.1 with signing required, and one share writable by the user
+/// in under `dir`, SMB 2.1 to 3.1.1 with signing required (`SAMBA_SERVER_SIGNING` sets another
+/// `server signing`, such as `auto`: offered, not required), and one share writable by the user
 /// that `users.map` maps to `unix_user`. `vfs mkdir use tmp name` is off: samba 4.25 makes a
 /// directory under a temporary name with mode 0 and renames it into place, and on macOS that
 /// rename fails (EACCES), leaving a mode-0 directory and the client ACCESS_DENIED.
 pub fn samba_conf(dir: &Path, port: u16, share: &str, unix_user: &str) -> String {
     let d = dir.display();
+    let signing = std::env::var("SAMBA_SERVER_SIGNING").unwrap_or_else(|_| "mandatory".into());
     format!("[global]
   smb ports = {port}
   bind interfaces only = yes
@@ -186,7 +188,7 @@ pub fn samba_conf(dir: &Path, port: u16, share: &str, unix_user: &str) -> String
   server role = standalone server
   server min protocol = SMB2_10
   server max protocol = SMB3_11
-  server signing = mandatory
+  server signing = {signing}
   map to guest = never
   passdb backend = tdbsam:{d}/private/passdb.tdb
   username map = {d}/users.map
