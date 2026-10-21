@@ -89,9 +89,10 @@ fn hosted_slave(nat: Nat) -> esp32c6::Machine {
 struct Sample { t: u64, pc: [u32; 2], mie: [u32; 2], thresh: [u32; 2] }
 
 /// One command on an SD device as the device saw it: sent at `start_ns`, its data phase over at
-/// `end_ns` (`start_ns` without data; the timed bus hands each block over at the data phase's end).
+/// `end_ns` (`start_ns` without data; the timed bus hands each block over at the data phase's end),
+/// and its short response (0 for none or a long one).
 #[derive(Clone, Copy, Debug)]
-struct BusOp { sdio: bool, cmd: u8, arg: u32, start_ns: u64, end_ns: u64, bytes: u32, answered: bool }
+struct BusOp { sdio: bool, cmd: u8, arg: u32, start_ns: u64, end_ns: u64, bytes: u32, answered: bool, resp: u32 }
 
 /// An SD device with every command it takes logged.
 struct Tap { inner: Box<dyn SdDevice>, sdio: bool, ops: Rc<RefCell<Vec<BusOp>>> }
@@ -105,7 +106,8 @@ impl Tap {
 impl SdDevice for Tap {
     fn command(&mut self, now: u64, cmd: u8, arg: u32) -> Result<SdResponse, SdCmdError> {
         let r = self.inner.command(now, cmd, arg);
-        self.ops.borrow_mut().push(BusOp { sdio: self.sdio, cmd, arg, start_ns: now, end_ns: now, bytes: 0, answered: r != Err(SdCmdError::NoResponse) });
+        let resp = match r { Ok(SdResponse::Short(v)) => v, _ => 0 };
+        self.ops.borrow_mut().push(BusOp { sdio: self.sdio, cmd, arg, start_ns: now, end_ns: now, bytes: 0, answered: r != Err(SdCmdError::NoResponse), resp });
         r
     }
     fn read_data(&mut self, now: u64, buf: &mut [u8]) -> Result<(), SdDataError> { let r = self.inner.read_data(now, buf); self.data(now, buf.len()); r }
@@ -236,7 +238,7 @@ impl Report {
         Report { writes, others, reader, pass, window }
     }
 
-    fn print(&self, label: &str) {
+    fn print(&self, label: &str, bus: &[BusOp]) {
         let ms = |ns: u64| ns as f64 / 1e6;
         let lat = |f: &dyn Fn(&Write) -> bool| Latency::new(self.writes.iter().filter(|w| f(w)).map(|w| w.t.latency_ns()).collect());
         let data = |w: &Write| w.t.blocks as usize * 512 == CHUNK;
@@ -278,9 +280,14 @@ impl Report {
         eprintln!("[latency]   firmware card reads in the window: {} commands, {} bytes; in the pass {} bytes, {:.3} MB/s over it",
                   in_window.len(), bytes, pass_bytes, self.pass.map_or(0.0, |p| pass_bytes as f64 / 1e6 / secs(p).max(1e-9)));
         eprintln!("[latency]   their sizes (CMD, blocks: count): {}", sizes.iter().map(|(c, b, n)| format!("CMD{c} {b}: {n}")).collect::<Vec<_>>().join(", "));
-        let unanswered: Vec<&&BusOp> = in_window.iter().filter(|o| !o.answered).collect();
-        eprintln!("[latency]   reads the card did not answer: {}", unanswered.len());
-        for o in unanswered.iter().take(10) { eprintln!("[latency]     t={:.6} CMD{} arg {:#x}", o.start_ns as f64 / 1e9, o.cmd, o.arg); }
+        let unanswered: Vec<&BusOp> = self.reader.iter().filter(|o| !o.answered).collect();
+        eprintln!("[latency]   firmware reads the card did not answer: {}", unanswered.len());
+        for o in unanswered.iter().take(10) {
+            // the status the next command on the card was answered with
+            let next = bus.iter().find(|n| !n.sdio && n.start_ns >= o.start_ns && n.answered);
+            eprintln!("[latency]     t={:.6} CMD{} arg {:#x}; next: {}", o.start_ns as f64 / 1e9, o.cmd, o.arg,
+                      next.map_or("none".to_string(), |n| format!("CMD{} at {:.6} answered {:#x}", n.cmd, n.start_ns as f64 / 1e9, n.resp)));
+        }
     }
 
     /// Per-write, per-read and per-card-command rows for offline analysis, when `LATENCY_OUT`
@@ -293,8 +300,8 @@ impl Report {
         let mut r = String::from("start_ns\tend_ns\tcmd\targ\tbytes\tanswered\n");
         for o in &self.reader { r += &format!("{}\t{}\t{}\t{}\t{}\t{}\n", o.start_ns, o.end_ns, o.cmd, o.arg, o.bytes, o.answered as u8); }
         std::fs::write(dir.join(format!("{label}.reads.tsv")), r).unwrap();
-        let mut c = String::from("start_ns\tend_ns\tcmd\targ\tbytes\tanswered\n");
-        for o in bus.iter().filter(|o| !o.sdio) { c += &format!("{}\t{}\t{}\t{}\t{}\t{}\n", o.start_ns, o.end_ns, o.cmd, o.arg, o.bytes, o.answered as u8); }
+        let mut c = String::from("start_ns\tend_ns\tcmd\targ\tbytes\tanswered\tresp\n");
+        for o in bus.iter().filter(|o| !o.sdio) { c += &format!("{}\t{}\t{}\t{}\t{}\t{}\t{:#x}\n", o.start_ns, o.end_ns, o.cmd, o.arg, o.bytes, o.answered as u8, o.resp); }
         std::fs::write(dir.join(format!("{label}.card.tsv")), c).unwrap();
         let mut m = String::from("submit_ns\tlatency_ns\top\tlba\tblocks\tok\n");
         for t in cmds { m += &format!("{}\t{}\t{}\t{}\t{}\t{}\n", t.submit_ns, t.latency_ns(), t.op, t.lba, t.blocks, t.ok as u8); }
@@ -387,7 +394,7 @@ fn car_write_latency(shared: bool) {
         _ => None,
     };
     let report = Report::new(&cmds, &bus, window, pass.filter(|_| shared));
-    report.print(&label);
+    report.print(&label, &bus);
     if let Some(dir) = std::env::var_os("LATENCY_OUT") { report.save(std::path::Path::new(&dir), &label, &bus, &cmds, r.pcs.as_deref().unwrap_or(&[])); }
     let all = std::env::var("LATENCY_CONSOLE").is_ok_and(|v| v == "1");
     let shown = |l: &str| all || ["shared", "0x107", "sdmmc", "smb: ", "upload", "scan:"].iter().any(|k| l.contains(k));
@@ -423,7 +430,7 @@ fn external_car_write_latency_alone() { car_write_latency(false); }
 #[test]
 fn the_reader_is_what_the_car_did_not_ask_for() {
     let cmd = |op, lba, blocks, submit_ns, done_ns| CmdTime { op, lba, blocks, submit_ns, done_ns, ok: true };
-    let op = |sdio, cmd, arg, start_ns, end_ns| BusOp { sdio, cmd, arg, start_ns, end_ns, bytes: ((end_ns - start_ns) / 10) as u32, answered: true };
+    let op = |sdio, cmd, arg, start_ns, end_ns| BusOp { sdio, cmd, arg, start_ns, end_ns, bytes: ((end_ns - start_ns) / 10) as u32, answered: true, resp: 0 };
     let cmds = [cmd(READ10, 50, 1, 0, 100), cmd(WRITE10, 1000, 128, 200, 1000), cmd(WRITE10, 2000, 128, 1200, 2000)];
     let bus = [op(false, CMD_READ_SINGLE, 50, 10, 20), op(false, CMD_READ_MULTIPLE, 9000, 150, 300), op(false, CMD_WRITE_MULTIPLE, 1000, 400, 900),
                op(true, 53, 0, 500, 550), op(false, CMD_READ_SINGLE, 60, 1500, 1520)];
