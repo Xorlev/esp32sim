@@ -1,6 +1,6 @@
 # ESP32-P4 — plan
 
-Status: milestones 4a and 4b done; 4c part 1 (the car's hazards) done, its other items next.
+Status: milestones 4a and 4b done; 4c's car hazards and car write latency done; the network, the AXI GDMA and the radio wedge next.
 hello_world boots to `app_main` on one and on both cores and reboots through the ROM; the core has
 F with the lazy FPU traps, the Zicntr counters, CLIC mode and two harts. The SDMMC host and an SD
 card carry IDF's sdmmc example through a FAT32 mount. The high-speed USB-OTG core presents the card
@@ -140,9 +140,10 @@ car's next writes landing intact.
 - **4c, part 1, done**: the car's hazards against oxidrive's current build (esp32p4.md, "The car's
   hazards"): a car that writes into a window, keeps its FAT between polls, misses windows shorter
   than its poll, writes back as Linux does (the firmware's own writeback parameters), and runs
-  fsck after a mount and after a USB reset; the die temperature sensor as a model. Left: the car's
-  write latency under a shared reader, the network under the firmware, the AXI GDMA, the radio
-  wedge (esp32p4.md, "Handoff").
+  fsck after a mount and after a USB reset; the die temperature sensor as a model. Also done: the
+  car's write latency under a shared reader (esp32p4.md, "Car write latency under a shared
+  reader"). Left: the network under the firmware, the AXI GDMA, the radio wedge (esp32p4.md,
+  "Handoff").
 
 BLE is not modelled (see the roadmap); firmware that uses it must tolerate a controller that
 never answers.
