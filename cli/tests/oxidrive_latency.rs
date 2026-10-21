@@ -470,8 +470,8 @@ fn external_car_write_latency_alone() { car_write_latency(&oxidrive_board::dir()
 /// The shared pass of oxidrive's fix-shared-reader (`OXIDRIVE_READER_DIR`): no read meets the card
 /// programming, no car command of 100 ms or more, and the pass archives both events it was
 /// offered. oxidrive 728b71f fails it at every `OXIDRIVE_SD_PRG_US`. At 2000 the pass's summary
-/// came at 74 s, inside the 30 s the run waits after the car's last write (61 s); a slower SMB
-/// path could push it past that.
+/// came at 61 s (74 s with the SMB thread pinned to core 1), inside the 30 s the run waits after
+/// the car's last write (61 s); a slower SMB path could push it past that.
 #[test]
 #[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_READER_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
 fn external_a_shared_pass_completes_without_racing_the_car() { car_write_latency(&reader_dir(), true, true); }
