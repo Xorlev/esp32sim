@@ -90,7 +90,10 @@ fn external_oxidrive_archives_a_window() {
         let quiet_from = msc.host.now_ns();
         while msc.host.now_ns() < deadline {
             let now = msc.host.now_ns();
-            match msc.test_unit_ready() {
+            // a media poll as Linux's sd_check_events makes one: the flag a UNIT ATTENTION set is taken
+            let ready = msc.test_unit_ready();
+            msc.take_changed();
+            match ready {
                 Ok(()) if gone_at.is_some() => { back_at = Some(now); break; }
                 Ok(()) => {}
                 Err(MscError::Check(s)) if gone_at.is_none() => { eprintln!("[oxidrive] car: t={:.3} TEST UNIT READY: {s}", now as f64 / 1e9); gone_at = Some(now); }
