@@ -1722,7 +1722,7 @@ inversion above, and the reader's alignment, without which a 32 KiB read is 64 c
 
 ### The fixed reader
 
-oxidrive's branch `fix-shared-reader` (1e685d4, not in this repository) changes the reader along
+oxidrive's branch `fix-shared-reader` (0518b69, not in this repository) changes the reader along
 the lines above:
 
 - **A lock with the car's writes.** One FreeRTOS mutex. The firmware's write tap (its linker wrap
@@ -1734,7 +1734,8 @@ the lines above:
   and each pass in a row ended that way doubles the wait for the next. The boot sector is no
   longer read before each pass: the geometry from the card probe is kept, and read again only
   after a car write to LBA 0 or the boot sector.
-- **32 KiB reads**, aligned, contiguous clusters in one transfer (the 32 KiB build above).
+- **32 KiB reads**, aligned, contiguous clusters in one transfer (the 32 KiB build above), and a
+  pacer that banks at most two of them while it waits on the network.
 - **The reader at priority 23 while it holds the card**, above the SMB thread (5) and below the
   TinyUSB task (24), so made ready on core 0 it preempts libsmb2's signing whatever priority
   inheritance does. IDF's own error log for a failed SD command, which ran under the lock, is off
@@ -1752,24 +1753,28 @@ cell, three at a time:
 | 728b71f | 0 | 2.63 / 2.88 / 247 | 247 ms | 8 | 0 | stopped by its own guard at 15.4 s, 1.8 MB read, nothing archived | 0.30 | fails |
 | 728b71f | 1 ms | 3.62 / 3.63 / 3.63-3.87 | 3.87 ms | 0 | 1 | ended at 9.2-9.6 s after 0-0.4 MB, nothing archived | | fails |
 | 728b71f | 2 ms | 4.63 / 4.75 / 4.75 | 4.75 ms | 0 | 1 | ended at 9.2 s, nothing read | | fails |
-| fix-shared-reader | 0 | 2.63 / 3.25 / 4.25-4.38 | 5.25-5.37 ms | 0 | 0 | both events archived, summary at 51.3-51.7 s | 0.20 | passes |
-| fix-shared-reader | 1 ms | 3.62 / 3.75-3.87 / 5.25-5.50 | 6.25 ms | 0 | 0 | both events archived, 54.5 s | 0.19 | passes |
-| fix-shared-reader | 2 ms | 4.63 / 4.88 / 6.00 | 7.25 ms | 0 | 0 | both events archived, 61.3-61.4 s | 0.16 | passes |
+| fix-shared-reader | 0 | 2.63 / 2.88 / 4.25 | 4.25 ms | 0 | 0 | both events archived, summary at 52.5-52.7 s | 0.20 | passes |
+| fix-shared-reader | 1 ms | 3.62 / 3.75-3.87 / 5.12-5.50 | 5.12-5.50 ms | 0 | 0 | both events archived, 55.2-55.4 s | 0.19 | passes |
+| fix-shared-reader | 2 ms | 4.63 / 4.87-4.88 / 5.75-6.00 | 7.25 ms | 0 | 0 | both events archived, 62.0 s | 0.16 | passes |
 
-The 728b71f rows are one run each (0 ms twice, the same both times). In a fixed run 39 to 69 of
-the 2500 data WRITE(10)s (1.6-2.8%) met a reader transfer, at most 6 of them in a row and never
-more than 1.84 ms of bus inside one, and no read was retried. An earlier build of the branch,
-6adb83d, ran the same cells with the same results to within these ranges. Every WRITE(10) ended with good status and the card held every clip as
-the car wrote it.
+The 728b71f rows are one run each (0 ms twice, the same both times). In a fixed run 39 to 76 of
+the 2500 data WRITE(10)s (1.6-3.0%) met a reader transfer, never two in a row and never more
+than 1.75 ms of bus inside one; no read was retried, and the car kept up with its camera in
+every run, at most 6.0 ms late. Every WRITE(10) ended with good status and the card held every
+clip as the car wrote it.
 
-At 2 ms the car's own commands for a chunk (the 64 KiB WRITE(10), the FAT sector's READ(10) and
-two one-block WRITE(10)s) fill about 15.9 of its 16 ms, so the reader's bus time, about 1.7 ms
-per transfer five times a second, accumulates: in every fixed run at 2 ms the car started 9 or
-10 chunks a whole chunk or more late, at most 30 ms. At 0 and 1 ms it kept up (at most 6.2 ms
-late). 728b71f's passes ended before that could happen.
+The branch's earlier builds (6adb83d, 1e685d4) passed the same cells, but at 2 ms the car fell
+behind. Its commands for a chunk (the 64 KiB WRITE(10), the FAT sector's READ(10) and two
+one-block WRITE(10)s) take a median 11.6 ms of the 16 ms, leaving 4.4 ms. The pacer's bucket
+banked up to a second's worth (1 MB) while the reader waited on SMB, then let it out at once:
+35-39 transfers within 200 ms, 50-62 ms of bus, met by about one car command in nine. Each run
+at 2 ms started 9 or 10 chunks a whole chunk or more late, at most 30 ms; at 0 and 1 ms they
+kept up. 728b71f's passes ended before that could happen. Capped at two transfers (0518b69), a
+steady 1 MB/s is one transfer every two chunks, at the same 0.16 MB/s over the pass.
 
 The inversion fix was chosen by measuring the others, from scratch commits of the same branch
-(`sim-fix-reader-*` in oxidrive's repository; the `fixed` checks applied to each):
+before the burst cap (`sim-fix-reader-*` in oxidrive's repository; the `fixed` checks applied to
+each):
 
 | build | programming | runs | car commands of 100 ms or more | worst car command | MB/s over the pass |
 | --- | --- | --- | --- | --- | --- |
