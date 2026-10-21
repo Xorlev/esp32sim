@@ -59,8 +59,9 @@ pub struct Landing {
     pub lba: u64,
     pub count: u32,
     pub meta: bool,
-    /// when the oldest page in it was dirtied
+    /// when the oldest page in it was dirtied, and when the earliest was due to land
     pub dirtied_ns: u64,
+    pub due_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -160,7 +161,7 @@ impl<D: BlockDevice> PageCache<D> {
     /// Land `pages`, oldest due first, contiguous sectors in one write.
     fn land(&mut self, mut pages: Vec<u64>) -> Result<usize, String> {
         pages.sort_by_key(|p| { let x = &self.dirty[p]; (x.due, x.seq) });
-        let mut runs: Vec<(u64, Vec<u8>, bool, u64)> = Vec::new();
+        let mut runs: Vec<(u64, Vec<u8>, bool, u64, u64)> = Vec::new();
         for page in &pages {
             let p = self.dirty.remove(page).unwrap();
             for slot in 0..PAGE_SECTORS as usize {
@@ -168,19 +169,19 @@ impl<D: BlockDevice> PageCache<D> {
                 let lba = page * PAGE_SECTORS + slot as u64;
                 let s = &p.data[slot * SECTOR..slot * SECTOR + SECTOR];
                 match runs.last_mut() {
-                    Some(r) if r.0 + (r.1.len() / SECTOR) as u64 == lba && r.2 == p.meta => { r.1.extend_from_slice(s); r.3 = r.3.min(p.dirtied); }
-                    _ => runs.push((lba, s.to_vec(), p.meta, p.dirtied)),
+                    Some(r) if r.0 + (r.1.len() / SECTOR) as u64 == lba && r.2 == p.meta => { r.1.extend_from_slice(s); r.3 = r.3.min(p.dirtied); r.4 = r.4.min(p.due); }
+                    _ => runs.push((lba, s.to_vec(), p.meta, p.dirtied, p.due)),
                 }
             }
             self.stats.pages_landed += 1;
         }
         let mut first_err = None;
-        for (lba, data, meta, dirtied) in runs {
+        for (lba, data, meta, dirtied, due) in runs {
             self.stats.writes += 1;
             match self.dev.write_blocks(lba, &data) {
                 Ok(()) => if self.record {
                     let at = self.dev.now_ns();
-                    self.landings.push(Landing { at_ns: at, lba, count: (data.len() / SECTOR) as u32, meta, dirtied_ns: dirtied });
+                    self.landings.push(Landing { at_ns: at, lba, count: (data.len() / SECTOR) as u32, meta, dirtied_ns: dirtied, due_ns: due });
                     if meta { self.meta_landed.push((at, lba, data)); }
                 },
                 Err(e) => { self.stats.write_errors += 1; first_err.get_or_insert(e); }
@@ -223,7 +224,7 @@ impl<D: BlockDevice> PageCache<D> {
         match &r {
             Ok(()) if self.record => {
                 let at = self.dev.now_ns();
-                self.landings.push(Landing { at_ns: at, lba, count: (data.len() / SECTOR) as u32, meta, dirtied_ns: t0 });
+                self.landings.push(Landing { at_ns: at, lba, count: (data.len() / SECTOR) as u32, meta, dirtied_ns: t0, due_ns: t0 });
                 if meta { self.meta_landed.push((at, lba, data.to_vec())); }
             }
             Ok(()) => {}
