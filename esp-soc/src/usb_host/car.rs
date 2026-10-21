@@ -18,11 +18,116 @@
 //! volume read again.
 //!
 //! What the car keeps of the volume between polls, and when its writes land, is its
-//! `pagecache::PageCache`.
-use super::fat32::{BlockDevice, Fat32, FsckReport, FsckWrite};
+//! `pagecache::PageCache`. The volume is FAT32 as vfat writes it (`fat32::Fat32`, the default) or
+//! exFAT as Linux 5.8's exfat writes it (`exfat::ExFat`): `CarFs`.
+use super::exfat::{ExFat, ExFile, TruthLog};
+use super::fat32::{BlockDevice, DirEntry, Fat32, FileWriter, FsckReport, FsckWrite};
 use super::msc::{sense, Msc, MscError, Sense};
 use super::pagecache::PageCache;
 use std::collections::BTreeMap;
+
+/// A filesystem the car records on.
+pub trait CarFs: Clone + Sized {
+    type File: FsFile<Self>;
+    /// What the volume records of what it did, kept by the car across mounts (`Car::truth`).
+    type Truth: Clone + Default;
+    const NAME: &'static str;
+    fn mount(dev: &mut dyn BlockDevice) -> Result<Self, String>;
+    fn cluster_bytes(&self) -> usize;
+    /// The dirty flag as the medium has it.
+    fn dirty(&self, dev: &mut dyn BlockDevice) -> Result<bool, String>;
+    /// After the mount; `dirty_flag` is `CarCfg::dirty_flag`.
+    fn mounted<D: BlockDevice>(&mut self, disk: &mut PageCache<D>, dirty_flag: bool, truth: &Self::Truth) -> Result<(), String>;
+    /// A clean unmount, after every page held has landed.
+    fn unmounted<D: BlockDevice>(&mut self, disk: &mut PageCache<D>, dirty_flag: bool) -> Result<(), String>;
+    fn fsck(&mut self, dev: &mut dyn BlockDevice, mode: FsckWrite) -> Result<FsckReport, String>;
+    fn mkdir_all(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<(), String>;
+    fn create_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Self::File, String>;
+    /// The clusters freed.
+    fn delete_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u32>, String>;
+    fn read_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u8>, String>;
+    fn list(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>, String>;
+    /// The clusters of the file at `path`, in order.
+    fn clusters_of(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u32>, String>;
+}
+
+/// A file being written on a `CarFs`.
+pub trait FsFile<F> {
+    /// Linux's order (`FileWriter::linux`, `ExFile::linux`).
+    fn set_linux(&mut self, on: bool);
+    fn write(&mut self, fs: &mut F, dev: &mut dyn BlockDevice, data: &[u8]) -> Result<(), String>;
+    fn size(&self) -> u64;
+    fn close(self, fs: &mut F, dev: &mut dyn BlockDevice) -> Result<u64, String>;
+}
+
+impl CarFs for Fat32 {
+    type File = FileWriter;
+    type Truth = ();
+    const NAME: &'static str = "FAT32";
+    fn mount(dev: &mut dyn BlockDevice) -> Result<Self, String> { Fat32::mount(dev) }
+    fn cluster_bytes(&self) -> usize { Fat32::cluster_bytes(self) }
+    fn dirty(&self, dev: &mut dyn BlockDevice) -> Result<bool, String> { Fat32::dirty(self, dev) }
+    /// Linux marks a FAT32 volume dirty at a read-write mount (fs/fat/inode.c `fat_set_state`).
+    fn mounted<D: BlockDevice>(&mut self, disk: &mut PageCache<D>, dirty_flag: bool, _: &()) -> Result<(), String> {
+        if dirty_flag { self.set_dirty(&mut disk.dev, true)?; disk.invalidate(); }
+        Ok(())
+    }
+    fn unmounted<D: BlockDevice>(&mut self, disk: &mut PageCache<D>, dirty_flag: bool) -> Result<(), String> {
+        if dirty_flag { self.set_dirty(&mut disk.dev, false)?; }
+        Ok(())
+    }
+    fn fsck(&mut self, dev: &mut dyn BlockDevice, mode: FsckWrite) -> Result<FsckReport, String> { Fat32::fsck(self, dev, mode) }
+    fn mkdir_all(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<(), String> { Fat32::mkdir_all(self, dev, path).map(|_| ()) }
+    fn create_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<FileWriter, String> { Fat32::create_path(self, dev, path) }
+    fn delete_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u32>, String> { Fat32::delete_path(self, dev, path) }
+    fn read_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u8>, String> { Fat32::read_path(self, dev, path) }
+    fn list(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>, String> { Fat32::list(self, dev, path) }
+    fn clusters_of(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u32>, String> {
+        let e = self.stat(dev, path)?.ok_or_else(|| format!("{path}: no such file"))?;
+        if e.cluster == 0 { Ok(Vec::new()) } else { self.chain(dev, e.cluster) }
+    }
+}
+
+impl FsFile<Fat32> for FileWriter {
+    fn set_linux(&mut self, on: bool) { self.linux = on; }
+    fn write(&mut self, fs: &mut Fat32, dev: &mut dyn BlockDevice, data: &[u8]) -> Result<(), String> { FileWriter::write(self, fs, dev, data) }
+    fn size(&self) -> u64 { FileWriter::size(self) }
+    fn close(self, fs: &mut Fat32, dev: &mut dyn BlockDevice) -> Result<u64, String> { FileWriter::close(self, fs, dev) }
+}
+
+impl CarFs for ExFat {
+    type File = ExFile;
+    type Truth = TruthLog;
+    const NAME: &'static str = "exFAT";
+    fn mount(dev: &mut dyn BlockDevice) -> Result<Self, String> { ExFat::mount(dev) }
+    fn cluster_bytes(&self) -> usize { ExFat::cluster_bytes(self) }
+    fn dirty(&self, dev: &mut dyn BlockDevice) -> Result<bool, String> { ExFat::dirty(self, dev) }
+    /// Linux 5.8's exfat writes nothing at the mount: VolumeFlags go dirty at the first change.
+    fn mounted<D: BlockDevice>(&mut self, _: &mut PageCache<D>, dirty_flag: bool, truth: &TruthLog) -> Result<(), String> {
+        self.track_flags = dirty_flag;
+        self.set_truth(truth.clone());
+        Ok(())
+    }
+    /// `exfat_put_super` sets VolumeFlags clean and the device's last sync lands it (super.c:42-55).
+    fn unmounted<D: BlockDevice>(&mut self, disk: &mut PageCache<D>, _: bool) -> Result<(), String> {
+        self.set_vol_flags(disk, super::exfat::VOL_CLEAN)?;
+        disk.sync().map(|_| ())
+    }
+    fn fsck(&mut self, dev: &mut dyn BlockDevice, mode: FsckWrite) -> Result<FsckReport, String> { ExFat::fsck(self, dev, mode) }
+    fn mkdir_all(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<(), String> { ExFat::mkdir_all(self, dev, path).map(|_| ()) }
+    fn create_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<ExFile, String> { ExFat::create_path(self, dev, path) }
+    fn delete_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u32>, String> { ExFat::delete_path(self, dev, path) }
+    fn read_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u8>, String> { ExFat::read_path(self, dev, path) }
+    fn list(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>, String> { ExFat::list(self, dev, path) }
+    fn clusters_of(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u32>, String> { ExFat::clusters_of(self, dev, path) }
+}
+
+impl FsFile<ExFat> for ExFile {
+    fn set_linux(&mut self, on: bool) { self.linux = on; }
+    fn write(&mut self, fs: &mut ExFat, dev: &mut dyn BlockDevice, data: &[u8]) -> Result<(), String> { ExFile::write(self, fs, dev, data) }
+    fn size(&self) -> u64 { ExFile::size(self) }
+    fn close(self, fs: &mut ExFat, dev: &mut dyn BlockDevice) -> Result<u64, String> { ExFile::close(self, fs, dev) }
+}
 
 /// What a TEST UNIT READY said.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,9 +220,11 @@ pub enum Recorded {
     WriteFailed { written: u64, error: String },
 }
 
-pub struct Car<D: Drive> {
+pub struct Car<D: Drive, F: CarFs = Fat32> {
     pub disk: PageCache<D>,
-    pub fs: Option<Fat32>,
+    pub fs: Option<F>,
+    /// what the volume recorded of what the car did, across its mounts (exFAT's `exfat::Truth`)
+    pub truth: F::Truth,
     pub cfg: CarCfg,
     pub present: bool,
     pub next_poll_ns: u64,
@@ -139,9 +246,14 @@ pub struct Car<D: Drive> {
 pub type TickHook = Box<dyn FnMut(u64, &BTreeMap<String, CarFile>)>;
 
 impl<D: Drive> Car<D> {
-    /// A car on `disk`; nothing read yet.
-    pub fn new(disk: PageCache<D>, cfg: CarCfg) -> Self {
-        Car { disk, fs: None, cfg, present: true, next_poll_ns: 0, files: BTreeMap::new(), stats: CarStats::default(), log: Vec::new(), echo: false, fsck_at_mount: None, last_fsck: None, on_tick: None }
+    /// A car on `disk` with a FAT32 volume; nothing read yet.
+    pub fn new(disk: PageCache<D>, cfg: CarCfg) -> Self { Self::on(disk, cfg) }
+}
+
+impl<D: Drive, F: CarFs> Car<D, F> {
+    /// A car on `disk` with an `F` volume (`Car::<_, ExFat>::on`); nothing read yet.
+    pub fn on(disk: PageCache<D>, cfg: CarCfg) -> Self {
+        Car { disk, fs: None, truth: Default::default(), cfg, present: true, next_poll_ns: 0, files: BTreeMap::new(), stats: CarStats::default(), log: Vec::new(), echo: false, fsck_at_mount: None, last_fsck: None, on_tick: None }
     }
 
     pub fn now(&mut self) -> u64 { self.disk.now_ns() }
@@ -168,19 +280,19 @@ impl<D: Drive> Car<D> {
         if mode_sense {
             if let Err(e) = self.disk.dev.mode_sense() { self.say(format!("MODE SENSE failed, write enabled assumed: {e}")); }
         }
-        let mut fs = Fat32::mount(&mut self.disk)?;
+        let mut fs = F::mount(&mut self.disk)?;
         if let Some(mode) = self.fsck_at_mount {
             if fs.dirty(&mut self.disk)? {
                 let t0 = self.now();
                 let r = fs.fsck(&mut self.disk.dev, mode)?;
                 let t1 = self.now();
                 self.disk.invalidate();
-                fs = Fat32::mount(&mut self.disk)?;
+                fs = F::mount(&mut self.disk)?;
                 self.say(format!("fsck in {:.3} s: {}", (t1 - t0) as f64 / 1e9, r.summary()));
                 self.last_fsck = Some((t0, t1, r));
             }
         }
-        if self.cfg.dirty_flag { fs.set_dirty(&mut self.disk.dev, true)?; self.disk.invalidate(); }
+        fs.mounted(&mut self.disk, self.cfg.dirty_flag, &self.truth)?;
         self.stats.mounts += 1;
         self.fs = Some(fs);
         let t = self.now();
@@ -191,7 +303,7 @@ impl<D: Drive> Car<D> {
     /// Land everything held and clear the dirty flag: a clean unmount.
     pub fn unmount(&mut self) -> Result<(), String> {
         self.disk.sync()?;
-        if let Some(fs) = self.fs.take() { if self.cfg.dirty_flag { fs.set_dirty(&mut self.disk.dev, false)?; } }
+        if let Some(mut fs) = self.fs.take() { fs.unmounted(&mut self.disk, self.cfg.dirty_flag)?; }
         self.disk.invalidate();
         Ok(())
     }
@@ -282,7 +394,7 @@ impl<D: Drive> Car<D> {
             let fs = self.fs.as_mut().unwrap();
             if let Some((dir, _)) = path.rsplit_once('/') { fs.mkdir_all(&mut self.disk, dir).map_err(|e| format!("{dir}: {e}"))?; }
             let mut w = fs.create_path(&mut self.disk, path).map_err(|e| format!("{path}: {e}"))?;
-            w.linux = self.cfg.linux_entries;
+            w.set_linux(self.cfg.linux_entries);
             ws.push(w);
             self.files.insert(path.to_string(), CarFile { data: data.to_vec(), written: 0, complete: false, deleted: false, started_ns: t0, closed_ns: None });
         }
@@ -330,7 +442,7 @@ impl<D: Drive> Car<D> {
     pub fn fsck_now(&mut self, mode: FsckWrite) -> Result<FsckReport, String> {
         self.disk.sync()?;
         self.disk.invalidate();
-        let mut fs = Fat32::mount(&mut self.disk.dev)?;
+        let mut fs = F::mount(&mut self.disk.dev)?;
         let t0 = self.now();
         let r = fs.fsck(&mut self.disk.dev, mode)?;
         let t1 = self.now();
@@ -351,7 +463,7 @@ impl<D: Drive> Car<D> {
 
     /// The car's view of the file at `path`, read through its own cache.
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
-        let fs = self.fs.clone().ok_or("no volume")?;
+        let mut fs = self.fs.clone().ok_or("no volume")?;
         fs.read_path(&mut self.disk, path)
     }
 }

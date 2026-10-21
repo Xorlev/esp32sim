@@ -22,6 +22,11 @@ pub trait BlockDevice {
     /// (`pagecache::PageCache`); a plain device reads and writes it as blocks.
     fn read_meta(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), String> { self.read_blocks(lba, buf) }
     fn write_meta(&mut self, lba: u64, data: &[u8]) -> Result<(), String> { self.write_blocks(lba, data) }
+    /// Metadata written to the drive now, past any cache, as `sync_dirty_buffer` writes a buffer
+    /// (exFAT's VolumeFlags); a plain device writes it as `write_meta` does.
+    fn sync_meta(&mut self, lba: u64, data: &[u8]) -> Result<(), String> { self.write_meta(lba, data) }
+    /// Whether the sector at `lba` waits in a cache to be written (`buffer_dirty`).
+    fn meta_dirty(&self, _lba: u64) -> bool { false }
     /// Let time pass with nothing to do (a camera filling the next chunk).
     fn pause_ns(&mut self, _ns: u64) -> Result<(), String> { Ok(()) }
     /// Emulated time, for pacing; a device without a clock stays at 0.
@@ -788,6 +793,11 @@ pub struct FsckReport {
     pub dir_sectors_written: u64,
     /// the volume was marked dirty
     pub dirty_cleared: bool,
+    /// exFAT: the allocation bitmap read and written, and clusters it marks that no file holds,
+    /// left marked (exfatprogs 1.0.4 frees them only when it cut a file)
+    pub bitmap_bytes_read: u64,
+    pub bitmap_bytes_written: u64,
+    pub unreclaimed: u32,
 }
 
 impl FsckReport {
@@ -795,6 +805,7 @@ impl FsckReport {
         format!("{} files: {} truncated to their size, {} sizes cut to their chain, {} chains broken or cross-linked, {} lost clusters freed; FATs {}; {} FAT sectors changed, {} KiB of FAT read and {} KiB written, {} directory sectors written; {}",
                 self.files, self.truncated.len(), self.resized.len(), self.cross_or_broken.len(), self.lost_clusters, if self.fats_differ { "differed" } else { "agreed" },
                 self.fat_sectors_changed, self.fat_bytes_read >> 10, self.fat_bytes_written >> 10, self.dir_sectors_written, if self.dirty_cleared { "dirty flag cleared" } else { "the volume was clean" })
+            + &if self.bitmap_bytes_read > 0 { format!("; {} KiB of bitmap read and {} KiB written, {} clusters marked but unowned left", self.bitmap_bytes_read >> 10, self.bitmap_bytes_written >> 10, self.unreclaimed) } else { String::new() }
     }
 }
 

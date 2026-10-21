@@ -938,3 +938,5 @@ fn a_reset_then_a_bulk_fsck_rewrites_both_fats_whole() {
     assert!(w[first..].iter().take_while(|x| x.0 < fat2).all(|x| (fat1..fat2).contains(&x.0)), "FAT1 whole before FAT2");
     assert_eq!(port.dev.bus_resets, 3, "the enumeration's reset and the port reset's two");
 }
+
+mod exfat;

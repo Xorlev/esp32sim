@@ -14,6 +14,7 @@
 //! the next one there; host-side waits (debounce, reset recovery) are emulated time. The port
 //! the host runs on (`UsbPort`) lets emulated time pass: a `Machine` runs its firmware meanwhile.
 pub mod car;
+pub mod exfat;
 pub mod fat32;
 pub mod msc;
 pub mod pagecache;

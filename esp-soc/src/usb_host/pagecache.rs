@@ -293,6 +293,26 @@ impl<D: BlockDevice> BlockDevice for PageCache<D> {
         if self.writeback.is_some() { self.dirty_range(lba, data, true); Ok(()) } else { self.write_through(lba, data, true) }
     }
 
+    /// Written now, the sectors' dirty copies with it, as `sync_dirty_buffer` writes a buffer and
+    /// clears its dirty bit (v6.12 fs/buffer.c `__sync_dirty_buffer`; the same in v5.8).
+    fn sync_meta(&mut self, lba: u64, data: &[u8]) -> Result<(), String> {
+        self.flush_due()?;
+        if self.caching() {
+            for (i, s) in data.chunks(SECTOR).enumerate() { self.meta.insert(lba + i as u64, Box::new(s.try_into().map_err(|_| "a partial sector")?)); }
+        }
+        for i in 0..(data.len() / SECTOR) as u64 {
+            let at = lba + i;
+            let page = at / PAGE_SECTORS;
+            if let Some(p) = self.dirty.get_mut(&page) {
+                p.mask &= !(1 << (at % PAGE_SECTORS));
+                if p.mask == 0 { self.dirty.remove(&page); }
+            }
+        }
+        self.write_through(lba, data, true)
+    }
+
+    fn meta_dirty(&self, lba: u64) -> bool { self.dirty_sector(lba).is_some() }
+
     /// Time passes, the flusher landing pages as they fall due.
     fn pause_ns(&mut self, ns: u64) -> Result<(), String> {
         if self.writeback.is_none() { return self.dev.pause_ns(ns); }
