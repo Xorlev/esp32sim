@@ -1777,10 +1777,13 @@ refusals those are, by putting each refusal and discard into one of the causes b
     the firmware listed the entry.
 
   Any of the four is a change, and the reduced design would discard the clip too. That is (d).
-  Otherwise the discard is put down to the firmware's own answer and the hits it logged. The
-  firmware's clock (esp_timer milliseconds) plus 60.4 ms is the emulator's: this is the median
-  distance from each write the firmware logged to the same blocks in the card's write log, and
-  the 10th to 90th percentile spread is 2 ms (`clock:` lines).
+  Otherwise the discard is put down to the firmware's own answer (`Unknown` is (a)) and to where
+  the car's writes inside the watch landed during the window: every landing, not only the hits
+  the firmware logged, which stop at 24. The firmware's clock (esp_timer milliseconds) plus
+  60.4 to 60.6 ms is the emulator's. That is the median distance from each write the firmware
+  logged to the same blocks in the card's write log, over 298 to 1146 matches a run; the 10th
+  percentile is within 0.6 ms of it, and the tail is other writes to the same blocks (`clock:`
+  lines).
 - **Whether a saved discard was safe.** For every discard the reduced design would not make, the
   test also checks two things against the car's own record. Had the car closed the file before
   the read began? Had every cluster of the chain had data landed on it after the file was begun?
@@ -1845,16 +1848,16 @@ read until their 60 s budget, and refusals accumulate. 900 s of recording per ar
 | watch, open to re-check: median, max | 13.3 s, 14.3 s | 7.0 s, 8.0 s | 3.9 s, 4.9 s |
 | read time spent on discarded reads | 258 of 611 s (42%) | 335 of 621 s (54%) | 133 of 576 s (23%) |
 | (a) ring wrapped or no answer | 0 | 0 | 0 |
-| (b) FAT sector false sharing | 17 (21.5%) | 22 (24.2%) | 18 (23.1%) |
+| (b) FAT sector false sharing | 17 (21.5%) | 30 (33.0%) | 22 (28.2%) |
 | (c) directory sector false sharing | 0 | 0 | 0 |
 | (d) the clip changed during the read | 0 | 0 | 0 |
 | (e) refused at listing | 60 (75.9%): `ChainBroken` 52, `ChainAheadOfSize` 4, `ChainBehindSize` 4 | 44 (48.4%): `ChainBroken` 40, `ChainAheadOfSize` 4 | 44 (56.4%): `ChainBroken` 20, `ChainBehindSize` 16, `ChainAheadOfSize` 8 |
-| (g) widened watch | 2 (2.5%) | 25 (27.5%) | 16 (20.5%) |
+| (g) widened watch | 2 (2.5%) | 17 (18.7%) | 12 (15.4%) |
 | all refusals and discards | 79 | 91 | 78 |
-| **(a)+(b)+(c)** | **17 (21.5%)** | **22 (24.2%)** | **18 (23.1%)** |
+| **(a)+(b)+(c)** | **17 (21.5%)** | **30 (33.0%)** | **22 (28.2%)** |
 | (a)+(b)+(c)+(g) | 19 (24.1%) | 47 (51.6%) | 34 (43.6%) |
 | of the discards after a read | 19 of 19 | 47 of 47 | 34 of 34 |
-| discards with false hits of more than one kind | 1 | 8 | 2 |
+| discards with false hits of more than one kind | 1 | 16 | 6 |
 | removable discards of a clip that might not have been whole | 0 | 0 | 0 |
 | Sentry clips closed by the car / archived | 132 / 25 | 132 / 40 | 132 / 113 |
 | car's close to the upload: median, p90, max | 183 s, 212 s, 223 s | 162 s, 177 s, 185 s | 120 s, 166 s, 344 s |
@@ -1866,8 +1869,8 @@ an event's copies whose FAT entries had not landed (the metadata lag), and the e
 against the chain. Both designs make these refusals.
 
 - **(a) never happened, and cannot at these rates.** The pass budget bounds a watch: no watch
-  here lasted longer than 14.3 s, and one can last at most about 60 s. At 91 writes a second the
-  ring reached back 177 s or more at every re-check after it had wrapped (44 of 45), 12.4 times
+  here lasted longer than 14.3 s, and the budget holds one to about 60 s. At 91 writes a second the
+  ring reached back 176.8 s or more at every re-check after it had wrapped (44 of 45), 12.4 times
   the longest watch. At 23 writes a second it reached back 692 s. A watch would wrap the ring
   only above about 270 writes a second.
 - **(b) is the interleaved allocation.** The car writes an event's copies and the live set
@@ -1912,8 +1915,8 @@ events) is not simulated.
   nothing measurable. At every car rate tried the slow-write guard stops a pass before a read
   completes. The inversion and the 512-byte reads come first, then the bus race.
 - Once passes run to their budget, all the discards are false: 100% of them in all three arms,
-  and 21.5-24.2% of all refusals by the plan's taxonomy, (a)+(b)+(c). Nearly all of those are
-  (b), FAT false sharing; (a) and (c) are zero. With (g), 24-52% of all refusals. These discards
+  and 21.5-33.0% of all refusals by the plan's taxonomy, (a)+(b)+(c). All of those are (b), FAT
+  false sharing; (a) and (c) are zero. With (g), 24-52% of all refusals. These discards
   cost a quarter to half of the passes' read time.
 - What would remove them: FAT-entry comparison removes (b). (g) needs only a watch that does not
   widen: a per-cluster map, or the directory entry in a region of its own and more runs. The

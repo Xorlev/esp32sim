@@ -606,10 +606,14 @@ fn analyse(data: &RunData, out: Option<&std::path::Path>) -> Summary {
                 let chain_set: HashSet<u32> = chain.clone().unwrap_or_default().into_iter().collect();
                 let fat_with_entries: HashSet<u64> = (0..g.fats).flat_map(|copy| chain_set.iter().map(move |&c| (copy, c))).map(|(copy, c)| g.fat_lba(copy, c)).collect();
                 // each hit sector inside the watch: a FAT sector holding a chain entry or only
-                // inside the watched range, the entry's sectors, the clip's own data, or elsewhere
+                // inside the watched range, the entry's sectors, the clip's own data, or elsewhere.
+                // The hits are every landing of the car inside the window, not only the ones the
+                // firmware logged, which stop at 24.
                 let ws = spans(x.get("watch"));
+                let lo = lands.partition_point(|l| l.at_ns <= t0);
+                let landed: Vec<(u64, u64)> = lands[lo..].iter().take_while(|l| l.at_ns <= t1).map(|l| (l.lba, l.count as u64)).collect();
                 let mut kinds: BTreeSet<&'static str> = BTreeSet::new();
-                for &(_, lba, count, _) in &hs {
+                for (lba, count) in hs.iter().map(|h| (h.1, h.2)).chain(landed) {
                     for s in (lba..lba + count).filter(|s| ws.iter().any(|w| w.0 <= *s && *s < w.0 + w.1)) {
                         kinds.insert(if g.is_fat(s) { if fat_with_entries.contains(&s) { "fat" } else { "fat-range" } }
                                      else if entry_sectors.contains(&s) || (s >= dfirst.min(dlba) && s <= dlba) { "dirent" }
