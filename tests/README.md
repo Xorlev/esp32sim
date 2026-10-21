@@ -60,6 +60,8 @@ everywhere with `sh` and `sleep` (readiness, early exit, timeout, the group gone
 the configurations); `external_samba_and_mosquitto_serve_a_test_client` needs the servers.
 `cli/tests/oxidrive_services.rs` uses it for the owner's oxidrive firmware (`OXIDRIVE_DIR`):
 its broker and NAS, an archive window with the car, and an unsigned update refused.
+`cli/tests/oxidrive_latency.rs` times every car command while oxidrive's shared pass reads the
+card (`OXIDRIVE_SD_PRG_US`, `LATENCY_*`; esp32p4.md, "Car write latency under a shared reader").
 `sd_image::fsck` checks a card image's volume with the system's FAT checker (`fsck_msdos -n`,
 `fsck.fat -n`, or `FSCK_FAT`); `external_fat32_tree_passes_fsck` holds the car's long-name and
 directory writes to it.
