@@ -8,6 +8,7 @@ Pocket Tank (from part 6 also the C6 WiFi station). One file per part:
 | part | branch | receipt | experiment |
 | --- | --- | --- | --- |
 | 1 | `p4/01-rv32f` | [01-rv32f.md](01-rv32f.md) | [EX240](../../experiments.md#ex240) |
+| 2 | `p4/02-core` | [02-core.md](02-core.md) | [EX241](../../experiments.md#ex241) |
 
 ## Method
 
