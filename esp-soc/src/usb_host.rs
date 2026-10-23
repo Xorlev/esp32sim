@@ -14,6 +14,7 @@
 pub mod fat32;
 pub mod msc;
 pub mod script;
+pub mod timing;
 #[cfg(test)]
 mod tests;
 
