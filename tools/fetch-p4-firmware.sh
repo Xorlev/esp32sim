@@ -14,7 +14,9 @@ DIR=${1:-web/wasm/fw/public}
 BASE=${P4_FIRMWARE_BASE_URL:-https://raw.githubusercontent.com/mikroverk/esp32sim-firmware/e8facb5ccae4ba4fbf303cb2e0e7d94a59f7f46f/p4}
 # file, SHA-256, URL
 IMAGES="p4-hello-smp-bootloader.bin fc8698c1520e0d6469861e917d84568c94d17721faa93937896ae427e8f91717 $BASE/p4-hello-smp-bootloader.bin
-p4-hello-smp_world.bin 9476bccf819114fe30ad55dde4d0917e7f5213df34ec6f159b81c4a84e053f8b $BASE/p4-hello-smp_world.bin"
+p4-hello-smp_world.bin 9476bccf819114fe30ad55dde4d0917e7f5213df34ec6f159b81c4a84e053f8b $BASE/p4-hello-smp_world.bin
+p4-sdcard-bootloader.bin 985366855e83f25f6b9399c79aa3eac01742e0950d3e6406e24db0a32bd76816 $BASE/p4-sdcard-bootloader.bin
+p4-sdcard.bin 411c93b78fc0efb199e3576c510bf0de23f74086a87cc3a9204c67a207428749 $BASE/p4-sdcard.bin"
 
 sha256_ok() {  # FILE HASH; -c without GNU-only --status, so macOS shasum and sha256sum both work
   if command -v shasum >/dev/null 2>&1; then echo "$2  $1" | shasum -a 256 -c >/dev/null 2>&1

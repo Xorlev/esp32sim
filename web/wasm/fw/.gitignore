@@ -39,3 +39,5 @@
 # tools/fetch-p4-firmware.sh, so a fetched copy is never committed by accident.
 public/p4-hello-smp-bootloader.bin
 public/p4-hello-smp_world.bin
+public/p4-sdcard-bootloader.bin
+public/p4-sdcard.bin
