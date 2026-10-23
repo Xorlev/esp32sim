@@ -200,12 +200,15 @@ pub struct Nat {
     pub tcp_opened: u64, pub tcp_refused: u64, pub udp_flows: u64,
     pub udp_evicted: u64, pub udp_send_errors: u64,
     pub bytes_to_host: u64, pub bytes_to_guest: u64,
+    /// A flow idle this long is dropped without telling either end (120 s by default). A server
+    /// on the guest's own LAN keeps an idle connection; a test standing in for one can raise it.
+    pub idle_close_us: u64,
 }
 
 impl Nat {
     pub fn new(log: bool) -> Self {
         Self { tcp: Vec::new(), udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), log, outbound: true, forwards: Vec::new(),
-            tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0 }
+            tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0, idle_close_us: IDLE_CLOSE_US }
     }
 
     /// A NAT that relays the forwards and nothing else (`--net none,fwd=...`).
@@ -391,11 +394,12 @@ impl Nat {
                 out.push(ethernet(&flow.guest_mac, &GATEWAY_MAC, 0x0800, &ip_packet(17, &flow.reply_src, &flow.guest_ip, &udp)));
             }
         }
+        let idle = self.idle_close_us;
         self.tcp.retain(|c| {
-            let timeout = if matches!(c.transport, Transport::TimeWait) { TIME_WAIT_US } else { IDLE_CLOSE_US };
+            let timeout = if matches!(c.transport, Transport::TimeWait) { TIME_WAIT_US } else { idle };
             !c.closed() && now_us.wrapping_sub(c.last_activity_us) < timeout
         });
-        self.udp.retain(|f| now_us.wrapping_sub(f.last_activity_us) < IDLE_CLOSE_US);
+        self.udp.retain(|f| now_us.wrapping_sub(f.last_activity_us) < idle);
         out
     }
 }
