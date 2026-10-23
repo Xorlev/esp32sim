@@ -217,6 +217,17 @@ fn run_until_line(r: &mut Rig, from: usize, s: &str, secs: u64) -> bool {
 
 fn p4_lines_since(r: &Rig, from: usize) -> Vec<String> { r.lines[from..].iter().filter(|l| !l.1).map(|l| l.2.clone()).collect() }
 
+/// Stub `stubs` (function entry, return value) until the P4 resets, in steps small enough that
+/// the next boot does not reach them, then remove them.
+fn crash_once(r: &mut Rig, stubs: &[(u32, u32)]) {
+    let resets = r.cs.summary.p4_resets;
+    for &(at, v) in stubs { r.cs.p4.stubs.insert(at, v); }
+    let end = r.cs.now_ns + 20_000_000_000;
+    while r.cs.summary.p4_resets == resets && r.cs.now_ns < end { let t = r.cs.now_ns + 20_000_000; r.run_to(t); }
+    for (at, _) in stubs { r.cs.p4.stubs.remove(at); }
+    assert_eq!(r.cs.summary.p4_resets, resets + 1, "the stubs did not reset the P4 once");
+}
+
 /// Ask `diag crash` with request id `id` and return the reply, run on 3 s for it.
 fn diag_crash(r: &mut Rig, heard: &services::Listener, id: u32) -> Option<String> {
     r.mqtt.client.publish(&format!("oxidrive/{}/diag/req", r.id), &format!(r#"{{"id":{id},"cmd":"crash"}}"#)).unwrap();
@@ -225,14 +236,18 @@ fn diag_crash(r: &mut Rig, heard: &services::Listener, id: u32) -> Option<String
     heard.messages().into_iter().find(|(t, p)| t.ends_with("/diag/rsp") && p.contains(&format!(r#""id":{id},"#))).map(|m| m.1)
 }
 
-/// A crash and its report, over four boots of a firmware that reports its core dumps. 1: the
+/// A crash and its report, over eight boots of a firmware that reports its core dumps. 1: the
 /// coredump partition is blank, nothing is reported and `diag crash` answers `none`. 2:
 /// `smb2_init_context` stubbed to return NULL fails the firmware's link check at boot (a Rust
 /// `assert!`, so `abort()`), and the panic handler writes its core dump to flash. 3: the stub
 /// gone, the next boot finds the dump and reports it: a `crash:` line, a `crash` event on MQTT,
 /// the partition's bytes and a `.txt` under `oxidrive-crash/` on the share, and `diag crash`
 /// answering `reported`. 4: a reset by the test; the same dump is reported already and nothing is
-/// said or uploaded again. `app.elf` beside the images names the stubbed function.
+/// said or uploaded again. 5: `clock_gettime` stubbed to fail once the firmware runs, so std's
+/// `Instant::now` panics with a message. 6: the report of that dump carries the message. 7: the
+/// clock fails again with `esp_core_dump_write_prepare` stubbed to ESP_ERR_NO_MEM, as for a dump
+/// too big for the partition, and flash keeps the last dump. 8: that crash is reported lost,
+/// naming the dump flash still holds. `app.elf` beside the images names the stubbed functions.
 /// `OXIDRIVE_CRASH_DIR` keeps the uploaded image and `.txt` there, for oxidrive's decoder.
 #[test]
 #[ignore = "needs a crash-reporting oxidrive (images, app.elf and nvs.csv under OXIDRIVE_DIR), ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
@@ -323,6 +338,48 @@ fn external_oxidrive_reports_its_crash_to_the_nas() {
     assert!(boot4.iter().any(|l| l.contains("core dump") && l.contains("already on the NAS")), "boot 4 did not find the dump reported");
     assert!(!boot4.iter().any(|l| l.contains("crash: abort in main") || l.contains("crash: the core dump is on the NAS")), "boot 4 reported the dump again");
     assert_eq!(std::fs::read_dir(&crash_dir).unwrap().count(), 2, "boot 4 uploaded again");
+
+    // 5: a Rust panic with a message, after the journal is open
+    let clock = r.cs.p4.sym_addr("clock_gettime").expect("clock_gettime in app.elf");
+    let mark = r.lines.len();
+    crash_once(&mut r, &[(clock, u32::MAX)]);
+    for l in p4_lines_since(&r, mark).iter().filter(|l| l.contains("panicked") || l.contains("ore dump has")) { eprintln!("[oxidrive] boot 5: {l}"); }
+
+    // 6: its report carries the message
+    let mark = r.lines.len();
+    assert!(run_until_line(&mut r, mark, "crash: the core dump is on the NAS at", 60), "the second dump never reached the NAS");
+    let boot6 = p4_lines_since(&r, mark);
+    for l in boot6.iter().filter(|l| l.contains("crash")) { eprintln!("[oxidrive] boot 6: {l}"); }
+    assert!(boot6.iter().any(|l| l.contains("crash: abort in ") && l.contains(" why: pal/unix/time.rs:")), "no crash line carrying the panic message");
+    let txt6 = std::fs::read_dir(&crash_dir).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "txt") && !names.iter().any(|n| p.ends_with(n))).expect("a second .txt");
+    let txt6 = std::fs::read_to_string(txt6).unwrap();
+    let panic_line = txt6.lines().find(|l| l.starts_with("panic: ")).unwrap_or_else(|| panic!("no panic line in\n{txt6}"));
+    eprintln!("[oxidrive] boot 6: the .txt's {panic_line}");
+    assert!(panic_line.contains("pal/unix/time.rs:") && panic_line.contains("unwrap()"), "{panic_line}");
+    if let Some(keep) = std::env::var_os("OXIDRIVE_CRASH_DIR") {
+        for e in std::fs::read_dir(&crash_dir).unwrap().flatten() { std::fs::copy(e.path(), std::path::Path::new(&keep).join(e.file_name())).unwrap(); }
+    }
+
+    // 7: a panic whose dump IDF refuses before it erases anything
+    assert!(run_until_line(&mut r, mark, "session ready", 20), "no MQTT session in boot 6");
+    let prepare = ["esp_core_dump_write_prepare", "esp_core_dump_flash_write_prepare"].iter().find_map(|n| r.cs.p4.sym_addr(n)).expect("esp_core_dump_write_prepare in app.elf");
+    let held = r.cs.p4.bus.flash[core_off..core_off + core_size].to_vec();
+    crash_once(&mut r, &[(clock, u32::MAX), (prepare, 0x101)]);
+    assert!(r.cs.p4.bus.flash[core_off..core_off + core_size] == held[..], "the refused dump changed the partition");
+
+    // 8: reported lost, naming what flash holds
+    let mark = r.lines.len();
+    assert!(run_until_line(&mut r, mark, "session ready", 40), "no MQTT session after the lost dump");
+    let t = r.cs.now_ns + 3_000_000_000;
+    r.run_to(t);
+    let boot8 = p4_lines_since(&r, mark);
+    for l in boot8.iter().filter(|l| l.contains("crash")) { eprintln!("[oxidrive] boot 8: {l}"); }
+    assert!(boot8.iter().any(|l| l.contains("crash: lost: boot ") && l.contains("followed a panic and flash kept no dump of it; flash holds the dump ") && l.ends_with(", on the NAS")), "no lost line naming the dump flash holds");
+    let reply = diag_crash(&mut r, &heard, 3).expect("no diag crash reply in boot 8");
+    eprintln!("[oxidrive] boot 8: diag crash -> {reply}");
+    assert!(reply.contains(r#""present":true,"err":"lost","reported":true"#), "{reply}");
+    assert!(heard.messages().iter().any(|(t, p)| t.ends_with("/event") && p.contains(r#""detail":"lost: boot "#)), "no lost event");
+    assert_eq!(std::fs::read_dir(&crash_dir).unwrap().count(), 4, "boot 8 uploaded something");
     r.report(10);
     eprintln!("[oxidrive] {:.1} s wall for {:.1} s emulated", wall.elapsed().as_secs_f64(), r.cs.now_ns as f64 / 1e9);
 }
