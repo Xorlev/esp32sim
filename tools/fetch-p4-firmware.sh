@@ -21,7 +21,17 @@ p4-sdsectors-bootloader.bin 7a2e21c03a9ae5e6ac3d4b90e981843ca2348264e70cb302085e
 p4-sdsectors.bin e658889c0ed35e7ca4ca0ca2acecbf4a48e1e4d87057341e6f31143c8d057062 $BASE/p4-sdsectors.bin
 p4-usbmsc-bootloader.bin 365a7cafa9e101bb564422724a5d46d22b8dd18ea1594457b559dbeae2f8f485 $BASE/p4-usbmsc-bootloader.bin
 p4-usbmsc-ptable.bin f6992f2eded46b7b73dccaf32c0702dd50c683bf834222916c5cddf7b85dac74 $BASE/p4-usbmsc-ptable.bin
-p4-usbmsc.bin f47d38b4eae7c954e0c874a2ff6cfbba3a96a93c0765927672634517e4bb4150 $BASE/p4-usbmsc.bin"
+p4-usbmsc.bin f47d38b4eae7c954e0c874a2ff6cfbba3a96a93c0765927672634517e4bb4150 $BASE/p4-usbmsc.bin
+c6-hosted-bootloader.bin 42ae8347814c4e2ac477caede2797d798261ef253c114dffc344068783f9d643 $BASE/c6-hosted-bootloader.bin
+c6-hosted-ptable.bin dbbebb5ee220599f4b12fb5c43c01c38b59b2720b5df0d14f7d1b857f6524c92 $BASE/c6-hosted-ptable.bin
+c6-hosted-otadata.bin 7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f $BASE/c6-hosted-otadata.bin
+c6-hosted-slave.bin 7192ec47329c8f3d91e30f5f1da4ba9ee89a86cf1a363f27531c316f971cf44a $BASE/c6-hosted-slave.bin
+c6-hosted-rawtp-slave.bin 3b0dd12a47b69cec91e20a2264393824de0bf9238c01d690f1233ed38535bf2c $BASE/c6-hosted-rawtp-slave.bin
+p4-hosted-bootloader.bin 0afa47b7d81bac1e57ba261abfb8a9f622c555da56319434ad8b0f346f7cb062 $BASE/p4-hosted-bootloader.bin
+p4-hosted-ptable.bin 7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820 $BASE/p4-hosted-ptable.bin
+p4-hosted-station.bin b0e99c2150ba445d07b5a5f7cbe4ccd3e1e30b39075e3c93bcf736d74271f1e1 $BASE/p4-hosted-station.bin
+p4-hosted-rawtp-rx.bin ca8efaf3d8ea2d5f67b2dd48171a75ad883ef4ecb46c9c92f1a6c5f51a180ac6 $BASE/p4-hosted-rawtp-rx.bin
+p4-hosted-rawtp-tx.bin 8c5a3bcf2fc99d982119697e35ff7e3903805589489e69221ab828cdfd1d820e $BASE/p4-hosted-rawtp-tx.bin"
 
 sha256_ok() {  # FILE HASH; -c without GNU-only --status, so macOS shasum and sha256sum both work
   if command -v shasum >/dev/null 2>&1; then echo "$2  $1" | shasum -a 256 -c >/dev/null 2>&1

@@ -46,3 +46,13 @@ public/p4-sdsectors.bin
 public/p4-usbmsc-bootloader.bin
 public/p4-usbmsc-ptable.bin
 public/p4-usbmsc.bin
+public/c6-hosted-bootloader.bin
+public/c6-hosted-ptable.bin
+public/c6-hosted-otadata.bin
+public/c6-hosted-slave.bin
+public/c6-hosted-rawtp-slave.bin
+public/p4-hosted-bootloader.bin
+public/p4-hosted-ptable.bin
+public/p4-hosted-station.bin
+public/p4-hosted-rawtp-rx.bin
+public/p4-hosted-rawtp-tx.bin
