@@ -42,6 +42,7 @@ fn fixture(var: &str, name: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| format!("{}/Code/dlp/sim-fixtures/esp32p4/{name}", std::env::var("HOME").unwrap_or_default()))
 }
 fn report_dir() -> String { fixture("OXIDRIVE_CAR_REPORT_DIR", "oxidrive-car-report") }
+fn older_dir() -> String { fixture("OXIDRIVE_OLDER_REPORT_DIR", "oxidrive-c4c538c") }
 fn baseline_dir() -> String { fixture("OXIDRIVE_BASELINE_DIR", "oxidrive-bc40b82") }
 
 /// GD25Q-class typical times, `OXIDRIVE_FLASH_ERASE_MS` and `OXIDRIVE_FLASH_BYTE_NS` to vary them.
@@ -340,6 +341,44 @@ fn external_oxidrive_car_report_survives_a_power_cut() {
     assert!(published_two, "boot 3 never published boot 2's report");
     assert!(after.iter().any(|(t, j)| t.ends_with("/car_report/2") && num(j, "seq") == 2));
     assert_eq!(firsts, 1, "boot 1's report published again after it was marked");
+}
+
+/// An update that appends fields to the record, with a boot's report still unpublished: the
+/// older build (`OXIDRIVE_OLDER_REPORT_DIR`, the `oxidrive-c4c538c` fixture, which writes the
+/// first v1 layout, 469 bytes) runs a boot and saves its report, then the newer build
+/// (`OXIDRIVE_CAR_REPORT_DIR`) is written over its app at 0x30000, flash and NVS otherwise kept,
+/// and the P4 loses power. The new boot must keep the old record, publish it as boot 1, and
+/// give the counts appended since as null.
+#[test]
+#[ignore = "needs two oxidrive car-report builds (OXIDRIVE_OLDER_REPORT_DIR, OXIDRIVE_CAR_REPORT_DIR) with nvs.csv, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxidrive_car_report_from_an_older_build_survives_the_update() {
+    let newer = std::fs::read(format!("{}/app.bin", report_dir())).unwrap_or_else(|e| panic!("{}/app.bin: {e}", report_dir()));
+    let mut r = rig_on(older_dir(), "car-report-update.img", [(0, 0); 2], "");
+    assert!(run_until_lines(&mut r, "session ready", 1, 90 * S), "no MQTT session in the older build's boot");
+    // The first save comes once the boot has been quiet a while; well past it.
+    let t = r.cs.now_ns + 40 * S;
+    r.run_to(t);
+    let older: Vec<String> = r.p4_lines().into_iter().filter(|l| l.contains("car report") || l.contains("car_report")).map(String::from).collect();
+    for l in &older { eprintln!("[report] older: {l}"); }
+    r.cs.p4.write_flash(0x30000, &newer).unwrap();
+    let mark = r.lines.len();
+    power_cut(&mut r);
+    let by = r.cs.now_ns + 120 * S;
+    let published = run_until_lines(&mut r, "car_report: car 1/", 1, by);
+    let newer_lines: Vec<String> = r.lines[mark..].iter().filter(|l| !l.1 && (l.2.contains("car report") || l.2.contains("car_report"))).map(|l| l.2.clone()).collect();
+    for l in &newer_lines { eprintln!("[report] newer: {l}"); }
+    let got = reports(&r);
+    r.report(10);
+    assert!(newer_lines.iter().any(|l| l.contains("car report: boot 2, 1 kept, 1 not yet published")), "the newer build did not keep the older record");
+    assert!(!newer_lines.iter().any(|l| l.contains("unreadable")), "the older record was refused");
+    assert!(published, "the older boot's report was not published");
+    let one = got.iter().find(|(t, _)| t.ends_with("/car_report/1")).map(|(_, j)| j.clone()).expect("no retained car_report/1");
+    assert_eq!(num(&one, "seq"), 1);
+    assert!(one.str_or("fw", "?").contains("c4c538c"), "car_report/1 is not the older build's: {}", one.str_or("fw", "?"));
+    let stopped = one.get("shared").and_then(|s| s.get("stopped")).expect("no shared.stopped");
+    assert!(matches!(stopped.get("connection_lost"), Some(esp_soc::json::Json::Null)), "connection_lost is not null");
+    assert!(matches!(stopped.get("no_session"), Some(esp_soc::json::Json::Null)), "no_session is not null");
+    assert!(stopped.get("yielded").and_then(|v| v.as_i64()).is_some(), "the older counts are numbers");
 }
 
 /// One boot of a car that records the way a Linux flusher writes back: a second of writes
