@@ -67,7 +67,10 @@ output path, `sha256` hashes, `fw_dir` is where the example images are (`ESP32SI
 lays out SD card images by hand. `tests/common.rs` re-exports the first three next to the golden
 helpers. `sd_image::fsck` checks a card image's volume with the system's FAT checker
 (`fsck_msdos -n`, `fsck.fat -n`, or `FSCK_FAT`); `external_fat32_tree_passes_fsck` holds the host's
-long-name and directory writes to it.
+long-name and directory writes to it. `sd_image::exfat` lays out an exFAT card, and `fsck` sends an
+exFAT image to macOS's `fsck_exfat -n` (the image attached read-only with `hdiutil`), exfatprogs'
+`fsck.exfat -n`, or `FSCK_EXFAT`; `external_exfat_tree_passes_fsck` holds the recorder's exFAT
+writes to it ([esp32p4.md](../docs/esp32p4.md), "exFAT").
 
 Use `--release`: the debug build runs the same scenarios ~30x slower. On a mismatch the actual
 output is left next to the golden as `*.actual` for diffing.

@@ -68,6 +68,8 @@ pub enum MscError {
     /// the data stage moved less than the command needed
     Short { want: usize, got: usize, residue: u32 },
     NotMsc(String),
+    /// refused by the host itself: a UNIT ATTENTION was seen since the last poll (`Msc::changed`)
+    Changed,
 }
 impl From<UsbError> for MscError { fn from(e: UsbError) -> Self { MscError::Usb(e) } }
 impl std::fmt::Display for MscError {
@@ -75,7 +77,7 @@ impl std::fmt::Display for MscError {
         match self {
             MscError::Usb(e) => write!(f, "{e}"), MscError::Check(s) => write!(f, "CHECK CONDITION, {s}"), MscError::Phase => write!(f, "phase error"),
             MscError::BadCsw(s) => write!(f, "bad CSW: {s}"), MscError::Short { want, got, residue } => write!(f, "{got} of {want} bytes (residue {residue})"),
-            MscError::NotMsc(s) => write!(f, "{s}"),
+            MscError::NotMsc(s) => write!(f, "{s}"), MscError::Changed => write!(f, "device offline or changed"),
         }
     }
 }
@@ -131,6 +133,11 @@ pub struct Msc<'p> {
     pub stats: MscStats,
     /// each command's submission and completion while `Some`; `None` keeps nothing
     pub times: Option<Vec<CmdTime>>,
+    /// Linux's `sdev->changed` for a removable device: set by a CHECK CONDITION with UNIT ATTENTION
+    /// (v6.12 drivers/scsi/scsi_lib.c:803-811 for I/O, 2391-2399 for TEST UNIT READY), cleared by
+    /// the next media poll (`take_changed`; sd.c:1773-1774). While it is set READ(10) and WRITE(10)
+    /// are refused without being sent (sd.c:1340-1343).
+    pub changed: bool,
 }
 
 fn be32(b: &[u8]) -> u32 { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) }
@@ -147,7 +154,7 @@ impl<'p> Msc<'p> {
         let bulk = |dir_in: bool| f.endpoints.iter().find(|e| e.attributes & 3 == 2 && (e.address & 0x80 != 0) == dir_in).copied();
         let (i, o) = (bulk(true).ok_or_else(|| MscError::NotMsc("no bulk IN endpoint".into()))?, bulk(false).ok_or_else(|| MscError::NotMsc("no bulk OUT endpoint".into()))?);
         let mut m = Msc { interface: f.number, ep_in: i.address, ep_out: o.address, mps_in: i.mps, mps_out: o.mps, host, lun: 0, max_lun: 0, tag: 0,
-                          block_size: 512, blocks: 0, max_blocks: 240, timeout_ns: 30_000_000_000, recovery: Recovery::Linux, stats: MscStats::default(), times: None };
+                          block_size: 512, blocks: 0, max_blocks: 240, timeout_ns: 30_000_000_000, recovery: Recovery::Linux, stats: MscStats::default(), times: None, changed: false };
         m.max_lun = match m.host.control(setup_packet(0xa1, GET_MAX_LUN, 0, m.interface as u16, 1), Vec::new()) {
             Ok(d) => d.first().copied().unwrap_or(0),
             Err(UsbError::Stall(_)) => 0,
@@ -313,13 +320,22 @@ impl<'p> Msc<'p> {
     /// A SCSI command; on CHECK CONDITION the sense data comes back as the error.
     pub fn scsi(&mut self, cdb: &[u8], dir: Dir) -> Result<Vec<u8>, MscError> {
         let r = self.command(cdb, dir)?;
-        if r.csw.status == 1 {
-            self.stats.check_conditions += 1;
-            let s = self.request_sense()?;
-            return Err(MscError::Check(s));
-        }
+        if r.csw.status == 1 { return Err(self.check_condition()); }
         Ok(r.data)
     }
+
+    /// After a CSW with status 1: REQUEST SENSE, and a UNIT ATTENTION noted as `changed`.
+    fn check_condition(&mut self) -> MscError {
+        self.stats.check_conditions += 1;
+        match self.request_sense() {
+            Ok(s) => { if s.key == sense::UNIT_ATTENTION { self.changed = true; } MscError::Check(s) }
+            Err(e) => e,
+        }
+    }
+
+    /// Whether a UNIT ATTENTION came since the last call, which clears it: `sd_check_events`'s
+    /// `disk_changed = sdp->changed; sdp->changed = 0` (sd.c:1773-1774).
+    pub fn take_changed(&mut self) -> bool { std::mem::take(&mut self.changed) }
 
     pub fn request_sense(&mut self) -> Result<Sense, MscError> {
         let r = self.command(&[op::REQUEST_SENSE, 0, 0, 0, 18, 0], Dir::In(18))?;
@@ -361,6 +377,7 @@ impl<'p> Msc<'p> {
 
     /// READ(10) of `blocks` blocks from `lba`, in commands of `max_blocks` at most.
     pub fn read10(&mut self, lba: u64, blocks: u32) -> Result<Vec<u8>, MscError> {
+        if self.changed { return Err(MscError::Changed); }
         let bs = self.block_size as usize;
         let mut out = Vec::with_capacity(blocks as usize * bs);
         let (mut at, mut left) = (lba, blocks);
@@ -368,7 +385,7 @@ impl<'p> Msc<'p> {
             let n = left.min(self.max_blocks).min(0xffff);
             let want = n as usize * bs;
             let r = self.command(&Self::rw10(op::READ10, at as u32, n as u16), Dir::In(want))?;
-            if r.csw.status == 1 { self.stats.check_conditions += 1; let s = self.request_sense()?; return Err(MscError::Check(s)); }
+            if r.csw.status == 1 { return Err(self.check_condition()); }
             if r.data.len() != want || r.csw.residue != 0 { return Err(MscError::Short { want, got: r.data.len(), residue: r.csw.residue }); }
             self.stats.bytes_read += want as u64;
             out.extend_from_slice(&r.data);
@@ -380,12 +397,13 @@ impl<'p> Msc<'p> {
 
     /// WRITE(10) of `data` (whole blocks) at `lba`, in commands of `max_blocks` at most.
     pub fn write10(&mut self, lba: u64, data: &[u8]) -> Result<(), MscError> {
+        if self.changed { return Err(MscError::Changed); }
         let bs = self.block_size as usize;
         let mut at = lba;
         for chunk in data.chunks(self.max_blocks.min(0xffff) as usize * bs) {
             let n = chunk.len().div_ceil(bs);
             let r = self.command(&Self::rw10(op::WRITE10, at as u32, n as u16), Dir::Out(chunk.to_vec()))?;
-            if r.csw.status == 1 { self.stats.check_conditions += 1; let s = self.request_sense()?; return Err(MscError::Check(s)); }
+            if r.csw.status == 1 { return Err(self.check_condition()); }
             if r.csw.residue != 0 { return Err(MscError::Short { want: chunk.len(), got: chunk.len() - r.csw.residue as usize, residue: r.csw.residue }); }
             self.stats.bytes_written += chunk.len() as u64;
             at += n as u64;
@@ -394,14 +412,16 @@ impl<'p> Msc<'p> {
     }
 
     /// TEST UNIT READY every `interval_ns` until it passes, as a host polls a removable
-    /// drive; returns how many polls failed. A failure other than CHECK CONDITION ends it.
+    /// drive; returns how many polls failed. A failure other than CHECK CONDITION ends it. A UNIT
+    /// ATTENTION among them is a failed poll, and the caller reads the drive afresh: `changed` is
+    /// cleared.
     pub fn wait_ready(&mut self, interval_ns: u64, timeout_ns: u64) -> Result<u32, MscError> {
         let deadline = self.host.now_ns() + timeout_ns;
         let mut failed = 0;
         let mut last: Option<Sense> = None;
         loop {
             match self.test_unit_ready() {
-                Ok(()) => return Ok(failed),
+                Ok(()) => { self.changed = false; return Ok(failed) }
                 Err(MscError::Check(s)) => {
                     if last != Some(s) { self.host.say(format_args!("TEST UNIT READY: {s}")); last = Some(s); }
                     failed += 1;

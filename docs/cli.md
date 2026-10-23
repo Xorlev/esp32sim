@@ -173,7 +173,7 @@ adds a `[usb]` line with the core's and the host's counts.
 | `timeout MS` | how long a command may take before the host aborts it (30000, sd's SD_TIMEOUT) |
 | `inject vbus-off MS` | VBUS goes MS from now, whatever the host is doing then; a transfer in flight ends disconnected |
 | `ready INTERVAL_MS TIMEOUT_MS` | TEST UNIT READY until it passes, REQUEST SENSE after each failure |
-| `poll INTERVAL_MS MS` | TEST UNIT READY every interval for a while, as a host polls a removable drive; a NOT READY seen here or by `ready` drops the mounted volume |
+| `poll INTERVAL_MS MS` | TEST UNIT READY every interval for a while, as a host polls a removable drive; a NOT READY or UNIT ATTENTION seen here or by `ready` drops the mounted volume |
 | `capacity`, `mode-sense`, `prevent`, `allow`, `sync`, `eject` | READ CAPACITY(10), MODE SENSE(6), PREVENT ALLOW MEDIUM REMOVAL, SYNCHRONIZE CACHE(10) (a refusal is logged, not an error), START STOP UNIT with LoEj |
 | `read LBA COUNT`, `write LBA COUNT BYTE`, `verify LBA COUNT BYTE` | READ(10) (its hash), WRITE(10) of one byte value (hex), READ(10) and compare |
 | `mount`, `ls` | mount the FAT32 volume on the LUN (an MBR's partition or from LBA 0); list its root directory |
