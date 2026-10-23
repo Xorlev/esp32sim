@@ -87,6 +87,10 @@ pub trait Soc: 'static {
     /// addresses to learn whose they are.
     #[inline(always)]
     fn select_core(_bus: &mut Self::Bus, _core: usize) {}
+    /// Refuse a bootloader or application image (an `esp_image_header_t` first) this model cannot
+    /// run, such as one built for another silicon revision; the error completes "the image ...".
+    /// The front ends call it for the images they load, before the first instruction.
+    fn check_image(_image: &[u8]) -> Result<(), String> { Ok(()) }
 }
 
 /// Programmed GPIO state, not the resolved electrical level or peripheral-matrix output.

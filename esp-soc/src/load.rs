@@ -47,14 +47,23 @@ impl TryFrom<u32> for LoadKind {
     }
 }
 
+/// `Soc::check_image` for a whole flash image: its bootloader and the app at 0x10000, where the
+/// loaders put one.
+pub fn check_flash_image<S: Soc>(flash: &[u8]) -> Result<(), String> {
+    for (what, off) in [("bootloader", S::BOOTLOADER_OFFSET), ("app", 0x10000)] {
+        if let Some(image) = flash.get(off..) { S::check_image(image).map_err(|e| format!("({what} at {off:#x}) {e}"))?; }
+    }
+    Ok(())
+}
+
 impl<S: Soc> Machine<S> {
     pub fn load_input(&mut self, kind: LoadKind, data: &[u8]) -> Result<(), String> {
         match kind {
             LoadKind::Rom => self.load_rom(data),
-            LoadKind::Bootloader => self.write_flash(S::BOOTLOADER_OFFSET, data),
-            LoadKind::Flash => self.write_flash(0, data),
+            LoadKind::Bootloader => { S::check_image(data).map_err(|e| format!("the bootloader {e}"))?; self.write_flash(S::BOOTLOADER_OFFSET, data) }
+            LoadKind::Flash => { check_flash_image::<S>(data).map_err(|e| format!("the flash image {e}"))?; self.write_flash(0, data) }
             LoadKind::Partitions => self.write_flash(0x8000, data),
-            LoadKind::App => self.write_flash(0x10000, data),
+            LoadKind::App => { S::check_image(data).map_err(|e| format!("the app {e}"))?; self.write_flash(0x10000, data) }
             LoadKind::Symbols => self.add_symbols(data),
             LoadKind::Script => {
                 let text = std::str::from_utf8(data).map_err(|_| "script is not UTF-8")?;

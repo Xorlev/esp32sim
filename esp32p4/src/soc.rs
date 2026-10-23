@@ -9,13 +9,16 @@ use riscv_rv32::Cpu;
 use std::marker::PhantomData;
 
 /// What differs between ESP32-P4 silicon revisions. rev >= 3 (ECO5) moves the interrupt threshold
-/// into the `mintthresh` CSR, the L2 cache to the bottom of L2MEM and has its own ROM; it becomes
-/// a second implementation of this trait.
+/// into the `mintthresh` CSR, the L2 cache to the bottom of L2MEM and has its own ROM
+/// (`esp32p4_rev300_rom.elf`); it becomes a second implementation of this trait.
 pub trait Revision: 'static {
     /// The mask ROM ELF's name in espressif/esp-rom-elfs.
     const ROM_ELF: &'static str;
     /// (major, minor) wafer version the efuses report.
     const WAFER: (u32, u32);
+    /// Why an image whose header accepts chip revisions `min..=max` (major * 100 + minor) cannot
+    /// run on this revision, if it cannot; it completes "the image ...".
+    fn refuse(min: u16, max: u16) -> Option<String>;
 }
 
 /// rev < 3 (v0.x, v1.x), as on the Waveshare ESP32-P4-WIFI6 (v1.0). The ECO0 ROM is the only one
@@ -25,6 +28,27 @@ pub struct RevLt3;
 impl Revision for RevLt3 {
     const ROM_ELF: &'static str = "esp32p4_rev0_rom.elf";
     const WAFER: (u32, u32) = (1, 0);
+    /// A rev >= 3 build (min 300 or more) links against the rev 3 ROM and has the rev 3 interrupt
+    /// threshold built in, so it would run on here into the wrong code. It is what `idf.py
+    /// set-target esp32p4` builds by default: ESP32P4_SELECTS_REV_LESS_V3 defaults to n (IDF v5.5.3
+    /// components/esp_hw_support/port/esp32p4/Kconfig.hw_support). A rev 3 model accepts these and
+    /// refuses max < 300 instead.
+    fn refuse(min: u16, _max: u16) -> Option<String> {
+        let (major, minor) = Self::WAFER;
+        (min >= 300).then(|| format!("was built for ESP32-P4 rev ≥ v3.0 (min_chip_rev_full={min}); this model is rev < 3 (v{major}.{minor}). \
+            Rebuild with CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y, or wait for rev 3 support."))
+    }
+}
+
+/// `R::refuse` for an image built for the P4, from its `esp_image_header_t` (IDF v5.5.3
+/// components/bootloader_support/include/esp_app_format.h:81-107): magic 0xE9 at 0, chip_id at 12
+/// (ESP_CHIP_ID_ESP32P4 = 0x0012), min_chip_rev_full at 15 and max_chip_rev_full at 17. Anything
+/// else is not this check's to judge.
+pub fn check_image<R: Revision>(image: &[u8]) -> Result<(), String> {
+    let Some(h) = image.get(..24) else { return Ok(()) };
+    if h[0] != 0xE9 || h[12..14] != [0x12, 0x00] { return Ok(()); }
+    let field = |at: usize| u16::from_le_bytes([h[at], h[at + 1]]);
+    R::refuse(field(15), field(17)).map_or(Ok(()), Err)
 }
 
 pub struct Esp32p4<R: Revision>(PhantomData<R>);
@@ -85,6 +109,7 @@ impl<R: Revision> Soc for Esp32p4<R> {
         bus.irq_dirty = true;
     }
     fn select_core(bus: &mut SocBus, core: usize) { bus.cur_core = core; }
+    fn check_image(image: &[u8]) -> Result<(), String> { check_image::<R>(image) }
     /// Core 1 runs once HP_SYS_CLKRST gives it its clock and releases its reset.
     fn core_state(bus: &SocBus, core: usize) -> CoreState {
         if core == 0 || bus.periph.hp_clkrst.core1_released() { CoreState::Running } else { CoreState::Reset }
@@ -195,4 +220,32 @@ impl esp_soc::SocBus for SocBus {
     fn audio(&self) -> (&[i16], u32) { (&[], 44100) }
     /// `line` is the CPU interrupt line, CLIC ID - 16.
     fn irq_sources_of(&self, core: usize, line: u32) -> Vec<usize> { self.periph.sources_of(core, line + CLIC_EXT_OFFSET) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `esp_image_header_t` with the given chip and revision range, the rest zero.
+    fn header(chip: u16, min: u16, max: u16) -> Vec<u8> {
+        let mut h = vec![0; 24];
+        h[0] = 0xE9;
+        h[12..14].copy_from_slice(&chip.to_le_bytes());
+        h[15..17].copy_from_slice(&min.to_le_bytes());
+        h[17..19].copy_from_slice(&max.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn a_rev3_image_is_refused_and_a_rev_lt3_one_is_not() {
+        assert_eq!(check_image::<RevLt3>(&header(0x12, 300, 399)).unwrap_err(), "was built for ESP32-P4 rev ≥ v3.0 (min_chip_rev_full=300); \
+            this model is rev < 3 (v1.0). Rebuild with CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y, or wait for rev 3 support.");
+        assert!(check_image::<RevLt3>(&header(0x12, 301, 399)).is_err());
+        // what IDF v5.5.3 writes with ESP32P4_SELECTS_REV_LESS_V3: ESP32P4_REV_MIN_FULL, max 199
+        for min in [0, 1, 100] { assert_eq!(check_image::<RevLt3>(&header(0x12, min, 199)), Ok(())); }
+        // another chip's image, a short header, not an image: not this check's to judge
+        assert_eq!(check_image::<RevLt3>(&header(0x0d, 300, 399)), Ok(()));
+        assert_eq!(check_image::<RevLt3>(&header(0x12, 300, 399)[..23]), Ok(()));
+        assert_eq!(check_image::<RevLt3>(&[0xff; 64]), Ok(()));
+    }
 }

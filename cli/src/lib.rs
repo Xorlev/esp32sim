@@ -483,14 +483,17 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
         None if boot == "rom" => { eprintln!("[emu] no {} mask ROM ELF found (pass --rom, or use --boot app)", S::NAME); std::process::exit(2) }
         None => {}
     }
-    if let Some(p) = &o.flash_image { m.write_flash(0, &std::fs::read(p).expect("flash image")).unwrap(); }
-    if let Some(p) = &o.bootloader { m.write_flash(S::BOOTLOADER_OFFSET, &std::fs::read(p).expect("bootloader")).unwrap(); }
+    // an image the model cannot run (one built for another silicon revision) stops the run before it starts
+    let refuse = |path: &str, r: Result<(), String>| if let Err(e) = r { eprintln!("[emu] {path} {e}"); std::process::exit(2) };
+    if let Some(p) = &o.flash_image { let d = std::fs::read(p).expect("flash image"); refuse(p, esp_soc::load::check_flash_image::<S>(&d)); m.write_flash(0, &d).unwrap(); }
+    if let Some(p) = &o.bootloader { let d = std::fs::read(p).expect("bootloader"); refuse(p, S::check_image(&d)); m.write_flash(S::BOOTLOADER_OFFSET, &d).unwrap(); }
     if let Some(p) = &o.ptable { m.write_flash(0x8000, &std::fs::read(p).expect("ptable")).unwrap(); }
-    if let Some(p) = &o.app { m.write_flash(0x10000, &std::fs::read(p).expect("app")).unwrap(); }
+    if let Some(p) = &o.app { let d = std::fs::read(p).expect("app"); refuse(p, S::check_image(&d)); m.write_flash(0x10000, &d).unwrap(); }
     for spec in &o.flash_at {
         let (off, path) = spec.split_once('=').unwrap_or_else(|| { eprintln!("--flash-at needs OFFSET=FILE"); std::process::exit(2) });
         let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or_else(|_| { eprintln!("--flash-at: bad offset {}", off); std::process::exit(2) });
         let data = std::fs::read(path).unwrap_or_else(|e| { eprintln!("--flash-at: {}: {}", path, e); std::process::exit(2) });
+        refuse(path, S::check_image(&data));
         m.write_flash(off, &data).unwrap_or_else(|e| { eprintln!("--flash-at: {}", e); std::process::exit(2) });
         eprintln!("[emu] flash {:#x}: {} ({} bytes)", off, path, data.len());
     }
