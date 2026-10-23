@@ -165,6 +165,77 @@ impl MqttClient {
     pub fn publish(&self, topic: &str, payload: &str) -> Result<(), String> {
         run_tool(self.tool("mosquitto_pub")?.args(["-t", topic, "-m", payload]), "").map(|_| ())
     }
+
+    /// At QoS 1 over MQTT 5, with a message expiry of `expiry_s` if given: queued by the broker
+    /// for a persistent session that is away, and dropped unsent once it expires. The broker
+    /// expires by its own clock, not the emulator's.
+    pub fn publish_v5(&self, topic: &str, payload: &str, expiry_s: Option<u32>) -> Result<(), String> {
+        let mut c = self.tool("mosquitto_pub")?;
+        c.args(["-V", "mqttv5", "-q", "1", "-t", topic, "-m", payload]);
+        if let Some(s) = expiry_s { c.args(["-D", "publish", "message-expiry-interval", &s.to_string()]); }
+        run_tool(&mut c, "").map(|_| ())
+    }
+}
+
+/// A TCP relay on 127.0.0.1 in front of a service, which a test can cut (every connection
+/// closed, new ones closed as they arrive) or make deaf one way (what the client sends is read
+/// and dropped, what the service sends still arrives), standing in for a network that drops the
+/// device or loses its acknowledgements. Its threads end with the process.
+pub struct Relay { pub port: u16, state: std::sync::Arc<RelayState> }
+
+struct RelayState { mode: std::sync::atomic::AtomicU8, live: std::sync::Mutex<Vec<TcpStream>> }
+
+const RELAY_PASS: u8 = 0;
+const RELAY_DEAF: u8 = 1;
+const RELAY_CUT: u8 = 2;
+
+impl Relay {
+    pub fn start(target: SocketAddr) -> Result<Relay, String> {
+        use std::sync::{atomic::Ordering, Arc};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| format!("relay: {e}"))?;
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(RelayState { mode: RELAY_PASS.into(), live: Default::default() });
+        let st = state.clone();
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                if st.mode.load(Ordering::SeqCst) == RELAY_CUT { continue; }
+                let Ok(server) = TcpStream::connect(target) else { continue };
+                let (Ok(c2), Ok(s2), Ok(c3), Ok(s3)) = (client.try_clone(), server.try_clone(), client.try_clone(), server.try_clone()) else { continue };
+                st.live.lock().unwrap().extend([c3, s3]);
+                let up = st.clone();
+                std::thread::spawn(move || pump(client, server, Some(up.as_ref())));
+                std::thread::spawn(move || pump(s2, c2, None));
+            }
+        });
+        Ok(Relay { port, state })
+    }
+
+    pub fn addr(&self) -> SocketAddr { SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)) }
+
+    /// Close every connection both ways, and every new one as it arrives, until `restore`.
+    pub fn cut(&self) {
+        self.state.mode.store(RELAY_CUT, std::sync::atomic::Ordering::SeqCst);
+        for s in self.state.live.lock().unwrap().drain(..) { let _ = s.shutdown(std::net::Shutdown::Both); }
+    }
+
+    /// Drop what clients send from now on; the service's side still flows to them.
+    pub fn deafen(&self) { self.state.mode.store(RELAY_DEAF, std::sync::atomic::Ordering::SeqCst); }
+
+    pub fn restore(&self) { self.state.mode.store(RELAY_PASS, std::sync::atomic::Ordering::SeqCst); }
+}
+
+/// Copy `from` to `to` until either end closes, then close both. `deaf_if` is the relay whose
+/// deaf mode drops this direction's bytes.
+fn pump(mut from: TcpStream, mut to: TcpStream, deaf_if: Option<&RelayState>) {
+    use std::io::{Read, Write};
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match from.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => n };
+        if deaf_if.is_some_and(|s| s.mode.load(std::sync::atomic::Ordering::SeqCst) == RELAY_DEAF) { continue; }
+        if to.write_all(&buf[..n]).is_err() { break; }
+    }
+    let _ = from.shutdown(std::net::Shutdown::Both);
+    let _ = to.shutdown(std::net::Shutdown::Both);
 }
 
 fn samba_tool(var: &str, name: &str) -> Result<PathBuf, String> {
@@ -285,6 +356,41 @@ fn the_service_configurations_keep_to_loopback_and_their_directory() {
     }
     let mq = mosquitto_conf(1884, Path::new("/tmp/svc/passwd"));
     assert!(mq.starts_with("listener 1884 127.0.0.1\n") && mq.contains("allow_anonymous false\n") && mq.contains("password_file /tmp/svc/passwd\n"));
+}
+
+/// The relay against an echo server: it passes both ways, drops only what the client sends
+/// while deaf, closes the live connection and refuses new ones while cut, and passes again after.
+#[test]
+fn a_relay_passes_goes_deaf_one_way_and_cuts() {
+    use std::io::{Read, Write};
+    let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let target = echo.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for mut s in echo.incoming().flatten() {
+            std::thread::spawn(move || { let mut b = [0u8; 64]; while let Ok(n @ 1..) = s.read(&mut b) { if s.write_all(&b[..n]).is_err() { break; } } });
+        }
+    });
+    let relay = Relay::start(target).unwrap();
+    let open = || { let s = TcpStream::connect(relay.addr()).unwrap(); s.set_read_timeout(Some(Duration::from_millis(500))).unwrap(); s };
+    let echoed = |s: &mut TcpStream, b: &[u8]| -> Option<Vec<u8>> {
+        s.write_all(b).ok()?;
+        let mut got = vec![0u8; b.len()];
+        s.read_exact(&mut got).ok().map(|_| got)
+    };
+    let mut s = open();
+    assert_eq!(echoed(&mut s, b"one").as_deref(), Some(&b"one"[..]));
+    relay.deafen();
+    assert_eq!(echoed(&mut s, b"two"), None, "the server never heard it, so nothing came back");
+    relay.restore();
+    assert_eq!(echoed(&mut s, b"three").as_deref(), Some(&b"three"[..]));
+    relay.cut();
+    let mut b = [0u8; 8];
+    assert!(matches!(s.read(&mut b), Ok(0) | Err(_)), "the live connection is closed");
+    let mut late = open();
+    assert!(matches!(late.read(&mut b), Ok(0) | Err(_)), "a new connection is closed while cut");
+    relay.restore();
+    let mut again = open();
+    assert_eq!(echoed(&mut again, b"four").as_deref(), Some(&b"four"[..]));
 }
 
 /// Both servers from this machine's install: a file through the share and back, a retained

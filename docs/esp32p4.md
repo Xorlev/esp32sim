@@ -1172,6 +1172,30 @@ the AXI GDMA (IDF v5.5.3 `mbedtls/port/crypto_shared_gdma`, `SOC_AXI_GDMA_SUPPOR
 modelled, so SHA_BUSY (0x50091018) never clears and core 0 spins on it. The card stays with the
 application. mbedTLS's AES in DMA mode goes the same way on the P4.
 
+**Commands sent while it is away.** From teslausb-p4 b1baddc oxidrive keeps a persistent MQTT
+session (clean session off, its device id as the client id), so the broker queues QoS 1
+commands for it while it is gone; publishers set an MQTT 5 message expiry, which the broker
+enforces by its own clock. Four tests put a `Relay` (`tests/services.rs`) between the firmware
+and mosquitto (`RigOpts::mqtt_relay`): the relay can cut every connection and refuse new ones,
+or go deaf one way, dropping what the device sends while the broker's side still flows. "Away"
+is the relay cut until the broker has published the device's will (`avail` = `offline`), then
+`CoSim::p4` reset as a chip reset (`Machine::reboot`: flash and card kept), with the relay
+restored before the emulator runs again. Each test waits for `session up (resumed)`, the
+firmware's log of CONNACK's session-present flag. Results, all passing, 25-28 s on the host
+each:
+
+| Test | Published while away (expiry) | What the firmware did |
+| --- | --- | --- |
+| `external_oxidrive_runs_a_command_queued_across_a_reboot_and_drops_an_expired_one` | `ble_probe` (2 s), `update_status` (600 s), then 4 s of the host's time | session resumed at 7.306 s after the reset; `update_status` arrived in the same millisecond, before the firmware subscribed again, and ran once; `ble_probe` never arrived |
+| `external_oxidrive_acts_once_on_a_redelivered_command` | none: `update_status` sent while connected, the relay deaf, so its PUBACK was lost; then the connection cut | ran it once; 15 s later, on the resumed session, `command 1 delivered again within 120s; ignored` |
+| `external_oxidrive_cancel_queued_behind_an_update_now_wins` | `update V now` and `update_cancel V` (300 s each), V staged as in the update test | both arrived 3 ms apart after CONNACK; `update to V cancelled before it started`, the card never taken, the retained state's `ota.phase` `cancelled`; then `update V now`, sent after the cancel, took the card |
+| `external_oxidrive_never_sees_an_update_now_that_expired_while_it_was_away` | `update V now` (2 s), `update_status` (600 s), then 4 s | only `update_status` arrived; the card never taken |
+
+The redelivery test is the only one that needs the deaf relay: a QoS 1 message is sent again
+only on the next session, and only when its acknowledgement was lost. mosquitto 2.1.2 sent it
+with its original packet id, which is what the firmware keys on. `a_relay_passes_goes_deaf_one_way_and_cuts`
+checks the relay itself against an echo server and runs with the CI suite.
+
 ## The temperature sensor
 
 LP_TSENS (0x5012F000, `esp32p4::periph::Tsens`) reads a fixed die temperature, 25 °C unless a

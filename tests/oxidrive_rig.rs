@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 use crate::common::*;
 use crate::oxidrive_board;
-use crate::services::{Mosquitto, Samba};
+use crate::services::{Mosquitto, Relay, Samba};
 use esp32sim::cosim::{CoSim, Config};
 use esp_soc::nat::{Forward, Nat};
 use std::cell::RefCell;
@@ -59,6 +59,8 @@ pub fn hosted_slave(nat: Nat) -> esp32c6::Machine {
 /// two guest addresses nvs.csv names to the services, and refuses everything else.
 pub struct Rig {
     pub cs: CoSim, pub smb: Samba, pub mqtt: Mosquitto, pub card: std::path::PathBuf, pub id: String, pub lines: Vec<(u64, bool, String)>, pub samples: Vec<Sample>,
+    /// the firmware's way to the broker, with `RigOpts::mqtt_relay`
+    pub relay: Option<Relay>,
     /// the P4's console lines and the card's writes, readable while a car holds the rig as its port
     pub shared: Rc<RefCell<Shared>>,
     card_log: Option<Rc<RefCell<Vec<u64>>>>,
@@ -105,9 +107,11 @@ pub struct RigOpts {
     pub timed: Option<bool>,
     /// log every block written to the card (`Shared::writes`)
     pub log_writes: bool,
+    /// put a `Relay` between the firmware and the broker (`Rig::relay`)
+    pub mqtt_relay: bool,
 }
 impl RigOpts {
-    pub fn new(dir: String) -> Self { RigOpts { dir, card_name: "oxidrive.img".into(), card_bytes: 4 << 30, car: false, image: None, prg_us: None, timed: None, log_writes: false } }
+    pub fn new(dir: String) -> Self { RigOpts { dir, card_name: "oxidrive.img".into(), card_bytes: 4 << 30, car: false, image: None, prg_us: None, timed: None, log_writes: false, mqtt_relay: false } }
 }
 
 pub fn rig_with(o: RigOpts) -> Rig {
@@ -130,10 +134,12 @@ pub fn rig_with(o: RigOpts) -> Rig {
     let mac = oxidrive_board::board_mac(&board_log);
     let id = format!("{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5]);
     let log = std::env::var("OXIDRIVE_NET_LOG").is_ok_and(|v| v == "1");
-    let forwards = vec![Forward { guest: smb_at.guest, host: smb.svc.addr() }, Forward { guest: mqtt_at.guest, host: mqtt.svc.addr() }];
+    let relay = o.mqtt_relay.then(|| Relay::start(mqtt.svc.addr()).unwrap_or_else(|e| panic!("{e}")));
+    let broker = relay.as_ref().map_or(mqtt.svc.addr(), Relay::addr);
+    let forwards = vec![Forward { guest: smb_at.guest, host: smb.svc.addr() }, Forward { guest: mqtt_at.guest, host: broker }];
     for f in &forwards { eprintln!("[oxidrive] forwarding {} to {}", f.guest, f.host); }
     let cs = CoSim::new(p4, hosted_slave(Nat::forward_only(log, forwards)), Config::default());
-    Rig { cs, smb, mqtt, card, id, lines: Vec::new(), samples: Vec::new(), shared: Rc::new(RefCell::new(Shared::default())), card_log }
+    Rig { cs, smb, mqtt, card, id, lines: Vec::new(), samples: Vec::new(), relay, shared: Rc::new(RefCell::new(Shared::default())), card_log }
 }
 
 impl Rig {
