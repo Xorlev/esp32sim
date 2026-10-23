@@ -1,0 +1,8 @@
+[package]
+name = "esp32sim-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Helpers for tests that run the emulator, here or in another crate: the mask ROM ELFs, fresh output paths, SHA-256, hand-laid SD card images and the system's checkers for them"
+
+[dependencies]

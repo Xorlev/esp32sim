@@ -1,7 +1,6 @@
 //! The host against a mass-storage device written in Rust at the transaction level: a fake that
 //! answers like TinyUSB's MSC class, with knobs for the failures BOT's host side must handle.
-#[path = "../../../tests/sd_image.rs"]
-mod sd_image;
+use esp32sim_testkit::sd_image;
 use super::fat32::{file_bytes, write_paced, Fat32, MemDisk};
 use super::msc::{op, sense, Dir, Msc, MscError, Recovery, Sense};
 use super::*;

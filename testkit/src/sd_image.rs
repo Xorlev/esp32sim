@@ -4,7 +4,6 @@
 //! names, as IDF's FatFs writes them without long file names). Field offsets: Microsoft's FAT32
 //! File System Specification 1.03 (fatgen103), "Boot Sector and BPB", "FAT32 FSInfo Sector
 //! Structure", "FAT Directory Structure".
-#![allow(dead_code)]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 

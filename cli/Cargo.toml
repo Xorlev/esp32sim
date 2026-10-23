@@ -34,3 +34,6 @@ esp32c3 = { path = "../esp32c3" }
 esp32 = { path = "../esp32" }
 esp32c6 = { path = "../esp32c6" }
 esp32p4 = { path = "../esp32p4" }
+
+[dev-dependencies]
+esp32sim-testkit = { path = "../testkit" }
