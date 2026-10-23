@@ -41,3 +41,5 @@ public/p4-hello-smp-bootloader.bin
 public/p4-hello-smp_world.bin
 public/p4-sdcard-bootloader.bin
 public/p4-sdcard.bin
+public/p4-sdsectors-bootloader.bin
+public/p4-sdsectors.bin
