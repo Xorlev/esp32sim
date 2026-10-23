@@ -1,7 +1,7 @@
 //! The host against a mass-storage device written in Rust at the transaction level: a fake that
 //! answers like TinyUSB's MSC class, with knobs for the failures BOT's host side must handle.
 use esp32sim_testkit::sd_image;
-use super::fat32::{file_bytes, write_paced, Fat32, MemDisk};
+use super::fat32::{file_bytes, write_paced, Fat32, FileDisk, MemDisk};
 use super::msc::{op, sense, Dir, Msc, MscError, Recovery, Sense};
 use super::*;
 use emu_core::Fault;
@@ -46,7 +46,27 @@ struct FakeMsc {
     bus_resets: u32,
     /// stop answering bulk IN after this many more IN data packets
     hang_after: Option<u32>,
+    /// the port's time, set before each service
+    now: u64,
+    /// when the application holds the card
+    windows: Vec<FakeWindow>,
+    /// when each WRITE(10) of `writes` came
+    write_at: Vec<u64>,
+    /// Serve `windows` as an esp_tinyusb that gates the card does: READ CAPACITY, READ(10) and
+    /// WRITE(10) refused with MEDIUM NOT PRESENT as TEST UNIT READY is, and after each window UNIT
+    /// ATTENTION 6/28/00 for the first command but INQUIRY and REQUEST SENSE.
+    gated: bool,
+    /// windows whose unit attention has been reported
+    attended: usize,
 }
+
+/// A window as esp_tinyusb serves one: while the application holds the card TEST UNIT READY
+/// answers MEDIUM NOT PRESENT, and READ(10) and WRITE(10) still reach the card (tinyusb_msc.c
+/// `tud_msc_test_unit_ready_cb`, `tud_msc_read10_cb`, `tud_msc_write10_cb`). `app` changes the card
+/// once, at the window's start.
+struct FakeWindow { from: u64, to: u64, app: Option<AppWrite> }
+/// What the application does to the card's bytes.
+type AppWrite = Box<dyn FnMut(&mut Vec<u8>)>;
 
 const DEVICE: [u8; 18] = [18, 1, 0x00, 0x02, 0xef, 2, 1, 64, 0x3a, 0x30, 0x02, 0x40, 0x00, 0x01, 1, 2, 3, 1];
 fn config() -> Vec<u8> {
@@ -61,7 +81,7 @@ fn string(s: &str) -> Vec<u8> { let mut v = vec![2 + 2 * s.len() as u8, 3]; for 
 impl FakeMsc {
     fn new(blocks: usize) -> Self {
         FakeMsc { disk: vec![0; blocks * 512], vbus: false, setup: [0; 8], ctrl_in: Vec::new(), ctrl_pos: 0, ctrl_stall: false, ep0_pid: true, configured: false,
-                  pid: [false; 2], halt: [false; 2], bot: Bot::Idle, tag: 0, want: 0, sense: Sense::default(), knobs: Knobs::default(), bot_resets: 0, clear_halts: 0, commands: Vec::new(), write_lba: 0, writes: Vec::new(), bus_resets: 0, hang_after: None }
+                  pid: [false; 2], halt: [false; 2], bot: Bot::Idle, tag: 0, want: 0, sense: Sense::default(), knobs: Knobs::default(), bot_resets: 0, clear_halts: 0, commands: Vec::new(), write_lba: 0, writes: Vec::new(), bus_resets: 0, hang_after: None, now: 0, windows: Vec::new(), write_at: Vec::new(), gated: false, attended: 0 }
     }
     fn csw(&self, residue: u32, status: u8) -> [u8; 13] {
         let mut c = [0u8; 13];
@@ -86,9 +106,16 @@ impl FakeMsc {
         let lba = u32::from_be_bytes(cb[2..6].try_into().unwrap()) as usize;
         let n = u16::from_be_bytes([cb[7], cb[8]]) as usize;
         if self.knobs.phase_on == Some(opc) { self.bot = Bot::Status(self.csw(0, 2)); return; }
+        if self.gated {
+            let ended = self.windows.iter().filter(|w| w.to <= self.now).count();
+            if ended > self.attended && !matches!(opc, op::INQUIRY | op::REQUEST_SENSE) { self.attended = ended; return self.fail(sense::UNIT_ATTENTION, 0x28, dir_in); }
+            let held = self.windows.iter().any(|w| (w.from..w.to).contains(&self.now));
+            if held && matches!(opc, op::READ_CAPACITY10 | op::READ10 | op::WRITE10) { return self.fail(sense::NOT_READY, sense::MEDIUM_NOT_PRESENT, dir_in); }
+        }
         let reply = match opc {
             op::TEST_UNIT_READY => {
                 if self.knobs.not_ready > 0 { self.knobs.not_ready -= 1; return self.fail(sense::NOT_READY, sense::MEDIUM_NOT_PRESENT, false); }
+                if self.windows.iter().any(|w| (w.from..w.to).contains(&self.now)) { return self.fail(sense::NOT_READY, sense::MEDIUM_NOT_PRESENT, false); }
                 None
             }
             op::REQUEST_SENSE => { let mut s = vec![0u8; 18]; s[0] = 0x70; s[2] = self.sense.key; s[7] = 10; s[12] = self.sense.asc; s[13] = self.sense.ascq; self.sense = Sense::default(); Some(s) }
@@ -97,7 +124,7 @@ impl FakeMsc {
             op::MODE_SENSE6 => Some(vec![3, 0, 0, 0]),
             op::PREVENT_ALLOW | op::START_STOP_UNIT | op::SYNCHRONIZE_CACHE10 => None,
             op::READ10 => { if (lba + n) * 512 > self.disk.len() { return self.fail(sense::ILLEGAL_REQUEST, 0x21, true); } Some(self.disk[lba * 512..(lba + n) * 512].to_vec()) }
-            op::WRITE10 => { self.write_lba = lba; self.writes.push((lba, n)); self.bot = Bot::DataOut(n * 512, Vec::new()); return; }
+            op::WRITE10 => { self.write_lba = lba; self.writes.push((lba, n)); self.write_at.push(self.now); self.bot = Bot::DataOut(n * 512, Vec::new()); return; }
             _ => return self.fail(sense::ILLEGAL_REQUEST, sense::INVALID_OPCODE, dir_in),
         };
         match reply {
@@ -212,11 +239,14 @@ impl UsbPort for FakePort {
     fn link(&mut self) -> Option<&mut UsbLink> { Some(&mut self.link) }
     fn run_until(&mut self, t_ns: u64) -> Result<(), String> {
         loop {
+            self.dev.now = self.now;
+            for w in self.dev.windows.iter_mut().filter(|w| w.from <= self.now) { if let Some(mut app) = w.app.take() { app(&mut self.dev.disk); } }
             if self.link.tick_to(self.now) { self.link.service(self.now, &mut self.dev, &mut NoMem); }
             let p = self.dev.pullup();
             if p != self.pullup { self.pullup = p; self.link.device_pullup(self.now, p); continue; }
             if self.now >= t_ns { return Ok(()); }
-            self.now = self.link.wake_at().map_or(t_ns, |w| w.max(self.now + 1)).min(t_ns);
+            let next_window = self.dev.windows.iter().filter(|w| w.app.is_some() && w.from > self.now).map(|w| w.from).min().unwrap_or(u64::MAX);
+            self.now = self.link.wake_at().map_or(t_ns, |w| w.max(self.now + 1)).min(t_ns).min(next_window);
         }
     }
 }
@@ -627,18 +657,319 @@ fn external_fat32_tree_passes_fsck() {
 }
 
 /// A card image file as a block device.
-struct FileDisk(std::fs::File);
-impl super::fat32::BlockDevice for FileDisk {
-    fn block_size(&self) -> u32 { 512 }
-    fn blocks(&self) -> u64 { self.0.metadata().unwrap().len() / 512 }
-    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), String> {
-        use std::io::{Read, Seek};
-        self.0.seek(std::io::SeekFrom::Start(lba * 512)).map_err(|e| e.to_string())?;
-        self.0.read_exact(buf).map_err(|e| e.to_string())
-    }
-    fn write_blocks(&mut self, lba: u64, data: &[u8]) -> Result<(), String> {
-        use std::io::{Seek, Write};
-        self.0.seek(std::io::SeekFrom::Start(lba * 512)).map_err(|e| e.to_string())?;
-        self.0.write_all(data).map_err(|e| e.to_string())
+use super::recorder::{Recorder, RecorderCfg, Offline, Recorded};
+use super::fat32::{bmff_bytes, FsckWrite};
+use super::pagecache::{PageCache, WritebackCfg};
+
+/// A 64 MiB FAT32 image of 512-byte clusters, in memory.
+fn small_volume(tag: &str) -> Vec<u8> {
+    let img = std::env::temp_dir().join(format!("usbhost-{tag}-{}.img", std::process::id()));
+    sd_image::fat32(&img, 64 << 20, 512, "").unwrap();
+    let d = std::fs::read(&img).unwrap();
+    let _ = std::fs::remove_file(&img);
+    d
+}
+
+/// The application's FatFs making a directory on the card in a window: a cluster from FSInfo's
+/// hint, the entry in the root, FSInfo.
+fn app_mkdir(path: &'static str) -> AppWrite {
+    Box::new(move |disk: &mut Vec<u8>| {
+        let mut m = MemDisk(std::mem::take(disk));
+        let mut fs = Fat32::mount(&mut m).unwrap();
+        fs.mkdir_all(&mut m, path).unwrap();
+        *disk = m.0;
+    })
+}
+
+/// esp_tinyusb answers TEST UNIT READY with MEDIUM NOT PRESENT while the application holds the
+/// card but writes every WRITE(10) to the card all the same, so a recorder recording when a window
+/// opens keeps writing into it until its next poll: here 2 s polls, a window from 0.5 s, the
+/// writes between it and the poll at 2.16 s on the card, the file cut there. When the window ends
+/// the recorder sees the medium again and reads the volume anew.
+#[test]
+fn a_recorder_keeps_writing_into_a_window_until_its_next_poll() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("window-writes");
+    dev.windows.push(FakeWindow { from: 500_000_000, to: 3_000_000_000, app: None });
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut rec = Recorder::new(PageCache::new(m), RecorderCfg::default());
+    rec.mount().unwrap();
+    let mounted = rec.now();
+    let payload = bmff_bytes("event", 8 << 20);
+    let r = rec.record("HostData/ThirdGroup/file.bin", &payload).unwrap();
+    let Recorded::MediumGone { written } = r else { panic!("{r:?}") };
+    let gone = rec.log.iter().find(|l| l.1.contains("medium gone")).unwrap().0;
+    assert!((mounted + 2_000_000_000..mounted + 2_010_000_000).contains(&gone), "the poll 2 s after the mount saw it: {gone}");
+    assert!(written > 6 << 20 && written < 8 << 20, "about 2 s of a 4.1 MB/s source written: {written}");
+    assert!(!rec.present && rec.fs.is_none());
+    rec.idle(2_000_000_000).unwrap();
+    assert!(rec.present && rec.stats.mounts == 2 && rec.stats.media_changes == 2, "{:?}", rec.stats);
+    drop(rec);
+    let in_window: Vec<_> = port.dev.writes.iter().zip(&port.dev.write_at).filter(|(_, &t)| (500_000_000..gone).contains(&t)).collect();
+    let blocks: usize = in_window.iter().map(|(w, _)| w.1).sum();
+    assert!(in_window.len() > 90 && blocks * 512 > 6 << 20, "{} WRITE(10)s, {blocks} blocks reached the card under the application", in_window.len());
+    // vfat-like order: the cut file's entry still says 0 bytes and no cluster, its data orphaned
+    let mut mem = MemDisk(port.dev.disk.clone());
+    let fs = Fat32::mount(&mut mem).unwrap();
+    let e = fs.stat(&mut mem, "HostData/ThirdGroup/file.bin").unwrap().unwrap();
+    assert_eq!((e.size, e.cluster), (0, 0));
+}
+
+/// A recorder that keeps the FAT and the directories it read (Linux's buffer cache), polling every
+/// 5 s, does not see a window that opens and closes between two polls: the application's directory,
+/// made in the window, is not in the recorder's cached root and FAT, so the recorder's own
+/// directory takes the same root slot and the same cluster. A recorder that reads the volume again
+/// sees it and uses it.
+#[test]
+fn a_caching_recorder_writes_over_what_a_window_between_its_polls_wrote() {
+    for keep in [true, false] {
+        let mut dev = FakeMsc::new(0);
+        dev.disk = small_volume("window-short");
+        dev.windows.push(FakeWindow { from: 1_000_000_000, to: 1_500_000_000, app: Some(app_mkdir("HostData/FirstGroup")) });
+        let mut port = FakePort::new(dev);
+        let m = msc(&mut port);
+        let disk = if keep { PageCache::keeping_meta(m) } else { PageCache::new(m) };
+        let mut rec = Recorder::new(disk, RecorderCfg { poll_ns: 5_000_000_000, ..RecorderCfg::default() });
+        rec.mount().unwrap();
+        // the recorder looks for its folder before the window: the root and the FAT read
+        assert!(rec.fs.clone().unwrap().stat(&mut rec.disk, "HostData").unwrap().is_none());
+        rec.idle(6_000_000_000).unwrap();
+        assert_eq!((rec.stats.polls, rec.stats.media_changes), (1, 0), "the one poll, at 5.16 s, found the medium there");
+        let fs = rec.fs.as_mut().unwrap();
+        fs.mkdir_all(&mut rec.disk, "HostData/ThirdGroup").unwrap();
+        drop(rec);
+        let mut mem = MemDisk(port.dev.disk.clone());
+        let fs = Fat32::mount(&mut mem).unwrap();
+        let names = |p: &str, mem: &mut MemDisk| fs.list(mem, p).map(|v| v.into_iter().map(|e| e.name).collect::<Vec<_>>());
+        if keep {
+            assert_eq!(names("HostData", &mut mem).unwrap(), ["ThirdGroup"], "the application's FirstGroup is gone: the recorder's HostData took its cluster");
+            assert_eq!(fs.list_root(&mut mem).unwrap().len(), 1, "one HOSTDATA in the root, in the same slot");
+        } else {
+            assert_eq!(names("HostData", &mut mem).unwrap(), ["FirstGroup", "ThirdGroup"]);
+        }
     }
 }
+
+/// The window of `a_recorder_keeps_writing_into_a_window_until_its_next_poll`, gated: the recorder's
+/// first WRITE(10) after the window opens is refused with MEDIUM NOT PRESENT, so nothing of it
+/// reaches the card and the file is cut at once; its poll then finds the medium gone, and the first
+/// poll after the window meets the UNIT ATTENTION and revalidates (READ CAPACITY, MODE SENSE, the
+/// volume).
+#[test]
+fn a_gated_window_refuses_the_recorder_and_its_unit_attention_revalidates() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("window-gated");
+    dev.windows.push(FakeWindow { from: 500_000_000, to: 3_000_000_000, app: None });
+    dev.gated = true;
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut rec = Recorder::new(PageCache::new(m), RecorderCfg::default());
+    rec.mount().unwrap();
+    let payload = bmff_bytes("event", 8 << 20);
+    let r = rec.record("HostData/ThirdGroup/file.bin", &payload).unwrap();
+    let Recorded::WriteFailed { written, error } = r else { panic!("{r:?}") };
+    assert!(error.contains("2/3a/00") && written < 2 << 20, "refused at the window's start, about 0.33 s of the source written: {written}, {error}");
+    rec.idle(4_500_000_000).unwrap();
+    assert_eq!((rec.stats.unit_attentions, rec.stats.media_changes, rec.stats.mounts), (1, 2, 2), "gone at a poll, back at the unit attention: {:?}", rec.stats);
+    assert!(rec.present && rec.log.iter().any(|l| l.1.contains("NOT READY TO READY CHANGE")));
+    drop(rec);
+    assert!(port.dev.write_at.iter().all(|&t| !(500_000_000..3_000_000_000).contains(&t)), "no WRITE(10) reached the card in the window");
+    let after: Vec<u8> = port.dev.commands.iter().rev().take(12).copied().collect();
+    assert!(after.contains(&op::MODE_SENSE6) && after.contains(&op::READ_CAPACITY10), "the revalidation's commands: {after:02x?}");
+}
+
+/// `a_caching_recorder_writes_over_what_a_window_between_its_polls_wrote`, gated: the window still falls
+/// between the 5 s recorder's polls, but that poll meets the UNIT ATTENTION, so the recorder drops
+/// its cached root and FAT and reads the volume again before it makes its folder.
+#[test]
+fn a_caching_recorder_reads_again_what_a_gated_window_between_its_polls_wrote() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("window-short-gated");
+    dev.windows.push(FakeWindow { from: 1_000_000_000, to: 1_500_000_000, app: Some(app_mkdir("HostData/FirstGroup")) });
+    dev.gated = true;
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut rec = Recorder::new(PageCache::keeping_meta(m), RecorderCfg { poll_ns: 5_000_000_000, ..RecorderCfg::default() });
+    rec.mount().unwrap();
+    assert!(rec.fs.clone().unwrap().stat(&mut rec.disk, "HostData").unwrap().is_none());
+    rec.idle(6_000_000_000).unwrap();
+    assert_eq!((rec.stats.polls, rec.stats.unit_attentions, rec.stats.media_changes), (1, 1, 1), "the one poll met the unit attention");
+    let fs = rec.fs.as_mut().unwrap();
+    fs.mkdir_all(&mut rec.disk, "HostData/ThirdGroup").unwrap();
+    drop(rec);
+    let mut mem = MemDisk(port.dev.disk.clone());
+    let fs = Fat32::mount(&mut mem).unwrap();
+    let names: Vec<String> = fs.list(&mut mem, "HostData").unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(names, ["FirstGroup", "ThirdGroup"], "the application's folder kept");
+}
+
+/// A writeback recorder whose pages land while a gated window holds the card, and after it: the
+/// first landing after the window meets the UNIT ATTENTION, which marks the device changed, so the
+/// rest are refused by the host itself (sd.c:1340-1343) and lost, none reaching the card, and the
+/// next poll revalidates. A landing the drive refuses is not the error of the pause that woke it.
+#[test]
+fn a_writeback_recorder_loses_its_pages_to_a_gated_window_and_revalidates() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("window-writeback-gated");
+    dev.windows.push(FakeWindow { from: 1_000_000_000, to: 1_500_000_000, app: None });
+    dev.gated = true;
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut rec = Recorder::new(PageCache::writeback(m, WritebackCfg::default()), RecorderCfg { poll_ns: 5_000_000_000, linux_entries: true, ..RecorderCfg::default() });
+    rec.mount().unwrap();
+    let r = rec.record("HostData/ThirdGroup/file.bin", &bmff_bytes("c", 1 << 20)).unwrap();
+    assert!(matches!(r, Recorded::Closed { .. }), "{r:?}");
+    rec.idle(6_000_000_000).unwrap();
+    assert_eq!((rec.stats.unit_attentions, rec.stats.media_changes), (1, 1), "{:?}", rec.stats);
+    assert!(rec.disk.stats.write_errors > 1 && rec.disk.dirty_pages() == 0, "{:?}", rec.disk.stats);
+    drop(rec);
+    assert!(port.dev.write_at.iter().all(|&t| t < 1_000_000_000), "nothing landed in or after the window: {:?}", port.dev.write_at);
+}
+
+/// A recorder on Linux's writeback, `WritebackCfg`'s defaults: each chunk's data in
+/// one batch 50 ms to 5 s after it was written, metadata pages held back 30 s about 96 times in
+/// 100, the entry rewritten as the file grows, so the medium sees intermediate sizes; after a
+/// sync the medium is what the recorder believes.
+#[test]
+fn writeback_lands_data_in_batches_and_holds_the_metadata_back() {
+    let disk = PageCache::writeback(Offline { dev: MemDisk(small_volume("writeback")), now: 0 }, WritebackCfg::default());
+    // 64 KiB a second: each file records for 48 s, longer than the metadata lag
+    let mut rec = Recorder::new(disk, RecorderCfg { poll_ns: 0, linux_entries: true, gap_ns: 1_000_000_000, ..RecorderCfg::default() });
+    rec.disk.record = true;
+    rec.mount().unwrap();
+    let files: Vec<(String, Vec<u8>)> = (0..6).map(|i| (format!("HostData/FirstGroup/e{i}/first.bin"), bmff_bytes(&format!("c{i}"), 3 << 20))).collect();
+    for (p, c) in &files { assert!(matches!(rec.record(p, c).unwrap(), Recorded::Closed { .. })); }
+    rec.idle(40_000_000_000).unwrap();
+    assert_eq!(rec.disk.dirty_pages(), 0, "everything landed within the lag and a flusher wake");
+    let fs = rec.fs.clone().unwrap();
+    let data: Vec<_> = rec.disk.landings.iter().filter(|l| !l.meta).collect();
+    let lag = |l: &&super::pagecache::Landing| l.at_ns - l.dirtied_ns;
+    assert!(data.iter().all(|l| (50_000_000..=5_100_000_000).contains(&lag(l))), "data lands within a flusher wake");
+    assert!(data.iter().all(|l| l.count >= 128 || l.lba + l.count as u64 > fs.data_lba), "a 64 KiB chunk lands in one write");
+    let meta: Vec<_> = rec.disk.landings.iter().filter(|l| l.meta).collect();
+    let held = meta.iter().filter(|l| lag(l) >= 30_000_000_000).count();
+    assert!(held * 100 >= meta.len() * 85, "{held} of {} metadata writes trailed 30 s", meta.len());
+    let (first, entry_first) = super::pagecache::data_first(&rec.disk.landings, &fs);
+    eprintln!("data first in {first} clusters, the entry first in {entry_first} ({:.1}% data first); {held} of {} metadata writes held back", first as f64 * 100.0 / (first + entry_first) as f64, meta.len());
+    assert!(first > 0 && entry_first > 0 && first * 100 > (first + entry_first) * 95, "data before its FAT entry in {first} clusters, the entry first in {entry_first}");
+    // the medium mid-recording: some entry sizes landed between 0 and the file's size
+    let sizes = landed_entry_sizes(&rec.disk.meta_landed);
+    assert!(sizes.iter().any(|&(_, s)| s > 0 && s < 3 << 20), "an intermediate size reached the medium: {sizes:?}");
+    rec.disk.sync().unwrap();
+    let mut m = std::mem::replace(&mut rec.disk.dev.dev, MemDisk(Vec::new()));
+    let fs = Fat32::mount(&mut m).unwrap();
+    for (p, c) in &files { assert_eq!(fs.read_path(&mut m, p).unwrap(), *c, "{p}"); }
+}
+
+/// Power gone mid-recording: what had not landed is lost. The medium keeps a torn volume, which
+/// is dirty because the recorder never unmounted it; fsck cuts the files to what their chains hold,
+/// frees the clusters nothing reaches, and a second run finds nothing to do.
+#[test]
+fn a_power_cut_leaves_a_dirty_torn_volume_that_fsck_repairs() {
+    let disk = PageCache::writeback(Offline { dev: MemDisk(small_volume("powercut")), now: 0 }, WritebackCfg::default());
+    let mut rec = Recorder::new(disk, RecorderCfg { poll_ns: 0, linux_entries: true, dirty_flag: true, ..RecorderCfg::default() });
+    rec.mount().unwrap();
+    for i in 0..3 { rec.record(&format!("HostData/ThirdGroup/c{i}.bin"), &bmff_bytes(&format!("c{i}"), 2 << 20)).unwrap(); }
+    rec.idle(3_000_000_000).unwrap();
+    let lost = rec.power_cut();
+    assert!(lost > 0);
+    let mut m = Offline { dev: std::mem::replace(&mut rec.disk.dev.dev, MemDisk(Vec::new())), now: 0 };
+    let mut fs = Fat32::mount(&mut m).unwrap();
+    assert!(fs.dirty(&mut m).unwrap(), "no clean unmount");
+    let r = fs.fsck(&mut m, FsckWrite::Changed).unwrap();
+    assert!(r.dirty_cleared && r.lost_clusters + r.truncated.len() as u32 + r.resized.len() as u32 > 0, "{}", r.summary());
+    let again = fs.fsck(&mut m, FsckWrite::Changed).unwrap();
+    assert!(!again.dirty_cleared && again.lost_clusters == 0 && again.truncated.is_empty() && again.resized.is_empty() && again.fat_sectors_changed == 0, "{}", again.summary());
+}
+
+/// A recorder's ring of files on a full volume: deleting the oldest file frees its clusters, and
+/// the next file, allocated from the hint as Linux's `fat_alloc_clusters` does once it has come
+/// round, takes them.
+#[test]
+fn rotation_on_a_full_volume_reuses_the_clusters_it_frees() {
+    let mut mem = MemDisk(small_volume("rotation"));
+    let mut fs = Fat32::mount(&mut mem).unwrap();
+    // fill the volume but for three files and the two directories they go in
+    let fill = fs.clusters as usize - 1 - (3 * (1 << 20) / 512 + 2);
+    let mut w = fs.create(&mut mem, "FILLER.BIN").unwrap();
+    for n in (0..fill).step_by(2048).map(|at| (fill - at).min(2048)) { w.write(&mut fs, &mut mem, &vec![0u8; n * 512]).unwrap(); }
+    w.close(&mut fs, &mut mem).unwrap();
+    let mut rec = Recorder::new(PageCache::new(Offline { dev: mem, now: 0 }), RecorderCfg { poll_ns: 0, gap_ns: 0, ..RecorderCfg::default() });
+    rec.mount().unwrap();
+    let path = |i: usize| format!("HostData/ThirdGroup/c{i}.bin");
+    let mut chains = Vec::new();
+    for i in 0..6 {
+        if i >= 3 { rec.delete(&path(i - 3)).unwrap(); }
+        rec.record(&path(i), &bmff_bytes(&path(i), 1 << 20)).unwrap();
+        let fs = rec.fs.clone().unwrap();
+        let e = fs.stat(&mut rec.disk, &path(i)).unwrap().unwrap();
+        chains.push(fs.chain(&mut rec.disk, e.cluster).unwrap());
+    }
+    for i in 3..6 { assert_eq!(chains[i], chains[i - 3], "file {i} takes file {}'s clusters", i - 3); }
+    assert_eq!(rec.read(&path(5)).unwrap(), bmff_bytes(&path(5), 1 << 20));
+}
+
+/// The (name, size) of every file entry in the directory sectors that landed, in landing order.
+fn landed_entry_sizes(landed: &[(u64, u64, Vec<u8>)]) -> Vec<(String, u32)> {
+    landed.iter().flat_map(|(_, _, d)| d.chunks(32).filter(|e| e[0] != 0 && e[0] != 0xe5 && e[11] == 0x20).map(|e| (String::from_utf8_lossy(&e[..11]).to_string(), u32::from_le_bytes(e[28..32].try_into().unwrap()))).collect::<Vec<_>>()).collect()
+}
+
+/// A ring of long-named files in one directory: each deletion leaves its entries
+/// free (0xE5), and the next file's long name and short entry take them, so the directory's one
+/// cluster holds the ring for good.
+#[test]
+fn a_ring_of_long_names_reuses_its_directory_slots() {
+    let img = std::env::temp_dir().join(format!("usbhost-ring-{}.img", std::process::id()));
+    sd_image::fat32(&img, 3 << 30, 32 << 10, "").unwrap();
+    let file = FileDisk(std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap());
+    let mut rec = Recorder::new(PageCache::writeback(Offline { dev: file, now: 0 }, WritebackCfg::default()), RecorderCfg { poll_ns: 0, gap_ns: 0, linux_entries: true, ..RecorderCfg::default() });
+    rec.mount().unwrap();
+    let streams = ["first", "aux1", "third_channel", "fourth_channel"];
+    let mut ring = std::collections::VecDeque::new();
+    for m in 0..300u32 {
+        let paths: Vec<String> = streams.iter().map(|c| format!("HostData/ThirdGroup/2026-01-01_{:02}-{:02}-00-{c}.bin", m / 60, m % 60)).collect();
+        let datas: Vec<Vec<u8>> = paths.iter().map(|p| bmff_bytes(p, 40_000)).collect();
+        let set: Vec<(&str, &[u8])> = paths.iter().map(|p| p.as_str()).zip(datas.iter().map(|d| d.as_slice())).collect();
+        rec.record_set(&set, 100_000_000).unwrap_or_else(|e| panic!("set {m}: {e}"));
+        ring.push_back(paths);
+        if ring.len() > 12 { for p in ring.pop_front().unwrap() { rec.delete(&p).unwrap(); } }
+    }
+    rec.disk.sync().unwrap();
+    let fs = rec.fs.clone().unwrap();
+    let e = fs.stat(&mut rec.disk, "HostData/ThirdGroup").unwrap().unwrap();
+    assert_eq!(fs.chain(&mut rec.disk, e.cluster).unwrap().len(), 1, "one cluster");
+    assert_eq!(fs.list(&mut rec.disk, "HostData/ThirdGroup").unwrap().len(), 48);
+    drop(rec);
+    let _ = std::fs::remove_file(&img);
+}
+
+/// A USB reset without power loss, then the recorder's fsck with the FATs rewritten whole: the port
+/// reset as Linux's `usb_reset_device` does it, every sector of both FATs written, FAT1 first, in
+/// commands of 240 blocks, and the volume read again afterwards.
+#[test]
+fn a_reset_then_a_bulk_fsck_rewrites_both_fats_whole() {
+    let mut dev = FakeMsc::new(0);
+    dev.disk = small_volume("bulk-fsck");
+    let mut port = FakePort::new(dev);
+    let m = msc(&mut port);
+    let mut rec = Recorder::new(PageCache::new(m), RecorderCfg { poll_ns: 0, gap_ns: 0, ..RecorderCfg::default() });
+    rec.mount().unwrap();
+    rec.record("HostData/ThirdGroup/a.bin", &bmff_bytes("a", 300_000)).unwrap();
+    rec.disk.dev.host.reset_device().unwrap();
+    let fs = rec.fs.clone().unwrap();
+    let r = rec.fsck_now(super::fat32::FsckWrite::Bulk).unwrap();
+    assert_eq!((r.files, r.lost_clusters, r.fat_bytes_written), (1, 0, 2 * fs.fat_sectors as u64 * 512), "{}", r.summary());
+    assert_eq!(rec.read("HostData/ThirdGroup/a.bin").unwrap(), bmff_bytes("a", 300_000));
+    drop(rec);
+    let fat1 = 2048 + fs.reserved as usize;
+    let fat2 = fat1 + fs.fat_sectors as usize;
+    let w = &port.dev.writes;
+    let first = w.iter().position(|x| x.0 == fat1 && x.1 == 240).expect("FAT1 rewritten from its first sector");
+    let blocks = |lo: usize, hi: usize| w[first..].iter().filter(|x| (lo..hi).contains(&x.0)).map(|x| x.1).sum::<usize>();
+    assert_eq!((blocks(fat1, fat2), blocks(fat2, fat2 + fs.fat_sectors as usize)), (fs.fat_sectors as usize, fs.fat_sectors as usize));
+    assert!(w[first..].iter().take_while(|x| x.0 < fat2).all(|x| (fat1..fat2).contains(&x.0)), "FAT1 whole before FAT2");
+    assert_eq!(port.dev.bus_resets, 3, "the enumeration's reset and the port reset's two");
+}
+
+mod exfat;
