@@ -181,6 +181,8 @@ struct LinkFault {
     longest_loop: f64,
     /// Passes that ran while the fault held, after the faulted one: (end, seconds).
     later: Vec<(u64, f64)>,
+    /// Passes that found no session after the link was restored.
+    unreachable_after: usize,
 }
 
 /// The scenario both link-fault tests share. The car records `OXIDRIVE_CUT_EVENTS` (4) saved
@@ -289,13 +291,14 @@ fn smb_fault(card: &str, fault: impl Fn(&services::Relay), hold_s: u64, deadline
         failures: failures.len(), opens: count("begin_part failed"), saves: count("index: could not save"),
         save_begins: count("smb-> begin_part .oxidrive-index.tsv"), calls: count("smb-> "), longest_loop,
         later: scans.iter().skip(1).filter(|s| restored.is_none_or(|r| s.0 < r)).copied().collect(),
+        unreachable_after: restored.map_or(0, |r| after.iter().filter(|l| l.0 >= r && l.1.contains("archiver: no SMB session")).count()),
     };
     eprintln!("[oxidrive] forced {}, newer events recorded {}, fault {}, the pass ended {}, restored {}, reconnected {}, all archived {}",
               secs(f.first), secs(f.second), secs(Some(f.fault)), secs(f.pass_end), secs(f.restored), secs(f.reconnect), secs(f.done));
     eprintln!("[oxidrive] before the next session: {} SMB calls logged, {} failure lines ({} failed clip opens, {} failed manifest saves), {} manifest saves begun; {} \"archiver: connection lost\"; longest main-loop iteration after the fault {:.1} s",
               f.calls, f.failures, f.opens, f.saves, f.save_begins, f.lost, f.longest_loop);
     for (t, d) in &f.later { eprintln!("[oxidrive] a later pass while the fault held ended at {:.3} s after {d:.1} s", *t as f64 / 1e9); }
-    eprintln!("[oxidrive] {} of {n} clips on the share byte for byte", f.archived);
+    eprintln!("[oxidrive] {} of {n} clips on the share byte for byte; {} passes with no session after the restore", f.archived, f.unreachable_after);
     for l in r.lines.iter().filter(|l| !l.1 && (l.2.contains("shared: ") || l.2.contains("last iteration took") || l.2.contains("no SMB session"))) { eprintln!("[oxidrive]   {:8.3} {}", l.0 as f64 / 1e9, l.2); }
     for l in dead.iter().take(40) { eprintln!("[oxidrive]   {:8.3} {}", l.0 as f64 / 1e9, l.1); }
     r.report(10);
@@ -326,7 +329,8 @@ fn external_oxidrive_shared_pass_stops_once_when_its_smb_link_is_cut() {
 /// It should end the faulted pass within 90 s (libsmb2's 60 s request timeout and margin),
 /// with no main-loop iteration longer, and a pass that runs while the link is still silent
 /// should give up within 30 s (the 15 s connect timeout and margin). Once the link passes
-/// again, every clip reaches the share.
+/// again, the next pass finds a session, with no reply left from the fault mistaken for its own,
+/// and every clip reaches the share.
 #[test]
 #[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
 fn external_oxidrive_shared_pass_ends_when_its_smb_link_goes_half_open() {
@@ -339,6 +343,7 @@ fn external_oxidrive_shared_pass_ends_when_its_smb_link_goes_half_open() {
     assert_eq!(f.saves + f.save_begins, 0, "a manifest save on the dead session");
     assert!(!f.later.is_empty(), "no pass ran while the link was silent");
     assert!(f.later.iter().all(|l| l.1 <= 30.0), "a pass on the silent link took {:?}", f.later);
+    assert_eq!(f.unreachable_after, 0, "a pass after the restore found no session");
     assert_eq!(f.archived, f.n, "not every clip reached the share");
 }
 
