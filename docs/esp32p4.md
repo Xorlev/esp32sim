@@ -2367,6 +2367,8 @@ figures against the emulator's own record and measures what the saves cost the c
   longer) **and its writes as served** (`SdCardConfig::writes`: each write command from CMD24 or
   CMD25 to the end of its programming), the ground truth for a write tap's service time.
 - **Sense data per REQUEST SENSE** in `CmdTime::sense`.
+- **An NVS partition with more in it** (`RigOpts::nvs_extra`: CSV rows appended to the fixture's
+  `nvs.csv` before ESP-IDF's generator lays it out).
 - **A power cut**: a P4 reset with the power-on cause (`request_reset(RST_POWERON)`). RAM survives it
   here; the firmware re-initialises what it uses. The car is a new host after it: the old one is
   dropped and, where a test wants a car again, it enumerates afresh.
@@ -2383,25 +2385,27 @@ last save (its `up_ms`):
 
 | Figure | Device | Emulator |
 | --- | --- | --- |
-| TEST UNIT READY / REQUEST SENSE / READ CAPACITY / INQUIRY | 109 / 15 / 2 / 0 | 109 / 15 / 2 / 0 |
-| sense 2/3A/00, 6/28/00, none, other | 14, 1, 0, 0 | 14, 1, 0, 0 |
+| TEST UNIT READY / REQUEST SENSE / READ CAPACITY / INQUIRY | 109 / 14 / 2 / 0 | 109 / 14 / 2 / 0 |
+| sense 2/3A/00, 6/28/00, none, other | 13, 1, 0, 0 | 13, 1, 0, 0 |
 | TUR gaps, buckets <=0.5, 1, 2, 5, 10, 30 s, more | [0, 0, 108, 0, 0, 0, 0] | [0, 0, 108, 0, 0, 0, 0] |
 | car writes (the tap's calls; card write commands) | 1211 | 1211 |
 | sectors | 37940 | 37940 |
 | service time, buckets <=10, 25, 50, 100, 250, 500 ms, more | [1196, 0, 12, 0, 3, 0, 0] | [1196, 0, 12, 0, 3, 0, 0] |
-| longest write | 151.712 ms | 151.684 ms (card side) |
-| from the card's return to the car's first command / first write | 572 / 3624 ms | 549 / 3601 ms |
-| MQTT sessions lost (the console's `session down`) | 4 | 4 |
+| longest write | 151.707 ms | 151.684 ms (card side) |
+| from the card's return to the car's first command / first write | 216 / 3269 ms | 149 / 3201 ms |
+| MQTT sessions lost (a `session down` after a `session up`) | 4 | 4 |
 
-The return is timed from the console line, whose slice ends up to 100 ms after the event, so the
-emulator's gaps are short by the line's lag; the test allows 150 ms. The device's last save came
-60.3 s after the car's last write, as its schedule says. Three saves in the boot: at boot, 60 s
-after the car's first four events while a shared pass uploaded them, and 60 s after its last
-write; the longest held the flash for 3.7 ms, and no car command was in flight during any flash
-operation. The figures were the same on every run, apart from two more TEST UNIT READY polls in
-one (both sides) and the gaps after the window, which move with where the car's poll falls. An
-earlier build counted MQTT reconnects from the supervisor's tick, which a window or a pass holds,
-and reported 1 for these 4; it counts esp-mqtt's disconnects now. 656 s wall for 207 s emulated.
+The device stamps the card's return where the component hands it back; the emulator times it from
+the console line, whose slice ends up to 100 ms after the event, so the emulator's gaps are short
+by the line's lag; the test allows 150 ms. The device's last save came 60.3 s after the car's last
+write, as its schedule says. Three saves in the boot: at boot, 60 s after the car's first four
+events while a shared pass uploaded them, and 60 s after its last write; the longest held the flash
+for 3.6 ms, and no car command was in flight during any flash operation. The figures were the same
+on every run, apart from a TEST UNIT READY poll or a REQUEST SENSE more or less (both sides) and
+the gaps after the window, which move with where the car's poll falls. The device counts a lost
+session in esp-mqtt's callback, only if the session was up: esp-mqtt reports every failed connect
+as a disconnect too, so the test pairs each `session down` with a `session up` before it. The
+record's thread had 3.3 KiB of its 6 KiB stack left. 681 s wall for 207 s emulated.
 
 ### What saving costs the car
 
@@ -2423,9 +2427,29 @@ The five spells common to both are oxidrive's journal, written after every share
 not the car is writing (`archiver.rs`, `run_shared_pass`): those are the car WRITE(10)s that met a
 busy flash, in both builds. The report's own save five minutes in landed in a gap between bursts
 and held the flash for 2.69 ms with no car command in flight; the report the next boot published
-counted it (`persist`: one save before its own, 2.4 ms, histogram bucket <=5 ms, nothing during or
-just after). No sector erase came due in either run, so the 45 ms tail an NVS page reclaim costs
-was not exercised. 1271 s wall.
+counted it (`persist`: one save before its own, 2.7 ms, histogram bucket <=5 ms, nothing during or
+just after). No NVS sector erase came due in either run; the next test makes one. 1219 s wall.
+
+### An NVS page reclaim
+
+`external_oxidrive_car_report_nvs_reclaim_under_the_car`: the same car on the report's build, with
+the NVS partition generated full: thirteen pages of filler strings, the page the firmware writes
+next with 56 of its 126 entries free, and one empty page. 75 s with no car follow the 330 s, so
+the save after the car stops records the saves before it; then the power cut and the next boot's
+publish.
+
+| | |
+| --- | --- |
+| the reclaim | the report's five-minute save at 301.406 s: the flash busy 53.33 ms, a 4 KiB erase of NVS page 0 (0x9000) and 1260 bytes programmed, the page's live entries among them |
+| car commands in flight during it | 0 |
+| car commands by latency, <=10 ms ... >500 ms | [13260, 0, 0, 0, 0, 0, 0], longest 5.63 ms: the cost test's figures |
+| car commands that met a busy flash | 2, both the journal's 1.1 ms writes, at most 0 us over their median |
+| the published report | 2 saves before its own, longest 54,283 us, histogram [0, 1, 0, 0, 0, 1, 0] (the boot's save and the reclaim), nothing during or within 1 ms after |
+
+The save waited for a gap between bursts and the erase fitted in it. A car command that had come
+during it would have waited up to the rest of the 53 ms; this car's commands did not. The only
+other erase in the run is the bootloader's of `otadata` (0x2a000) 36 ms into the boot, before the
+car, in every run. 688 s wall.
 
 ### A crash the first runs found
 
@@ -2437,7 +2461,7 @@ out of `SocBus::flash`) put the give inside `card_lock::take`: it built its guar
 failed take dropped a guard and gave the mutex the reader held. On bc40b82 only a car write that
 waits out its 10 ms, or a shared read its 50 ms, fails a take; the report's build tries the lock
 once without waiting first, so every car write that met the reader did. Fixed on the car-report
-branch with `then(|| Held(m))`; the runs above are on that build.
+branch with `then(|| Held(m))`, and on oxidrive's main since; the runs above are on that build.
 
 ### Limits
 
@@ -2447,8 +2471,8 @@ branch with `then(|| Held(m))`; the runs above are on that build.
   how long, is not measured; the report's TUR gaps and save counts from a car will say.
 - **The power cut keeps RAM**, and the boots after it run with no car.
 - **The return of the card** is timed from a console line, to 100 ms.
-- **No erase** came due in the cost runs; its cost is the part's assumed 45 ms, reasoned rather
-  than measured.
+- **One reclaim was measured**, forced by a pre-filled partition, at the part's assumed 45 ms erase.
+  The datasheet's maximum is several times that; the run does not say how a car takes it.
 
 ## Compared with a board
 

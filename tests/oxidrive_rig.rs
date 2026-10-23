@@ -112,15 +112,22 @@ pub struct RigOpts {
     pub sd_writes: bool,
     /// the P4's flash takes time to program and erase (`SocBus::flash_timing`)
     pub flash_timing: Option<esp_periph::spi_mem::FlashTiming>,
+    /// CSV rows added to nvs.csv's before the NVS partition is generated
+    pub nvs_extra: String,
 }
 impl RigOpts {
-    pub fn new(dir: String) -> Self { RigOpts { dir, card_name: "oxidrive.img".into(), card_bytes: 4 << 30, car: false, image: None, prg_us: None, timed: None, log_writes: false, slow: [(0, 0); 2], sd_writes: false, flash_timing: None } }
+    pub fn new(dir: String) -> Self { RigOpts { dir, card_name: "oxidrive.img".into(), card_bytes: 4 << 30, car: false, image: None, prg_us: None, timed: None, log_writes: false, slow: [(0, 0); 2], sd_writes: false, flash_timing: None, nvs_extra: String::new() } }
 }
 
 pub fn rig_with(o: RigOpts) -> Rig {
     let dir = o.dir.clone();
     let csv_path = std::path::Path::new(&dir).join("nvs.csv");
     let csv = std::fs::read_to_string(&csv_path).unwrap_or_else(|e| panic!("{}: {e}", csv_path.display()));
+    let csv_path = if o.nvs_extra.is_empty() { csv_path } else {
+        let extended = tmp("nvs-extended.csv");
+        std::fs::write(&extended, format!("{}\n{}", csv.trim_end(), o.nvs_extra)).unwrap();
+        extended
+    };
     let (smb_at, mqtt_at) = (endpoint(&csv, "smb", 445), endpoint(&csv, "mqtt", 1883));
     let share = smb_at.path.split('/').next().filter(|s| !s.is_empty()).expect("a share in the smb:// URL").to_string();
     let smb = Samba::start(&share, SHARE_USER, SHARE_PASS).unwrap_or_else(|e| panic!("samba: {e}"));

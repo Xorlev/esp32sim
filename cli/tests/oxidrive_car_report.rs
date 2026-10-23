@@ -55,10 +55,40 @@ const WRITE_MS: [u64; 6] = [10, 25, 50, 100, 250, 500];
 const TUR_MS: [u64; 6] = [500, 1_000, 2_000, 5_000, 10_000, 30_000];
 fn bucket(edges: &[u64; 6], v: u64) -> usize { edges.iter().position(|&e| v <= e).unwrap_or(6) }
 
-fn rig_on(dir: String, card: &str, slow: [(u64, u64); 2]) -> Rig {
+fn rig_on(dir: String, card: &str, slow: [(u64, u64); 2], nvs_extra: &str) -> Rig {
     let prg = env_u64("OXIDRIVE_SD_PRG_US", 1500);
     eprintln!("[report] {dir}: card programming {prg} us, slow {slow:?}, flash {:?}", flash_timing());
-    rig_with(RigOpts { card_name: card.into(), card_bytes: env_u64("OXIDRIVE_CARD_MIB", 4096) << 20, car: true, prg_us: Some(prg), timed: Some(true), slow, sd_writes: true, flash_timing: Some(flash_timing()), ..RigOpts::new(dir) })
+    rig_with(RigOpts { card_name: card.into(), card_bytes: env_u64("OXIDRIVE_CARD_MIB", 4096) << 20, car: true, prg_us: Some(prg), timed: Some(true), slow, sd_writes: true, flash_timing: Some(flash_timing()), nvs_extra: nvs_extra.into(), ..RigOpts::new(dir) })
+}
+
+/// ESP-IDF NVS pages (nvs_page.hpp): a 32-byte header whose first word is the page's state, a
+/// 32-byte bitmap of two bits per entry (11 empty, 10 written, 00 erased), 126 entries of 32
+/// bytes. Each page as (state, written, erased, empty).
+fn nvs_pages(part: &[u8]) -> Vec<(u32, usize, usize, usize)> {
+    part.chunks(4096).map(|page| {
+        let state = u32::from_le_bytes(page[..4].try_into().unwrap());
+        let (mut written, mut erased, mut empty) = (0, 0, 0);
+        for i in 0..126 {
+            match (page[32 + i / 4] >> (2 * (i % 4))) & 3 {
+                3 => empty += 1,
+                2 => written += 1,
+                _ => erased += 1,
+            }
+        }
+        (state, written, erased, empty)
+    }).collect()
+}
+
+/// CSV rows that leave the NVS partition with one empty page and `free` empty entries on the page
+/// the firmware writes next: 13 strings of 125 entries, a page each after the fixture's own page,
+/// and one that leaves `free` of the fifteenth's 126. A string is a header entry and its bytes,
+/// NUL included, in 32-byte entries, and does not cross a page.
+fn nvs_fill(free: usize) -> String {
+    let string = |entries: usize| "x".repeat((entries - 1) * 32 - 1);
+    let mut rows = String::from("fill,namespace,,\n");
+    for i in 0..13 { rows += &format!("f{i},data,string,{}\n", string(125)); }
+    rows += &format!("last,data,string,{}\n", string(126 - free));
+    rows
 }
 
 /// A car on the port with every SCSI command it sends timed from before its first.
@@ -194,7 +224,7 @@ fn truth(times: &[CmdTime], sd: &[esp_periph::sdmmc::SdWrite], until_ns: u64) ->
 #[test]
 #[ignore = "needs the oxidrive car-report images and nvs.csv under OXIDRIVE_CAR_REPORT_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
 fn external_oxidrive_car_report_survives_a_power_cut() {
-    let mut r = rig_on(report_dir(), "car-report.img", [(97, 30 * MS), (401, 150 * MS)]);
+    let mut r = rig_on(report_dir(), "car-report.img", [(97, 30 * MS), (401, 150 * MS)], "");
     let shared = r.shared.clone();
     let (cmd, mqtt) = (format!("oxidrive/{}/cmd", r.id), r.mqtt.client.clone());
     let wall = std::time::Instant::now();
@@ -223,7 +253,12 @@ fn external_oxidrive_car_report_survives_a_power_cut() {
         (car.disk.dev.times.take().unwrap(), returned, last_write)
     };
     let cut_at = r.cs.now_ns;
-    let downs = r.p4_lines().iter().filter(|l| l.contains("oxidrive::net::mqtt: session down")).count();
+    // Sessions that were up and dropped: esp-mqtt also reports each failed connect as a disconnect.
+    let downs = r.p4_lines().iter().fold((false, 0), |(up, n), l| {
+        if l.contains("oxidrive::net::mqtt: session up") { (true, n) }
+        else if l.contains("oxidrive::net::mqtt: session down") { (false, n + usize::from(up)) }
+        else { (up, n) }
+    }).1;
     let sd = r.sd_writes.as_ref().unwrap().borrow().clone();
     let ops_boot1 = r.cs.p4.bus.flash_ops.clone();
     eprintln!("[report] boot 1: {} car commands, {} card writes, {} flash operations; power cut at {}", times.len(), sd.len(), ops_boot1.len(), secs(cut_at));
@@ -310,8 +345,8 @@ fn external_oxidrive_car_report_survives_a_power_cut() {
 /// One boot of a car that records the way a Linux flusher writes back: a second of writes
 /// every five seconds, TEST UNIT READY every 2 s, for `secs`. Returns the car's command times and
 /// the flash operations.
-fn bursty_run(dir: String, card: &str, secs_total: u64) -> (Rig, Vec<CmdTime>, Vec<FlashOp>, u64, u64) {
-    let mut r = rig_on(dir, card, [(0, 0); 2]);
+fn bursty_run(dir: String, card: &str, secs_total: u64, nvs_extra: &str) -> (Rig, Vec<CmdTime>, Vec<FlashOp>, u64, u64) {
+    let mut r = rig_on(dir, card, [(0, 0); 2], nvs_extra);
     let shared = r.shared.clone();
     let (times, from, to, failed) = {
         let mut car = car_timed(&mut r, CarCfg::default());
@@ -364,9 +399,9 @@ fn latency_hist(times: &[CmdTime]) -> [usize; 7] {
 fn external_oxidrive_car_report_costs_the_car_little() {
     let secs_total = env_u64("OXIDRIVE_COST_SECS", 330);
     let wall = std::time::Instant::now();
-    let (base_r, base_times, base_ops, base_from, base_to) = bursty_run(baseline_dir(), "cost-base.img", secs_total);
+    let (base_r, base_times, base_ops, base_from, base_to) = bursty_run(baseline_dir(), "cost-base.img", secs_total, "");
     drop(base_r);
-    let (mut r, times, ops, from, to) = bursty_run(report_dir(), "cost-report.img", secs_total);
+    let (mut r, times, ops, from, to) = bursty_run(report_dir(), "cost-report.img", secs_total, "");
     let in_run = |t: &[CmdTime], a: u64, b: u64| t.iter().filter(|c| c.submit_ns >= a && c.submit_ns < b).copied().collect::<Vec<_>>();
     let (base_times, times) = (in_run(&base_times, base_from, base_to), in_run(&times, from, to));
     let (base_h, h) = (latency_hist(&base_times), latency_hist(&times));
@@ -406,4 +441,67 @@ fn external_oxidrive_car_report_costs_the_car_little() {
     assert!(p("n") as usize + 1 >= saves.len(), "the report counts every save the emulator saw");
     assert!(h[4] + h[5] + h[6] <= base_h[4] + base_h[5] + base_h[6], "more commands of 100 ms or more with the report");
     assert_eq!(num(&one, "writes.slow"), 0, "a slow car write");
+}
+
+/// NVS reclaiming a page under the car. The partition is generated with one empty page and
+/// `OXIDRIVE_NVS_FREE` (56) free entries on the page the firmware writes next, so that a page has
+/// to be erased within the run: about the journal's writes after each shared pass and the
+/// report's saves at boot and five minutes in. The same bursty car as the cost test, on the
+/// report's build, then 75 s with no car so the save after the car stops records the earlier
+/// saves. Printed: every flash busy spell, each erase's address, and the car commands in flight
+/// during one; the report the next boot publishes. Asserted: an NVS sector was erased while the
+/// car was recording, the P4 did not reset, and the published report's longest save is at least
+/// the erase.
+#[test]
+#[ignore = "needs the oxidrive car-report images and nvs.csv under OXIDRIVE_CAR_REPORT_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxidrive_car_report_nvs_reclaim_under_the_car() {
+    let free = env_u64("OXIDRIVE_NVS_FREE", 56) as usize;
+    let secs_total = env_u64("OXIDRIVE_COST_SECS", 330);
+    let wall = std::time::Instant::now();
+    let fill = nvs_fill(free);
+    let (mut r, times, _, from, to) = bursty_run(report_dir(), "reclaim.img", secs_total, &fill);
+    let quiet = r.cs.now_ns + 75 * S;
+    r.run_to(quiet);
+    let ops = r.cs.p4.bus.flash_ops.clone();
+    let table = std::fs::read(format!("{}/partition-table.bin", report_dir())).unwrap();
+    let (off, size) = oxidrive_board::nvs_partition(&table).unwrap();
+    let mut csv = std::fs::read_to_string(format!("{}/nvs.csv", report_dir())).unwrap();
+    csv = format!("{}\n{fill}", csv.trim_end());
+    let first = common::tmp("reclaim-first.csv");
+    std::fs::write(&first, &csv).unwrap();
+    for (i, p) in nvs_pages(&oxidrive_board::nvs_image(&first, size)).iter().enumerate() {
+        if p.0 != u32::MAX { eprintln!("[reclaim] generated page {i:2}: state {:#010x}, {} written, {} erased, {} empty", p.0, p.1, p.2, p.3); }
+    }
+    let empty_at_start = nvs_pages(&oxidrive_board::nvs_image(&first, size)).iter().filter(|p| p.0 == u32::MAX).count();
+    for (i, p) in nvs_pages(&r.cs.p4.bus.flash[off..off + size]).iter().enumerate() {
+        eprintln!("[reclaim] after the run page {i:2}: state {:#010x}, {} written, {} erased, {} empty", p.0, p.1, p.2, p.3);
+    }
+    let spells = bursts(&ops, 0, quiet);
+    for b in &spells { eprintln!("[reclaim] flash busy {} for {:.2} ms: {} bytes programmed, {} erases", secs(b.0), (b.1 - b.0) as f64 / 1e6, b.2, b.3); }
+    let in_nvs = |a: u32| (off..off + size).contains(&(a as usize));
+    for o in ops.iter().filter(|o| o.erase) {
+        eprintln!("[reclaim] erase at {}: {:#x}, {} bytes, {}", secs(o.start_ns), o.addr, o.len, if in_nvs(o.addr) { "NVS" } else { "not NVS" });
+    }
+    let erasing: Vec<_> = ops.iter().filter(|o| o.erase && in_nvs(o.addr) && o.start_ns >= from && o.start_ns < to).collect();
+    let in_run: Vec<CmdTime> = times.iter().filter(|c| c.submit_ns >= from && c.submit_ns < to).copied().collect();
+    let held = held_by_flash(&in_run, &ops);
+    for (c, extra) in &held { eprintln!("[reclaim] car command {:#04x} at {} took {} us, {} us over its median, the flash busy", c.op, secs(c.submit_ns), c.latency_ns() / 1000, extra / 1000); }
+    eprintln!("[reclaim] car commands by latency (<=10, 25, 50, 100, 250, 500, >500 ms): {:?} of {}, max {} us", latency_hist(&in_run), in_run.len(), in_run.iter().map(|t| t.latency_ns()).max().unwrap_or(0) / 1000);
+    let resets = r.cs.summary.p4_resets;
+    let cut = r.cs.now_ns;
+    power_cut(&mut r);
+    let published = run_until_lines(&mut r, "car_report: car 1/", 1, cut + 120 * S);
+    let one = reports(&r).into_iter().find(|(t, _)| t.ends_with("/car_report/1")).map(|(_, j)| j);
+    let longest = one.as_ref().map_or(0, |one| {
+        let p = |k: &str| num(one, &format!("persist.{k}"));
+        eprintln!("[reclaim] the report: {} saves before its own, longest {} us, histogram {:?}, during {}, after {}; writes {:?}, slow {}; saved at uptime {} ms",
+                  p("n"), p("max_us"), hist(one, "persist.hist"), p("during"), p("after"), hist(one, "writes.hist"), num(one, "writes.slow"), num(one, "up_ms"));
+        p("max_us")
+    });
+    eprintln!("[reclaim] {:.0} s wall", wall.elapsed().as_secs_f64());
+    assert_eq!(empty_at_start, 1, "the generated partition leaves one empty page");
+    assert_eq!(resets, 0, "the P4 reset during the run");
+    assert!(!erasing.is_empty(), "no NVS sector was erased while the car recorded; lower OXIDRIVE_NVS_FREE");
+    assert!(published, "the next boot never published the report");
+    assert!(longest as u64 >= flash_timing().sector_ns / 1000, "the report's longest save, {longest} us, is shorter than an erase");
 }
