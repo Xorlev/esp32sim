@@ -489,6 +489,15 @@ there, so the firmware runs between the transfers of a command:
   CAPACITY(10), MODE SENSE(6), PREVENT ALLOW MEDIUM REMOVAL, START STOP UNIT, READ(10) and
   WRITE(10) of any length in commands of 240 blocks at most (usb-storage's `max_sectors`,
   scsiglue.c:670), SYNCHRONIZE CACHE(10); `wait_ready` polls TEST UNIT READY as a host polls its drive.
+  A CHECK CONDITION whose sense is UNIT ATTENTION marks the device changed (`Msc::changed`, Linux's
+  `sdev->changed` for a removable device: v6.12 drivers/scsi/scsi_lib.c:803-811 for a read or
+  write, 2391-2399 for TEST UNIT READY); while it is set the host refuses READ(10) and WRITE(10)
+  itself (`MscError::Changed`, sd's "device offline or changed", sd.c:1340-1343) until the next
+  media poll takes the change (`take_changed`, sd.c:1773-1774). `wait_ready` clears it: its caller
+  reads the drive afresh. `Msc::times`, when set, keeps each command's submission (the CBW about
+  to go out) and completion (its CSW checked, or its failure and recovery done) on the host's
+  clock (`timing::CmdTime`); `timing::Latency` gives their order statistics by nearest rank and a
+  millisecond histogram.
   A command may take 30 s (sd's SD_TIMEOUT, drivers/scsi/sd.h:15, set at sd.c:3970-3972) before it
   is aborted. The LUN is a `fat32::BlockDevice`. Recovery (`Msc::recovery`) is Linux's by default,
   from v6.12 drivers/usb/storage/transport.c:
@@ -517,21 +526,41 @@ there, so the firmware runs between the transfers of a command:
   boxes are `ftyp`, `mdat` and `moov`). It writes in a vfat-like order: the directory entry at once,
   the data a chunk at a time as it comes (one WRITE(10) per contiguous run of clusters), the FAT
   sectors of each chunk's clusters in both FATs, then the entry's size and first cluster and FSInfo.
-  It is not Linux's writeback order, in which the page cache batches the data, the buffer cache
-  holds the FAT and directory sectors, inode writeback updates the entry periodically and FSInfo is
-  written at sync or unmount: a file cut off mid-write here keeps size 0 and no cluster with its
-  clusters orphaned in the FAT, where Linux would usually have left a shorter file. Allocation
-  starts at FSInfo's hint and writes the last cluster allocated back as the hint; the free count
-  written is FSInfo's as it stands on the volume less what this host allocated since.
-  `FileWriter::fat_every` writes the FAT less often.
+  A file cut off mid-write in this order keeps size 0 and no cluster, its clusters orphaned in the
+  FAT. Allocation starts at FSInfo's hint and writes the last cluster allocated back as the hint;
+  the free count written is FSInfo's as it stands on the volume less what this host allocated
+  since and plus what it freed. `FileWriter::fat_every` writes the FAT less often, and
+  `FileWriter::linux` rewrites the entry and FSInfo after every chunk, as Linux's inode writeback
+  finds them dirty. The metadata (boot sector, FSInfo, FAT, directories) goes through
+  `BlockDevice::read_meta` and `write_meta`, which a plain device answers as blocks, so a cache
+  underneath can tell it from data. `delete_path` unlinks as vfat does (the entries marked
+  deleted, then the chain freed in both FATs, then FSInfo), `dirty`/`set_dirty` keep the volume's
+  dirty flag, and `fsck` checks and repairs the volume after dosfstools 4.2 ("The recorder" below).
+  `MemDisk` and `FileDisk` are a disk in memory and a card image file.
+- `pagecache::PageCache` is a buffer and page cache between a filesystem and the drive: metadata
+  kept until the medium is seen to change, or writeback ("The writeback model" below). Plain, it
+  passes everything through. A page the drive refuses to take is lost and counted
+  (`write_errors`), not returned as the error of whatever woke the flusher, as Linux keeps a
+  writeback error for fsync (include/linux/pagemap.h:238-248 `mapping_set_error`).
+- `recorder::Recorder` is a host that writes files at a fixed rate, one or several at a time,
+  polls TEST UNIT READY between writes as Linux's sd driver does, mounts, unmounts, loses power,
+  runs fsck, and keeps what it believes each file holds ("The recorder" below). A medium change
+  (NOT READY then ready, a UNIT ATTENTION at a poll, or one on a read or write since the last
+  poll) revalidates as `sd_revalidate_disk` does (sd.c:3698-3763): READ CAPACITY, MODE SENSE (a
+  failure taken as write enabled, as `sd_read_write_protect_flag` takes it), then the volume read
+  again. It writes FAT32 or exFAT (`recorder::RecorderFs`; `exfat::ExFat`, "exFAT" below). Which
+  files it writes where, and which it deletes, is the caller's.
+- `writelog` sorts the writes a recorder landed by region of the volume and the boot sector's
+  VolumeFlags by the change each write made, and gives each file's landings, for checking a trace
+  of a drive's writes against ("exFAT").
 - `fat32::write_paced` writes a file at a fixed rate: chunk i is due at t0 + i x gap (t0
   taken before the file is created), the host waits only for a chunk that is not due yet, and the
   result (`PacedStats`) has the rate overall and over the second half, the worst lateness against
   the schedule and whether the host kept up (never a whole chunk behind).
 - `script::Runner` runs a command file (`--usb-host`), each command logging what it did. A
-  NOT READY seen by `ready` or `poll` drops the mounted volume, and a failure that leaves no
-  device on the port drops the interface and the volume, so the next `mount` reads the volume
-  again. The CLI runs it under the run's `--max-insns` and reboot policy
+  NOT READY or UNIT ATTENTION seen by `ready` or `poll` drops the mounted volume, and a failure
+  that leaves no device on the port drops the interface and the volume, so the next `mount` reads
+  the volume again. The CLI runs it under the run's `--max-insns` and reboot policy
   (`usb_host::run_machine_until`).
 
 A test drives the same API between runs of the machine:
@@ -558,7 +587,9 @@ link, including control writes of one and two packets (the status stage is DATA1
 endpoint disable waiting for its NAK, the reset line held, and an injected VBUS loss.
 `fat32_directories_and_long_names_round_trip` writes a tree of long names on an image and reads
 it back; `external_fat32_tree_passes_fsck` runs the system's FAT checker on the same tree
-(`sd_image::fsck`: `fsck_msdos -n`, `fsck.fat -n` or `FSCK_FAT`).
+(`sd_image::fsck` from `esp32sim-testkit`: `fsck_msdos -n`, `fsck.fat -n` or `FSCK_FAT`).
+`command_times_are_kept_on_request` pins `Msc::times`; the recorder's tests are in "The recorder"
+and "exFAT" below.
 
 **Throughput.** A host writing in 64 KiB chunks as fast as the drive takes them, then reading the
 file back (FAT32, the card's programming time 0). The second half is the rate from the middle
@@ -601,6 +632,13 @@ sequence:
 The file cut by the VBUS loss is on the card as an entry of size 0 and no cluster, its clusters
 allocated in the FAT (the golden checks both): the vfat-like writer's failure mode, not Linux's.
 
+A third golden, `usbmsc-p4-window` (`examples/usb_msc-p4/window.txt`, the SD bus timed, the card
+programming for 1.5 ms), has the host keep writing after it ejected: the application holds the card
+and writes README.MD, TEST UNIT READY answers MEDIUM NOT PRESENT, and four WRITE(10)s of 16 blocks
+are answered GOOD all the same, read back by READ(10) and on the card afterwards: esp_tinyusb's
+READ(10) and WRITE(10) callbacks serve the card whoever holds it (below). A host learns that the
+medium went only at its next poll ("The recorder").
+
 What the sources say about the hand-overs (TinyUSB 0.21.0~2, esp_tinyusb 2.4.0):
 
 - SET_CONFIGURATION with a non-zero value calls `tud_mount_cb` (usbd.c:1006-1012). A bus reset
@@ -640,6 +678,224 @@ class (`mscd_reset`). A 5 ms timeout cuts a live transfer, which is what opens t
   XferSize, no NYET handshake, USB reset leaving DCFG.DevAddr to the driver.
 - The NAK retry at the next microframe is one controller's policy, not the specification's; a
   controller that retries within the microframe would see a NAKing device sooner.
+
+### The recorder
+
+`recorder::Recorder` is a USB host that writes files on the drive at a fixed rate, written as
+Linux does it, with what it believes it wrote kept beside the medium (`Recorder::files`), so what
+reached the card, or an archive made from it, can be compared with it. `Recorder::new` makes a
+FAT32 recorder and `Recorder::<_, ExFat>::on` an exFAT one ("exFAT" below); `RecorderCfg` sets the
+poll, the chunk and the time between chunks, Linux's entry order and the dirty flag.
+
+- **Polls** follow `sd_check_events` (Linux v6.12 drivers/scsi/sd.c:1710-1776): TEST UNIT READY
+  every `poll_ns` while it records and idles (2 s by default, udev's media poll: systemd v256
+  rules.d/60-block.rules; the kernel's own default interval is 0, block/disk-events.c:38-39); NOT
+  READY or UNIT ATTENTION with ASC 3Ah marks the medium gone (`media_not_present`, 1682-1699), a
+  change either way or any UNIT ATTENTION is a medium change. A medium gone has capacity 0
+  (`set_media_not_present`, 1671-1680), so what the recorder still holds cannot reach it and is
+  dropped; a medium back is read again (`Recorder::revalidate`: READ CAPACITY, MODE SENSE, the
+  volume), after an fsck when the volume is dirty and the recorder runs one. Between polls only a
+  command that fails tells the recorder the medium went: a read or write refused with NOT READY
+  fails (the recorder's file is cut), and one that meets a UNIT ATTENTION also marks the device
+  changed, so the recorder's reads and writes stop until its next poll, which takes it as a medium
+  change (scsi_lib.c:803-811, sd.c:1340-1343). Linux reports such a change as an event and marks the
+  disk for a partition rescan when it is next opened (block/disk-events.c:272-284
+  `disk_check_media_change`, called from `sd_open`, sd.c:1484-1488); a volume mounted on it is left
+  as it is. What a host's own userspace does then is an assumption: here it reads the volume again.
+- **Recording**: `record_set` writes files as sources feed them, chunk i of every file due at t0 + i
+  × gap, file after file, polling between chunks, until a poll finds the medium gone or a write
+  fails; the files are made first and closed last. The recorder keeps every file's contents and how
+  much of them it wrote. Which paths it writes, and which it deletes, is the caller's: folders,
+  events and a schedule are a policy built on `record_set` and `delete`.
+- **Keeping metadata** (`PageCache::keeping_meta`): the boot sector, FSInfo, FAT and directory
+  sectors the recorder read or wrote are answered from memory until the medium is seen to change, as
+  Linux's buffer cache answers them.
+- **Writeback** (`PageCache::writeback`), below.
+- **Rotation** deletes as vfat unlinks (v6.12 fs/fat/namei_vfat.c `vfat_unlink`, inode.c
+  `fat_evict_inode`, fatent.c `fat_free_clusters`); allocation from FSInfo's hint, as Linux's
+  `fat_alloc_clusters` starts after `prev_free` (fatent.c:488), so on a full card the next file
+  takes the clusters the last deletion freed. `recorder::Fill` fills a fresh volume but for what is
+  left, as a card kept full is.
+- **The dirty flag** (FAT32 boot sector byte 65, which Linux keeps as `state`: v6.12
+  include/uapi/linux/msdos_fs.h FAT_STATE_DIRTY) set at a mount and cleared at a clean unmount
+  (inode.c `fat_set_state`, `fat_put_super`); a recorder that loses power (`power_cut`) leaves it
+  set.
+- **fsck** (`Fat32::fsck`) after dosfstools 4.2's `fsck.fat -a`: both FATs read whole; each file's
+  chain walked from its entry, a chain longer than the size cut at the size (src/check.c: 528-537),
+  a size past the chain cut to the chain (629-640), a chain into a free, bad or owned cluster cut
+  before it; clusters no entry reaches freed (`reclaim_free`, src/fat.c:420; with -f dosfstools
+  keeps them as FSCKnnnn.REC files instead, `reclaim_file`, not modelled); FSInfo's free count; the
+  dirty flag cleared (check.c:1065-1080). The FATs are written either as dosfstools writes them
+  (`FsckWrite::Changed`: the sectors with a changed entry, in both copies, and the second copy whole
+  when the two differed, fat.c:160-186) or whole, FAT1 first (`FsckWrite::Bulk`, an assumption about
+  a host's own checker). `Recorder::fsck_at_mount` runs it at a mount of a dirty volume, `fsck_now`
+  after a USB reset.
+- **Off the bus**: `recorder::Offline` gives a block device a clock of its own and a medium always
+  there, for a recorder with no USB (a card image prepared before a boot, the unit tests), and
+  `Recorder::on_tick` lets a test look at the medium as time passes.
+
+`esp-soc/src/usb_host/tests.rs` pins each behaviour against the fake device, which can serve a
+window in which the application holds the card the way esp_tinyusb does (TEST UNIT READY answers
+MEDIUM NOT PRESENT, READ(10) and WRITE(10) still reach the card) and change the card at the window's
+start: writes into a window until the next poll; a recorder keeping metadata writing over a window
+between its polls, and one that does not reading it; writeback's ordering; a power cut that fsck
+repairs; rotation; a ring of long names in one directory; a USB reset followed by a bulk fsck. With
+`gated` it serves a window as an esp_tinyusb that refuses READ CAPACITY, READ(10) and WRITE(10) with
+MEDIUM NOT PRESENT while the application holds the card, and answers the first command after it with
+UNIT ATTENTION 6/28/00: a recorder refused at its first write in the window and revalidating at the
+unit attention after it; a caching recorder reading again what a window between its polls wrote; a
+writeback recorder whose pages the window and the unit attention refuse. Stock esp_tinyusb never
+answers UNIT ATTENTION, so a recorder whose poll misses a window shorter than its interval never
+learns the medium changed, and a recorder keeping metadata then writes over what the window wrote
+(`a_caching_recorder_writes_over_what_a_window_between_its_polls_wrote`).
+
+### The writeback model
+
+`pagecache::WritebackCfg`, in nanoseconds:
+
+| parameter | value | provenance |
+| --- | --- | --- |
+| `min_delay_ns`, `max_delay_ns` | 50 ms, 5 s | lag is one flusher wake: measured on a Linux host, the bound followed `dirty_writeback_centisecs` (4.74 s at its default 500, 14.3-15.0 s at 1500); 500 is v6.12 mm/page-writeback.c:102. A given host's own value has not been read |
+| `data_first_bias` | 0.96 | the share of metadata pages held back past their data, measured on a drive a Linux host wrote (0.005 on macOS) |
+| `metadata_lag_ns` | 30 s | one `dirty_expire_centisecs` (mm/page-writeback.c:109); not measured |
+| `reorder`, `seed` | true, 0x2545F4914F6CDD1D | landing order independent of write order; fixed so a run reproduces |
+| page | 8 sectors | `PAGE_SECTORS`: Linux reclaims 4 KiB pages |
+
+How the recorder uses them:
+
+- The data of one write lands in one batch, 50 ms to 5 s after it was written; each metadata page
+  draws its own delay, and 96 times in 100 the 30 s lag on top. A page written again before it
+  lands keeps its schedule and carries the newest bytes. Reads see the recorder's own pages.
+- The writes come from the recorder's own FAT32 writer in Linux's order (`FileWriter::linux`): the
+  entry's size and first cluster rewritten after every chunk, as inode writeback finds the inode
+  dirty, so the medium sees intermediate sizes, about once a lag.
+- FSInfo is a metadata page written whenever the free count changes, as Linux marks its FSInfo
+  inode dirty on every allocation and free (v6.12 fs/fat/fatent.c `mark_fsinfo_dirty`, written by
+  inode.c `fat_write_inode` through misc.c `fat_clusters_flush`): it lands with the metadata lag,
+  not only at sync or unmount.
+- Under contention pages land later than they fall due: the flusher's writes are USB commands
+  like any other, behind the recorder's own and slowed by the card.
+- A power cut drops what has not landed; the volume stays dirty.
+
+On the fake drive the model puts a cluster's data on the medium before its FAT entry for 97.2% of
+clusters (35,778 against 1,047; `writeback_lands_data_in_batches_and_holds_the_metadata_back`),
+against 98.2% measured on a drive a Linux host wrote (18,460 clusters over 178 FAT sectors), counted
+the drive trace's way (`pagecache::data_first`): a cluster's first data landing against the first
+landing of its FAT1 sector after the data was written. The model's share is close to the drive's by
+construction rather than by fit.
+
+### exFAT
+
+A host can format the card exFAT; the recorder then writes it as exfat-linux 5.8-1arter97 does,
+the out-of-tree backport of Linux v5.8's fs/exfat (`usb_host::exfat`); line numbers below are
+that tag's, which differs from v5.8 in option parsing, in compatibility code, and in the two
+places noted. Every golden and every FAT32 test is unchanged by it.
+
+| | FAT32 (vfat, as modelled) | exFAT (5.8-1arter97) |
+| --- | --- | --- |
+| when a cluster is taken | after FSInfo's hint | at write() time, one cluster as the pages reach it (inode.c:104-262 `exfat_map_cluster`, through `cont_write_begin`) |
+| which cluster | the next free after the hint | the file's last cluster + 1 (inode.c:171-172); for an empty file, the first free from the search pointer (fatent.c:335-345), which goes back to cluster 2 at every mount (super.c:512) |
+| the chain | always in the FAT | none while each cluster is the last + 1 (NoFatChain); the first cluster that is not converts the file: its clusters so far chained in the FAT, the new one linked, the Stream Extension rewritten (fatent.c:366-372, inode.c:203-241) |
+| a free | the chain zeroed in both FATs | allocation-bitmap bits cleared; the FAT is not written (fatent.c:153-198) |
+| the dirty flag | set at a mount, cleared at a clean unmount | VolumeFlags dirty at the start of every change and clean at the end of each create, unlink, mkdir and truncate (namei.c:563/566, 835/844, 874/877; file.c:107/218); allocation (inode.c:169) and inode writeback (inode.c:40) set it dirty; nothing at a mount |
+| how the flag is written | at once | a change to dirty with `sync_dirty_buffer` when the boot sector's buffer is clean (super.c:120-129): an immediate WRITE(10), REQ_SYNC, without FUA; every other change only marks the buffer dirty for writeback. The unmount's clean lands at the device's last sync (super.c:42-55) |
+| entries | an 8.3 entry and long-name entries | a File entry, a Stream Extension and a name entry per 15 characters (dir.c:327-337): a 29-character file name is four entries, 128 bytes, and can straddle a sector. SetChecksum rewritten with every write of the set (dir.c:587-602); ValidDataLength written equal to DataLength (inode.c:74-75, 236-238) |
+| a new file's entry | size 0, no cluster | a FAT-chain flag, no cluster, size 0 (dir.c:434-480); the first allocation rewrites it NoFatChain with the cluster and the size then, 0 for the first page (inode.c:227-238) |
+
+Five details that set the write pattern and are easy to read otherwise:
+
+- **VolumeFlags is not written at a mount**, nor with FUA. It flips at every create, unlink and
+  mkdir, and a write goes out at once only on a change to dirty while the boot sector is not
+  waiting for writeback. `exfat_sync_fs` (sync(2)) lands what is dirty, then only marks the flag
+  clean (super.c:57-71). Later kernels write it at once with REQ_FUA and REQ_PREFLUSH (v6.1
+  fs/exfat/super.c:124); 5.8 and v5.10 do not.
+- **PercentInUse is never written** by 5.8.
+- **A name entry is written up to its terminating 0** (dir.c:418-432); v5.8 zeroes the rest of
+  the entry, 5.8-1arter97 leaves what a reused slot held.
+- **The allocation bitmap is pinned for the mount's life** (balloc.c:56-102): the driver
+  allocates from the bitmap it read at the mount, whatever its buffer cache drops. A recorder that
+  misses a window that allocated clusters takes them again
+  (`an_exfat_recorder_and_a_window_between_its_polls`).
+- **The search pointer starts at cluster 2 at every mount**, so the first file after a mount
+  takes the lowest free cluster; FAT32 continues from FSInfo's hint.
+
+The model:
+
+- `exfat::ExFat` mounts (the boot region and its checksum, the up-case table, the bitmap whole),
+  lists, reads, makes directories, writes and deletes files in the driver's order. Writes go
+  through `PageCache` as for FAT32: data with `write_blocks`, the FAT, the bitmap, directory
+  sectors and the boot sector with `write_meta`, a synchronous VolumeFlags write with
+  `BlockDevice::sync_meta`, which `PageCache` writes at once and takes off its dirty list. A
+  directory grows by a cluster hinted after its last, and is chained when that cluster is taken
+  (namei.c:302-398).
+- A chunk is any whole number of sectors; a cluster is taken when a chunk reaches one the file does
+  not have (`RecorderFs::write_unit`). The FAT32 recorder still rounds a chunk up to a cluster.
+- `RecorderCfg::linux_entries` rewrites the entry set after every chunk, as inode writeback finds
+  the inode dirty, and `dirty_flag` keeps VolumeFlags as above. Inode writeback is modelled at the
+  write, not 30 s later; the write lands with the metadata lag all the same, but VolumeFlags changes
+  to dirty a little earlier than Linux would. Allocation sets it dirty at the same time anyway while
+  a file grows.
+- `ExFat::fsck` follows exfatprogs 1.0.4's `fsck.exfat -y`: VolumeFlags dirty at once; every
+  chain walked; a chain into a free or owned cluster, or longer or shorter than its size, cut;
+  checksums and ValidDataLength fixed; when a file was cut, the FAT read whole with the stale
+  entries of free clusters zeroed, and the bitmap's differing sectors written; VolumeFlags clean.
+  Clusters the bitmap marks that no file holds are freed only when a file was cut, as in 1.0.4.
+  Whether a given host runs it is not known.
+- `esp32sim-testkit`'s `sd_image::exfat` lays out an exFAT card as exfatprogs' mkfs does (1.2.5,
+  mkfs/mkfs.c): partition from LBA 2048, the FAT and the cluster heap on 1 MiB boundaries, one
+  FAT, the bitmap, a 60-byte up-case table (a-z to A-Z, the rest to themselves) and the root in the
+  heap's first clusters. exfatprogs picks 4 KiB clusters up to 256 MiB, 32 KiB to 32 GiB, 128 KiB
+  above (lib/libexfat.c:121-130); a host's own format is not known, so the cluster is a parameter.
+  `sd_image::fsck` sends an exFAT image to macOS's `fsck_exfat -n` on the image attached
+  read-only with `hdiutil` (it checks devices, not files), to exfatprogs' `fsck.exfat -n`, or to
+  `FSCK_EXFAT`. macOS `fsck_exfat` passes the images at 4 KiB and 32 KiB clusters and a
+  writeback recorder's 3 GiB tree (`external_exfat_tree_passes_fsck`), and fails an image with one
+  bitmap bit flipped.
+
+**Ground truth.** `usb_host::writelog` turns what the recorder landed (`PageCache::landings` and
+`meta_landed`, with `record` set) and its record (`Recorder::truth`, an `exfat::Truth`) into what a
+trace analyzer should find:
+
+- per write: its sectors by region (`mbr`, `pre-volume`, `boot-sector`, `boot-region`,
+  `backup-boot`, `fat`, `fat2`, `bitmap`, `upcase`, `root-dir`, `dir`, `data`, `unknown`,
+  `outside`; FAT32 adds `fsinfo` and `reserved`); for a write over the boot sector, VolumeFlags as
+  it left them, whether only VolumeFlags and PercentInUse changed (`state`) or more
+  (`structural`), and whether it went at once or by writeback;
+- per file: chained or not, when and after how many clusters, its clusters and fragments, when it
+  was made, closed and deleted, when its data first landed and when every cluster had, and when
+  its entry set first landed and first held its final cluster, flags and size;
+- for one workload on both filesystems: FAT and bitmap sector writes by the change they carry
+  (`meta_changes`), the FAT sectors that files written together share (`shared_fat_sectors`), the
+  boot sector's writes (`boot_writes`).
+
+**What the tests pin** (`esp-soc/src/usb_host/tests/exfat.rs`): the image's layout and checksum
+(VolumeFlags left out of it); a file written alone stays NoFatChain with no FAT entry; two files
+written in turn are chained after one chunk each and read back through the FAT; a deletion clears
+bits and leaves the FAT, and keeps the deleted set's bytes with the type's top bit cleared;
+checksums and name hashes of sets that straddle sectors; VolumeFlags under writeback; intermediate
+entry sets and the ground truth; a power cut that fsck repairs, and fsck at the mount of a dirty
+volume; a ring of 120 sets, whose folder outgrows a 4 KiB cluster once and is chained; a directory
+that grows; on the fake drive, a recorder writing into a window until its poll, a gated window and
+its unit attention, and windows between polls (a caching or not caching recorder loses the window's
+folder, the bitmap being pinned; a gated window's unit attention saves it); a port reset and a bulk
+fsck; and either volume filled but for what is left (`Fill`).
+
+**Limits.**
+
+- **The writer is a guess.** How many files a host writes at once, in what chunks, and whether it
+  copies or renames files are the caller's choice here, not measured. Any interleaving of two
+  growing files chains both; a recorder that writes each file whole before the next would chain
+  none.
+- **The cluster size** of a host's own format is not known: 32 KiB and 128 KiB bracket exfatprogs'
+  choices for cards above 256 MiB.
+- **Writeback** is the model above, as for FAT32. Inode writeback is modelled at the write. Linux
+  writes a dirty inode back about 30 s after it was dirtied, and `__exfat_write_inode` sets
+  VolumeFlags dirty. While the recorder records, allocation keeps the flag dirty all the same. After
+  its last unlink, though, Linux's deferred inode writebacks set it dirty again about 30 s later
+  (written at once if the unlink's clean has landed by then). So a recorder at rest most likely
+  leaves the medium dirty, where the model leaves it clean.
+- **Not modelled**: rename, rmdir, truncate other than to 0, TexFAT's second FAT, sectors other
+  than 512 bytes, the up-case table's full contents (the image's is the mandatory part).
 
 ## The co-processor
 
@@ -922,6 +1178,40 @@ this configuration ESP-Hosted's receive task waits for the slave's interrupt wit
 the station example waits for its connect event the same way, so a wedged co-processor, a dead
 bus or a single lost DAT1 edge stop the WiFi for good without a log line.
 
+## The temperature sensor
+
+LP_TSENS (0x5012F000, `esp32p4::periph::Tsens`) reads a fixed die temperature, 25 °C unless a
+test sets `Tsens::celsius`, kept through a chip reset. CTRL.OUT (bits 7:0) and READY (8) read the
+sensor while POWER_UP (22) is set, in the range the driver last wrote over regi2c: I2C_SAR_ADC
+(block 0x69) register I2C_SARADC_TSENS_DAC (6), bits 3:0 (IDF v5.5.3
+`soc/esp32p4/include/soc/regi2c_saradc.h`). OUT inverts IDF's conversion,
+0.4386 × OUT − 27.88 × offset − 20.52 (`hal/esp32p4/include/hal/temperature_sensor_ll.h`;
+`esp_hw_support/sar_periph_ctrl_common.c`, `temperature_sensor_get_raw_value`), with the offset
+of the range whose register value matches (`soc/esp32p4/temperature_sensor_periph.c`: 5, 7, 15,
+11, 10 for offsets −2 to 2), rounded to the nearest count: 25 °C is 104 in the −10..80 °C range
+(DAC 15, offset 0), which reads back as 25.09. A DAC value outside the table, or none written,
+reads 0 without READY, as a sensor not powered. CTRL resets to the header's value (WAKEUP_MASK,
+INT_EN, CLK_DIV 6); the other registers are register RAM. The LP_PERI clock gate and reset the
+driver toggles, and the efuse calibration (zero here), are not modelled.
+
+The sensor is a `device_set!` entry. Measured against 8b9d4efa, this branch's base before the
+series under it was reworded, with `cargo build --release --bins`, seven alternating runs, median
+`user` time, identical instruction counts:
+
+| demo | 8b9d4efa | this branch | instructions |
+| --- | --- | --- | --- |
+| S3 `hello` (30 s) | 0.40 s | 0.39 s | 11,990,488 + 6,798,360 |
+| `c3-hello` (30 s) | 3.91 s | 3.93 s | 4,800,000,000 |
+| `c6-hello` (30 s) | 2.85 s | 2.89 s | 4,800,000,000 |
+| `p4-hello` (27 s) | 17.88 s | 17.77 s | 9,720,000,000 + 0 |
+| `p4-hello-smp` (27 s) | 19.21 s | 18.89 s | 9,720,000,000 + 9,713,148,105 |
+
+The P4 pays one more block compare per peripheral access (`pre_access`); the other chips run no
+code this branch touches, so their differences are noise (other work shared the host). The
+rewording of the series (b7f8e9c6) changed names, comments, log strings and documentation of the
+USB host, none of which these demos run; against it this branch retires the same instructions
+again (one run of each demo), and the times were not measured again.
+
 ## Compared with silicon
 
 Nothing on this page was compared with P4 silicon directly; the ECO0 ROM and IDF's own sources
@@ -967,7 +1257,7 @@ are what it is checked against.
 | CPU | two RV32IMAFC cores (`Cpu::new_esp32p4`, `misa` 0x40001125): F with the lazy FPU traps, EXT_ILL, Zicntr, CLIC mode, `mhartid`; core 1 held in reset until HP_SYS_CLKRST releases it. Xesppie and the hardware loops decode as illegal |
 | Memory | 128 KB mask ROM at 0x4FC00000 (reset vector), 768 KB L2MEM at 0x4FF00000 and its uncached alias at 0x8FF00000, 8 KB TCM at 0x30100000, LP ROM (empty) and 32 KB LP RAM; flash (0x40000000) and PSRAM (0x48000000) windows behind two 1024-entry MMUs of 64 KB pages, reached through SPI_MEM_C / SPI_MEM_S item registers, with their uncached aliases |
 | Interrupts | both interrupt matrices (128 sources, rev < 3) and both CLIC register blocks, delivered through the cores' CLIC mode |
-| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back), ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`), an SDIO function on slot 1 with its interrupt on DAT1 (`--coproc`: an ESP32-C6 running ESP-Hosted's slave, "The co-processor"); everything else is register RAM, listed by `--log-periph` |
+| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back, kept through a chip reset), the die temperature sensor at a fixed temperature, ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`), an SDIO function on slot 1 with its interrupt on DAT1 (`--coproc`: an ESP32-C6 running ESP-Hosted's slave, "The co-processor"); everything else is register RAM, listed by `--log-periph` |
 | Time base | 360 MHz, the rev < 3 application clock; one instruction is one cycle |
 
 The revision is a type parameter (`esp32p4::Revision`, `RevLt3`): rev ≥ 3 (its own ROM, the
@@ -985,16 +1275,13 @@ firmware dialog offers the board `esp32p4`.
 - **The co-processor**: native only; the SDIO link without timing by default and the slave
   without busy or read wait, CRC or suspend ("The co-processor"); faults are injected on the link
   rather than arising from a model of the bus. `--usb-host` does not run with `--coproc` yet.
-- **The temperature sensor** (LP_TSENS) is register RAM: IDF's driver reads OUT as 0, which it
-  turns into −48 °C and ESP_FAIL. A model would give a fixed die temperature from OUT and the DAC
-  range the driver writes over regi2c; it is a `device_set!` entry and needs a CPU-time receipt.
 - **USB**: the full-speed OTG core (0x50040000) and USB_WRAP, host mode, the core's slave mode
   (the data FIFOs), descriptor DMA, isochronous and interrupt endpoints, LPM, the
   per-endpoint interrupt source (94), and the time a transaction takes inside the core: it
-  answers at once. The UTMI PHY is register RAM. The host checks the drive between commands: it
-  writes only between polls that passed, mounts the volume again after a NOT READY instead of
-  keeping its FAT and directories cached as Linux's page and buffer caches do, and writes FAT32 in
-  a vfat-like order rather than Linux's writeback order ("The host").
+  answers at once. The UTMI PHY is register RAM. The recorder's reactions where Linux's sources
+  stop are assumptions: after a medium change it reads the volume again (after an fsck when it is
+  dirty), and after a USB reset it may run fsck ("The recorder"). Linux's SCSI retries are not
+  modelled ("The host").
 - **SD timing** is off by default: a command and its data are done in the register write that
   starts them. `--sd-timing` times the bus but not the card's read access time.
 - **No cache model, so DMA coherency bugs pass.** The data cache is not modelled: the CPU and
