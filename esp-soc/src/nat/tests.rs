@@ -194,6 +194,22 @@ fn zero_window_probe_recovers_a_lost_window_update() {
     assert_eq!(&rest[0][54..], b"ello");
 }
 
+/// A connection quiet for `idle_close_us` is dropped without a word to either end: 120 s by
+/// default, longer when a test raises it.
+#[test]
+fn an_idle_connection_is_reaped_after_idle_close_us() {
+    for (idle_us, kept) in [(IDLE_CLOSE_US, false), (3_600_000_000, true)] {
+        let (socket, _host) = socket_pair();
+        let mut c = flow(); c.transport = Transport::Connected(socket);
+        let mut nat = Nat::new(false); nat.tcp.push(c);
+        nat.idle_close_us = idle_us;
+        nat.poll(IDLE_CLOSE_US - 1);
+        assert_eq!(nat.tcp.len(), 1, "quiet for less than 120 s");
+        nat.poll(IDLE_CLOSE_US);
+        assert_eq!(nat.tcp.len() == 1, kept, "idle_close_us {idle_us}");
+    }
+}
+
 #[test]
 fn connector_permits_are_bounded_until_the_worker_drops_them() {
     let counter = AtomicUsize::new(0);
