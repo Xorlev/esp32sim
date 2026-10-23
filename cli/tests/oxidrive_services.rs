@@ -195,3 +195,134 @@ fn external_oxidrive_refuses_an_unsigned_update() {
     assert!(r.p4_has("supervisor: card returned to the car"), "the card did not come back");
     assert_eq!(r.cs.summary.p4_resets, 0, "nothing booted");
 }
+
+/// The coredump partition's offset and size in a partition table: a data partition of subtype 3.
+fn coredump_partition(table: &[u8]) -> Option<(usize, usize)> {
+    table.as_chunks::<32>().0.iter().take_while(|e| e[..2] == [0xaa, 0x50]).find(|e| e[2] == 0x01 && e[3] == 0x03).map(|e| {
+        let word = |i: usize| u32::from_le_bytes(e[i..i + 4].try_into().unwrap()) as usize;
+        (word(4), word(8))
+    })
+}
+
+/// Run until a P4 line after line `from` holds `s`, for at most `secs` more of emulated time.
+fn run_until_line(r: &mut Rig, from: usize, s: &str, secs: u64) -> bool {
+    let end = r.cs.now_ns + secs * 1_000_000_000;
+    loop {
+        if r.lines[from..].iter().any(|l| !l.1 && l.2.contains(s)) { return true; }
+        if r.cs.now_ns >= end { return false; }
+        let t = r.cs.now_ns + 500_000_000;
+        r.run_to(t);
+    }
+}
+
+fn p4_lines_since(r: &Rig, from: usize) -> Vec<String> { r.lines[from..].iter().filter(|l| !l.1).map(|l| l.2.clone()).collect() }
+
+/// Ask `diag crash` with request id `id` and return the reply, run on 3 s for it.
+fn diag_crash(r: &mut Rig, heard: &services::Listener, id: u32) -> Option<String> {
+    r.mqtt.client.publish(&format!("oxidrive/{}/diag/req", r.id), &format!(r#"{{"id":{id},"cmd":"crash"}}"#)).unwrap();
+    let t = r.cs.now_ns + 3_000_000_000;
+    r.run_to(t);
+    heard.messages().into_iter().find(|(t, p)| t.ends_with("/diag/rsp") && p.contains(&format!(r#""id":{id},"#))).map(|m| m.1)
+}
+
+/// A crash and its report, over four boots of a firmware that reports its core dumps. 1: the
+/// coredump partition is blank, nothing is reported and `diag crash` answers `none`. 2:
+/// `smb2_init_context` stubbed to return NULL fails the firmware's link check at boot (a Rust
+/// `assert!`, so `abort()`), and the panic handler writes its core dump to flash. 3: the stub
+/// gone, the next boot finds the dump and reports it: a `crash:` line, a `crash` event on MQTT,
+/// the partition's bytes and a `.txt` under `oxidrive-crash/` on the share, and `diag crash`
+/// answering `reported`. 4: a reset by the test; the same dump is reported already and nothing is
+/// said or uploaded again. `app.elf` beside the images names the stubbed function.
+/// `OXIDRIVE_CRASH_DIR` keeps the uploaded image and `.txt` there, for oxidrive's decoder.
+#[test]
+#[ignore = "needs a crash-reporting oxidrive (images, app.elf and nvs.csv under OXIDRIVE_DIR), ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxidrive_reports_its_crash_to_the_nas() {
+    let mut r = rig("oxidrive-crash.img", 4 << 30, false);
+    let dir = oxidrive_board::dir();
+    let elf = std::fs::read(format!("{dir}/app.elf")).unwrap_or_else(|e| panic!("{dir}/app.elf: {e}"));
+    r.cs.p4.add_symbols(&elf).unwrap();
+    let link_check = r.cs.p4.sym_addr("smb2_init_context").expect("smb2_init_context in app.elf");
+    let table = std::fs::read(format!("{dir}/partition-table.bin")).unwrap();
+    let (core_off, core_size) = coredump_partition(&table).expect("a coredump partition in partition-table.bin");
+    let base = format!("oxidrive/{}", r.id);
+    let heard = r.mqtt.client.listen(&[&format!("{base}/event"), &format!("{base}/diag/rsp")]).unwrap();
+    let wall = std::time::Instant::now();
+
+    // 1: a blank partition
+    assert!(run_until_line(&mut r, 0, "session ready", 40), "no MQTT session");
+    let reply = diag_crash(&mut r, &heard, 1);
+    eprintln!("[oxidrive] boot 1: diag crash -> {reply:?}");
+    assert!(reply.as_deref().is_some_and(|p| p.contains(r#""present":false,"err":"none""#)), "diag crash on a blank partition: {reply:?}");
+    assert!(r.cs.p4.bus.flash[core_off..core_off + 4] == [0xff; 4], "the coredump partition was not blank");
+    let said: Vec<&str> = r.p4_lines().into_iter().filter(|l| l.contains("crash") || l.contains("core dump")).collect();
+    assert!(said.iter().all(|l| !l.contains("oxidrive::crash")), "a blank partition was reported: {said:?}");
+
+    // 2: the panic
+    r.cs.p4.stubs.insert(link_check, 0);
+    let mark = r.lines.len();
+    r.cs.p4.reboot();
+    let end = r.cs.now_ns + 20_000_000_000;
+    // small steps: the next boot reaches the same panic about 250 ms after the reset
+    while r.cs.summary.p4_resets == 0 && r.cs.now_ns < end { let t = r.cs.now_ns + 20_000_000; r.run_to(t); }
+    r.cs.p4.stubs.remove(&link_check);
+    for l in p4_lines_since(&r, mark).iter().filter(|l| l.contains("anic") || l.contains("ore dump") || l.contains("abort") || l.contains("libsmb2")) { eprintln!("[oxidrive] boot 2: {l}"); }
+    assert_eq!(r.cs.summary.p4_resets, 1, "the stubbed link check did not reset the P4");
+    let len = u32::from_le_bytes(r.cs.p4.bus.flash[core_off..core_off + 4].try_into().unwrap()) as usize;
+    assert!(len > 4 && len <= core_size, "no core dump in the partition (length word {len:#x})");
+    let image = r.cs.p4.bus.flash[core_off..core_off + len].to_vec();
+    assert_eq!(crc32(&image[..len - 4]), u32::from_le_bytes(image[len - 4..].try_into().unwrap()), "the dump fails its CRC");
+    eprintln!("[oxidrive] boot 2: a {len}-byte core dump in the {core_size}-byte partition");
+
+    // 3: the report
+    let mark = r.lines.len();
+    let uploaded = run_until_line(&mut r, mark, "crash: the core dump is on the NAS at", 60);
+    // the upload can beat the MQTT session, which announces the crash when it comes up
+    assert!(run_until_line(&mut r, mark, "session ready", 20), "no MQTT session after the crash");
+    let t = r.cs.now_ns + 2_000_000_000;
+    r.run_to(t);
+    let boot3 = p4_lines_since(&r, mark);
+    for l in boot3.iter().filter(|l| l.contains("crash") || l.contains("core dump")) { eprintln!("[oxidrive] boot 3: {l}"); }
+    assert!(uploaded, "the dump never reached the NAS");
+    assert!(boot3.iter().any(|l| l.contains("crash: abort in main pc=0x") && l.contains(" why: abort() was called at PC 0x")), "no crash line naming the abort");
+    let crash_dir = r.smb.path().join("oxidrive-crash");
+    let mut names: Vec<String> = std::fs::read_dir(&crash_dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    eprintln!("[oxidrive] share: oxidrive-crash/ holds {names:?}");
+    assert_eq!(names.len(), 2, "one image and one .txt");
+    let core = names.iter().find(|n| n.ends_with(".core")).expect("an image");
+    assert!(core.contains("-boot") && core.ends_with(&format!("-{:08x}.core", u32::from_le_bytes(image[len - 4..].try_into().unwrap()))), "{core}: not <fw>-boot<N>-<crc>.core");
+    assert!(std::fs::read(crash_dir.join(core)).unwrap() == image, "the uploaded image differs from the partition");
+    let txt = std::fs::read_to_string(crash_dir.join(core.replace(".core", ".txt"))).unwrap();
+    eprintln!("[oxidrive] share: the .txt:\n{txt}");
+    let elf_name = txt.lines().find_map(|l| l.strip_prefix("elf: ")).expect("an elf line");
+    assert!(elf_name.len() >= 8 && sha256_hex(&elf).starts_with(elf_name), "the .txt's elf {elf_name} is not app.elf's hash");
+    assert!(txt.contains("\nfound in: the running image\n") && txt.contains("\nkind: abort\n") && txt.contains("\ntask: main\n"));
+    if let Some(keep) = std::env::var_os("OXIDRIVE_CRASH_DIR") {
+        std::fs::create_dir_all(&keep).unwrap();
+        for n in &names { std::fs::copy(crash_dir.join(n), std::path::Path::new(&keep).join(n)).unwrap(); }
+    }
+    let fw = txt.lines().find_map(|l| l.strip_prefix("fw: ")).unwrap();
+    assert!(core.starts_with(&format!("{fw}-boot")), "{core} is not named for {fw}");
+    let events: Vec<String> = heard.messages().into_iter().filter(|(t, p)| t.ends_with("/event") && p.contains(r#""kind":"crash""#)).map(|m| m.1).collect();
+    for e in &events { eprintln!("[oxidrive] event: {e}"); }
+    assert!(events.iter().any(|e| e.contains("abort in main pc=")), "no crash event with the summary");
+    assert!(events.iter().any(|e| e.contains("uploaded oxidrive-crash/")), "no event for the upload");
+    let reply = diag_crash(&mut r, &heard, 2);
+    eprintln!("[oxidrive] boot 3: diag crash -> {reply:?}");
+    let reply = reply.expect("no diag crash reply");
+    assert!(reply.contains(r#""present":true,"reported":true"#) && reply.contains(r#""task":"main""#) && reply.contains(r#""kind":"abort""#), "{reply}");
+
+    // 4: the same dump, reported already
+    let mark = r.lines.len();
+    r.cs.p4.reboot();
+    assert!(run_until_line(&mut r, mark, "session ready", 40), "no MQTT session after the reset");
+    let t = r.cs.now_ns + 5_000_000_000;
+    r.run_to(t);
+    let boot4 = p4_lines_since(&r, mark);
+    for l in boot4.iter().filter(|l| l.contains("crash") || l.contains("core dump")) { eprintln!("[oxidrive] boot 4: {l}"); }
+    assert!(boot4.iter().any(|l| l.contains("core dump") && l.contains("already on the NAS")), "boot 4 did not find the dump reported");
+    assert!(!boot4.iter().any(|l| l.contains("crash: abort in main") || l.contains("crash: the core dump is on the NAS")), "boot 4 reported the dump again");
+    assert_eq!(std::fs::read_dir(&crash_dir).unwrap().count(), 2, "boot 4 uploaded again");
+    r.report(10);
+    eprintln!("[oxidrive] {:.1} s wall for {:.1} s emulated", wall.elapsed().as_secs_f64(), r.cs.now_ns as f64 / 1e9);
+}
