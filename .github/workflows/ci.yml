@@ -38,6 +38,10 @@ jobs:
           key: micropython-${{ hashFiles('tools/fetch-micropython.sh') }}
       - name: Fetch the MicroPython ESP32_GENERIC image
         run: tools/fetch-micropython.sh
+      # The ESP32-P4 example images the goldens boot and the page does not, fetched from
+      # mikroverk/esp32sim-firmware and checked against the SHA-256 the script pins.
+      - name: Fetch the ESP32-P4 example images
+        run: tools/fetch-p4-firmware.sh
       - name: Build
         run: cargo build --release --workspace
       - name: Clippy

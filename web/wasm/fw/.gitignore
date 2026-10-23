@@ -34,3 +34,7 @@
 !atech-sid.json
 !public/
 !public/*
+# The P4 example images the goldens boot but the page does not run: pinned and fetched by
+# tools/fetch-p4-firmware.sh, so a fetched copy is never committed by accident.
+public/p4-hello-smp-bootloader.bin
+public/p4-hello-smp_world.bin
