@@ -371,3 +371,31 @@ fn external_oxidrive_never_sees_an_update_now_that_expired_while_it_was_away() {
     assert_eq!(count_since(&r, mark, "Update {"), 0, "the expired update was delivered");
     assert_eq!(count_since(&r, mark, "card taken for a firmware update"), 0, "the expired update took the card");
 }
+
+/// A cancel that arrives while the update holds the card: `update V now` sent while connected,
+/// `update_cancel V` once the card is taken. The supervisor stops the update and gives the card
+/// back at once. The download itself never finishes here (the P4 model does not serve SHA's DMA
+/// mode; see `external_oxidrive_refuses_an_unsigned_update`), so the checks the SMB thread makes
+/// itself, between reads and before it sets the boot partition, are not reached.
+#[test]
+#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR (a build with update_cancel), ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxidrive_cancel_gives_back_the_card_an_update_holds() {
+    let end = Rig::env_secs("OXIDRIVE_SECONDS", 120) * 1_000_000_000;
+    let mut r = queue_rig("oxidrive-cancel-writing.img", end);
+    let version = "0.1.0-0000004";
+    stage_update(&r, version);
+    let cmd = format!("oxidrive/{}/cmd", r.id);
+    let mark = r.lines.len();
+    r.mqtt.client.publish_v5(&cmd, &format!("update {version} now"), Some(300)).unwrap();
+    assert!(run_until(&mut r, mark, "card taken for a firmware update", end), "the update never took the card");
+    let (taken, sent_ns) = (r.lines.len(), r.cs.now_ns);
+    r.mqtt.client.publish_v5(&cmd, &format!("update_cancel {version}"), Some(300)).unwrap();
+    let returned = run_until(&mut r, taken, "card returned to the car", end);
+    let back_ns = r.lines[taken..].iter().find(|l| !l.1 && l.2.contains("card returned to the car")).map(|l| l.0);
+    for l in since(&r, mark).iter().filter(|l| l.contains("command") || l.contains("ota") || l.contains("supervisor")) { eprintln!("[oxidrive]   {l}"); }
+    eprintln!("[oxidrive] the card back {:?} ms of emulated time after the cancel was published (to the 100 ms slice)", back_ns.map(|t| (t - sent_ns) / 1_000_000));
+    r.report(10);
+    assert!(count_since(&r, taken, &format!("cancelling the update to {version}")) > 0, "the cancel did not stop the update");
+    assert!(returned, "the card did not come back after the cancel");
+    assert_eq!(r.cs.summary.p4_resets, 0, "nothing was installed");
+}
