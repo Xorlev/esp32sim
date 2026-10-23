@@ -16,7 +16,7 @@
 //! and the auto-stop's ACD come when the bits are through at the slot's card clock and width,
 //! from `advance`, which the chip calls at `next_event_ns`.
 pub mod card;
-pub use card::{FileStore, MemStore, SdCard, SdCardConfig, SdStore};
+pub use card::{FileStore, MemStore, SdCard, SdCardConfig, SdStore, SdWrite};
 use crate::device::{Device, WriteEffect};
 use crate::regram::RegRam;
 use emu_core::Fault;

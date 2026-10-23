@@ -236,6 +236,27 @@ fn programming_takes_its_time_and_refuses_reads_meanwhile() {
     assert!(c.busy(2_100_000) && !c.busy(3_100_000));
 }
 
+/// A card set to stall every `n`th write programs that one for longer, and keeps each write's
+/// service: from its command to the end of its programming.
+#[test]
+fn every_nth_write_stalls_and_each_write_is_kept() {
+    use esp_periph::sdmmc::SdWrite;
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let cfg = SdCardConfig { prg_ns: 1_000, slow: [(2, 30_000), (3, 150_000)], writes: Some(log.clone()), ..Default::default() };
+    let mut c = SdCard::with_config(Box::new(MemStore(image())), cfg).unwrap();
+    to_tran(&mut c);
+    for (i, t) in [0u64, 1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000].into_iter().enumerate() {
+        short(c.command(t, 24, i as u32));
+        c.write_data(t + 100, &[i as u8; 512]).unwrap();
+    }
+    short(c.command(6_000_000, 25, 40));
+    c.write_data(6_000_100, &[7; 1024]).unwrap();
+    short(c.command(6_000_200, 12, 0));
+    let ns: Vec<u64> = log.borrow().iter().map(|w: &SdWrite| w.end_ns - w.start_ns - 100).collect();
+    assert_eq!(&ns[..6], &[1_000, 30_000, 150_000, 30_000, 1_000, 150_000], "the longest stall that applies");
+    assert_eq!(log.borrow()[6], SdWrite { start_ns: 6_000_000, end_ns: 6_000_200 + 1_000, lba: 40, blocks: 2 }, "a multi-block write programs after CMD12");
+}
+
 /// Deselected while programming (CMD7 to another RCA), a card goes to dis, then stby when
 /// programming ends; selected again it returns to prg only while still programming (SD spec
 /// §4.8).
