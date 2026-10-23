@@ -19,6 +19,7 @@ version = "0.3.0"
 dependencies = [
  "emu-core",
  "esp-periph",
+ "esp32sim-testkit",
 ]
 
 [[package]]
@@ -48,6 +49,7 @@ dependencies = [
  "emu-core",
  "esp-periph",
  "esp-soc",
+ "esp32sim-testkit",
  "riscv-rv32",
 ]
 
@@ -83,7 +85,12 @@ dependencies = [
  "esp32c6",
  "esp32p4",
  "esp32s3",
+ "esp32sim-testkit",
 ]
+
+[[package]]
+name = "esp32sim-testkit"
+version = "0.3.0"
 
 [[package]]
 name = "esp32sim-wasm"
@@ -96,6 +103,7 @@ dependencies = [
  "esp32c6",
  "esp32p4",
  "esp32s3",
+ "esp32sim-testkit",
  "esp32sim-wasm-jit",
  "xtensa-lx7",
 ]

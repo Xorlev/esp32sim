@@ -9,5 +9,8 @@ description = "The machine around an Espressif SoC: scheduler, device time, cons
 emu-core = { path = "../emu-core" }
 esp-periph = { path = "../esp-periph" }
 
+[dev-dependencies]
+esp32sim-testkit = { path = "../testkit" }
+
 [features]
 wasm-cpu-profile = []

@@ -19,6 +19,9 @@ esp32p4 = { path = "../esp32p4" }
 esp32sim-wasm-jit = { path = "../wasm-jit" }
 xtensa-lx7 = { path = "../xtensa-lx7" }
 
+[dev-dependencies]
+esp32sim-testkit = { path = "../testkit" }
+
 [features]
 # The inline data-cache probe of the timing model; it is emitted only once the model is switched on.
 default = ["cache-inline"]

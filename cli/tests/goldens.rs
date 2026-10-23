@@ -7,8 +7,7 @@
 //! `tests/README.md`). Regenerate after an intentional change with `UPDATE_GOLDENS=1`.
 #[path = "../../tests/common.rs"]
 mod common;
-#[path = "../../tests/sd_image.rs"]
-mod sd_image;
+use esp32sim_testkit::sd_image;
 use common::*;
 
 const BIN: &str = env!("CARGO_BIN_EXE_esp32sim");
