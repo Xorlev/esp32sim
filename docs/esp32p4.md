@@ -1200,6 +1200,33 @@ so the cancel checks the firmware's SMB thread makes between reads and before it
 partition are not reached. `a_relay_passes_goes_deaf_one_way_and_cuts` checks the relay itself
 against an echo server and runs with the CI suite.
 
+**A cut SMB link** (`external_oxidrive_shared_pass_stops_once_when_its_smb_link_is_cut`). A second
+`Relay` can stand in front of smbd (`RigOpts::smb_relay`); `Relay` is `Clone`, so a test holds
+the relay while the car holds the rig. The car records four saved events of 1.5 MiB, then writes a
+RecentClips clip 64 KiB every 500 ms, so the card is never quiet and no window opens. `force_open`
+at 8.2 s starts a shared pass, which archives two of the events (the newest is held back, and one
+is discarded because the car wrote a sector it shares). At 29.1 s the car records four newer
+events. The firmware's own pass a minute after the forced one uploads those newest first and then
+checks the older ones; the relay is cut at 78.8 s, while it writes its second clip, and restored
+at 83.9 s. A second `force_open` is not used: one that meets the supervisor probing takes the card
+from the recording car. Results on teslausb-p4 c4c538c and on f08bb82 (branch smb-session-lost):
+
+| | c4c538c | f08bb82 |
+| --- | --- | --- |
+| the cut pass ends | 81.4 s | 81.1 s, at the first failed call |
+| `archiver: connection lost` | none | once |
+| failure lines before the next session | 10: a failed close, 5 failed clip opens, 2 failed manifest unlinks, 2 failed manifest saves | none |
+| SMB calls logged before the next session | 16 | 3: the write in flight and two closes of its handle |
+| next session | 130.5 s | 130.2 s |
+| clips on the share, byte for byte | 4 of 8 at 240 s; the 4 others failed and wait out a 15-minute cooldown | 8 of 8 at 167.5 s |
+| host time | 457 s for 240 s | 504 s for 169.5 s |
+
+The loss reaches the firmware 2.3 s after the cut as `smb2_service: POLLERR`, the error the car
+logged. c4c538c then fails every clip left in the pass, and because a failed stat reads as an
+absent file it drops the manifest rows of the clips it had archived and retries the manifest save
+after each clip. f08bb82 stops the pass at that first failure, saves nothing, and its next pass
+resumes the clip in flight.
+
 ## The temperature sensor
 
 LP_TSENS (0x5012F000, `esp32p4::periph::Tsens`) reads a fixed die temperature, 25 °C unless a

@@ -207,7 +207,9 @@ impl Drop for Listener {
 /// A TCP relay on 127.0.0.1 in front of a service, which a test can cut (every connection
 /// closed, new ones closed as they arrive) or make deaf one way (what the client sends is read
 /// and dropped, what the service sends still arrives), standing in for a network that drops the
-/// device or loses its acknowledgements. Its threads end with the process.
+/// device or loses its acknowledgements. Its threads end with the process. A clone controls the
+/// same relay, for a test whose rig is held by a car.
+#[derive(Clone)]
 pub struct Relay { pub port: u16, state: std::sync::Arc<RelayState> }
 
 struct RelayState { mode: std::sync::atomic::AtomicU8, live: std::sync::Mutex<Vec<TcpStream>> }

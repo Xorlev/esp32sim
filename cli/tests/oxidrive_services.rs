@@ -156,6 +156,127 @@ fn external_oxidrive_archives_a_window() {
     assert!(uploaded.iter().all(|s| manifest.contains(s)), "the manifest lacks an upload");
 }
 
+/// A clip the car keeps recording while a pass runs, so the card is never quiet and no window opens.
+const RECENT: &str = "TeslaCam/RecentClips/2026-01-01_01-00-00-front.mp4";
+
+/// A shared pass whose SMB link is cut mid-upload, as a home network that blinks. The car records
+/// `OXIDRIVE_CUT_EVENTS` (4) saved events of `OXIDRIVE_CUT_CLIP_KIB` (1536) KiB and goes on
+/// writing a RecentClips clip, 64 KiB every 500 ms, so no window opens. `force_open` starts a pass
+/// once the MQTT session is up, which archives all but the newest. The car then records as many
+/// newer events, and the firmware's own pass a minute later uploads those, newest first, and then
+/// checks the ones already archived. (A second `force_open` would take the card if it met the
+/// supervisor probing.) The relay in front of the share is cut while that pass writes its second
+/// clip and restored `OXIDRIVE_CUT_SECS` (5) later. The firmware should end the pass at once with
+/// one "archiver: connection lost", at most a couple of failed calls and no manifest save on the
+/// dead session; its next pass reconnects and every clip reaches the share byte for byte. The
+/// counts print either way, so a firmware without the fix shows what it does instead.
+#[test]
+#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxidrive_shared_pass_stops_once_when_its_smb_link_is_cut() {
+    use esp_soc::usb_host::{fat32::{clip_bytes, mp4_bytes, write_clip, Fat32}, msc::Msc, UsbHost};
+    const S: u64 = 1_000_000_000;
+    let per = Rig::env_secs("OXIDRIVE_CUT_EVENTS", 4) as usize;
+    let kib = Rig::env_secs("OXIDRIVE_CUT_CLIP_KIB", 1536) as usize;
+    let cut_for = Rig::env_secs("OXIDRIVE_CUT_SECS", 5) * S;
+    let deadline = Rig::env_secs("OXIDRIVE_SECONDS", 240) * S;
+    let mut r = rig_with(RigOpts { card_name: "oxidrive-smb-cut.img".into(), car: true, smb_relay: true, ..RigOpts::new(oxidrive_board::dir()) });
+    let relay = r.smb_relay.clone().unwrap();
+    let shared = r.shared.clone();
+    let (cmd, mqtt, share) = (format!("oxidrive/{}/cmd", r.id), r.mqtt.client.clone(), r.smb.path());
+    let n = 2 * per;
+    let stamps: Vec<String> = (0..n).map(|i| format!("2026-01-01_00-{i:02}-00")).collect();
+    let clips: Vec<Vec<u8>> = stamps.iter().map(|s| mp4_bytes(s, kib << 10)).collect();
+    let archived = || stamps.iter().zip(&clips).filter(|(s, c)| std::fs::read(share.join(format!("SavedClips/{s}/event.mp4"))).is_ok_and(|b| b == **c)).count();
+    // The console line from which the cut pass's uploads are counted, once batch two is recorded.
+    let (mut first, mut second, mut mark) = (None, None, None);
+    let (mut cut_at, mut restored_at, mut done_at) = (None, None, None);
+    let wall = std::time::Instant::now();
+    {
+        let mut host = UsbHost::new(&mut r);
+        host.enumerate(10 * S).unwrap_or_else(|e| panic!("enumerate: {e}"));
+        let mut msc = Msc::open(host).unwrap_or_else(|e| panic!("no mass-storage interface: {e}"));
+        msc.wait_ready(100_000_000, 10 * S).unwrap_or_else(|e| panic!("never ready: {e}"));
+        msc.read_capacity().unwrap();
+        let mut fs = Fat32::mount(&mut msc).unwrap();
+        let record = |fs: &mut Fat32, msc: &mut Msc, batch: std::ops::Range<usize>| {
+            let end = batch.end;
+            for (stamp, clip) in stamps[batch.clone()].iter().zip(&clips[batch]) {
+                let path = event_clip(stamp);
+                fs.mkdir_all(msc, path.rsplit_once('/').unwrap().0).unwrap();
+                write_clip(fs, msc, &path, clip, 64 << 10, 0, 1).unwrap_or_else(|e| panic!("{path}: {e}"));
+            }
+            eprintln!("[oxidrive] t={:.3} s: the car has recorded {end} saved events", msc.host.now_ns() as f64 / 1e9);
+        };
+        record(&mut fs, &mut msc, 0..per);
+        fs.mkdir_all(&mut msc, RECENT.rsplit_once('/').unwrap().0).unwrap();
+        let mut rec = fs.create_path(&mut msc, RECENT).unwrap();
+        let chunk = clip_bytes(RECENT, 64 << 10);
+        let mut step = 0u64;
+        while msc.host.now_ns() < deadline {
+            if step.is_multiple_of(5) { rec.write(&mut fs, &mut msc, &chunk).unwrap(); }
+            step += 1;
+            msc.host.idle_ns(100_000_000).unwrap();
+            let now = msc.host.now_ns();
+            let (ready, passes, lines, second_written) = {
+                let sh = shared.borrow();
+                let from = mark.unwrap_or(usize::MAX).min(sh.lines.len());
+                let begun: Vec<usize> = (from..sh.lines.len()).filter(|&i| sh.lines[i].1.contains("smb-> begin_part SavedClips/")).collect();
+                (sh.when("session ready").is_some(), sh.all("scan: shared").len(), sh.lines.len(),
+                 begun.len() >= 2 && sh.lines[begun[1]..].iter().any(|l| l.1.contains("smb-> write_part")))
+            };
+            if first.is_none() && ready {
+                mqtt.publish(&cmd, "force_open").unwrap();
+                first = Some(now);
+            }
+            if second.is_none() && first.is_some() && passes >= 1 {
+                record(&mut fs, &mut msc, per..n);
+                mark = Some(lines);
+                second = Some(msc.host.now_ns());
+            }
+            if cut_at.is_none() && second_written {
+                relay.cut();
+                cut_at = Some(now);
+                eprintln!("[oxidrive] t={:.3} s: the SMB relay cut", now as f64 / 1e9);
+            }
+            if let (Some(c), None) = (cut_at, restored_at) {
+                if now >= c + cut_for {
+                    relay.restore();
+                    restored_at = Some(now);
+                    eprintln!("[oxidrive] t={:.3} s: the SMB relay restored", now as f64 / 1e9);
+                }
+            }
+            if restored_at.is_some() && done_at.is_none() && archived() == n { done_at = Some(now); }
+            if done_at.is_some_and(|d| now > d + 2 * S) { break; }
+        }
+        rec.close(&mut fs, &mut msc).unwrap();
+    }
+    eprintln!("[oxidrive] {:.1} s wall for {:.1} s emulated", wall.elapsed().as_secs_f64(), r.cs.now_ns as f64 / 1e9);
+    let cut = cut_at.expect("the second pass never wrote a second clip");
+    let secs = |t: Option<u64>| t.map_or("never".to_string(), |t| format!("{:.3} s", t as f64 / 1e9));
+    // From the 100 ms slice that held the cut to the next session the firmware opened.
+    let after: Vec<(u64, &str)> = r.lines.iter().filter(|l| !l.1 && l.0 >= cut).map(|l| (l.0, l.2.as_str())).collect();
+    let reconnect = after.iter().position(|l| l.1.contains("smb: connected to"));
+    let dead = &after[..reconnect.unwrap_or(after.len())];
+    let count = |what: &str| dead.iter().filter(|l| l.1.contains(what)).count();
+    let lost = after.iter().filter(|l| l.1.contains("archiver: connection lost")).count();
+    let failures: Vec<&str> = dead.iter().map(|l| l.1).filter(|l| !l.contains("connection lost") && (l.contains(" failed") || l.contains("smb: unlink") || l.contains("could not"))).collect();
+    let (calls, opens, saves, save_begins) = (count("smb-> "), count("begin_part failed"), count("index: could not save"), count("smb-> begin_part .oxidrive-index.tsv"));
+    let pass_end = after.iter().find(|l| l.1.contains("scan: shared")).map(|l| l.0);
+    eprintln!("[oxidrive] forced {}, newer events recorded {}, cut {}, the pass ended {}, restored {}, reconnected {}, all archived {}",
+              secs(first), secs(second), secs(Some(cut)), secs(pass_end), secs(restored_at), secs(reconnect.map(|i| after[i].0)), secs(done_at));
+    eprintln!("[oxidrive] on the dead session: {calls} SMB calls logged, {} failure lines ({opens} failed clip opens, {saves} failed manifest saves), {save_begins} manifest saves begun; {lost} \"archiver: connection lost\"", failures.len());
+    eprintln!("[oxidrive] {} of {n} clips on the share byte for byte", archived());
+    for l in r.lines.iter().filter(|l| !l.1 && l.2.contains("shared: ")) { eprintln!("[oxidrive]   {:8.3} {}", l.0 as f64 / 1e9, l.2); }
+    for l in dead.iter().take(40) { eprintln!("[oxidrive]   {:8.3} {}", l.0 as f64 / 1e9, l.1); }
+    r.report(10);
+    assert_eq!(lost, 1, "not one \"archiver: connection lost\"");
+    assert!(failures.len() <= 2, "{} failure lines on the dead session", failures.len());
+    assert_eq!(saves + save_begins, 0, "a manifest save on the dead session");
+    assert!(reconnect.is_some(), "no session after the cut");
+    assert_eq!(archived(), n, "not every clip reached the share");
+    for s in &stamps { assert!(!share.join(format!("SavedClips/{s}/event.mp4.part")).exists(), "{s}: a .part left on the share"); }
+}
+
 /// CRC-32 (IEEE 802.3, reflected), as the update's manifest carries it.
 fn crc32(data: &[u8]) -> u32 {
     !data.iter().fold(!0u32, |c, &b| (0..8).fold(c ^ b as u32, |c, _| if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 }))
