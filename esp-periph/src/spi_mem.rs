@@ -5,6 +5,33 @@ use crate::regram::RegRam;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirtyMem { Flash, Psram }
 
+/// How long the flash array takes to program and erase, for a model whose writes take time: the
+/// status register's WIP bit stays set for this long after the command. `None` on `SpiMem` keeps
+/// every program and erase instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashTiming {
+    /// a page program: the first byte, and each byte after it
+    pub program_first_ns: u64,
+    pub program_byte_ns: u64,
+    /// 4 KiB sector, 32 and 64 KiB block, and chip erase
+    pub sector_ns: u64,
+    pub block32_ns: u64,
+    pub block64_ns: u64,
+    pub chip_ns: u64,
+}
+
+impl FlashTiming {
+    /// GigaDevice GD25Q-class typical figures (tBP1 30 us, tBP2 2.5 us, tSE 45 ms, tBE 150 and
+    /// 250 ms, tCE 80 s): an assumption for a 32 MB part, not a measurement.
+    pub const GD25Q_TYPICAL: FlashTiming = FlashTiming { program_first_ns: 30_000, program_byte_ns: 2_500, sector_ns: 45_000_000, block32_ns: 150_000_000, block64_ns: 250_000_000, chip_ns: 80_000_000_000 };
+
+    pub fn program_ns(&self, bytes: usize) -> u64 { self.program_first_ns + self.program_byte_ns * bytes.saturating_sub(1) as u64 }
+}
+
+/// One timed program or erase: what was busy, and when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashOp { pub start_ns: u64, pub end_ns: u64, pub addr: u32, pub len: u32, pub erase: bool }
+
 // ------------------------------------------------------------------ SPI flash controller (SPI_MEM: SPI1 = command engine, SPI0 = cache path)
 pub struct SpiMem {
     /// Whether a PSRAM device sits on CS1. True for the S3; the C3 has no PSRAM, and without
@@ -32,13 +59,36 @@ pub struct SpiMem {
     pub log: bool,
     /// octal PSRAM (APS6408-like) mode registers MR0..MR8, device on CS1 (SPI1 only)
     pub psram_mr: [u8; 9],
+    /// program and erase times; `None` for instant ones
+    pub timing: Option<FlashTiming>,
+    /// emulated time, set by the bus before each command
+    pub now_ns: u64,
+    busy_until_ns: u64,
+    /// the timed programs and erases since the bus last took them
+    pub ops: Vec<FlashOp>,
 }
 impl SpiMem {
-    pub fn new(is_spi1: bool) -> Self { SpiMem { has_psram: true, addr_msb_aligned: false, regs: RegRam::new(), dirty: Vec::new(), w: [0; 16], pending_cmd: 0, status: 0x200, jedec: [0x20, 0x40, 0x17], is_spi1, log: false , psram_mr: [0x09, 0x0d, 0x8b, 0x00, 0x20, 0, 0, 0, 0x03] } }
+    pub fn new(is_spi1: bool) -> Self { SpiMem { has_psram: true, addr_msb_aligned: false, regs: RegRam::new(), dirty: Vec::new(), w: [0; 16], pending_cmd: 0, status: 0x200, jedec: [0x20, 0x40, 0x17], is_spi1, log: false , psram_mr: [0x09, 0x0d, 0x8b, 0x00, 0x20, 0, 0, 0, 0x03], timing: None, now_ns: 0, busy_until_ns: 0, ops: Vec::new() } }
+    /// WIP while a timed program or erase is in progress.
+    fn wip(&self) -> u32 { u32::from(self.now_ns < self.busy_until_ns) }
+    /// A program or erase begins: busy for as long as `timing` says.
+    fn busy(&mut self, addr: usize, len: usize, erase: bool) {
+        let Some(t) = self.timing else { return };
+        let ns = match (erase, len) {
+            (false, n) => t.program_ns(n),
+            (true, 0x1000) => t.sector_ns,
+            (true, 0x8000) => t.block32_ns,
+            (true, 0x10000) => t.block64_ns,
+            (true, _) => t.chip_ns,
+        };
+        let start = self.now_ns.max(self.busy_until_ns);
+        self.busy_until_ns = start + ns;
+        self.ops.push(FlashOp { start_ns: start, end_ns: self.busy_until_ns, addr: addr as u32, len: len as u32, erase });
+    }
     pub fn read(&self, off: u32) -> u32 {
         match off {
             0x0 => 0,                                   // CMD: always idle after execution
-            0x2c => self.status,                        // RD_STATUS
+            0x2c => self.status | self.wip(),           // RD_STATUS
             0x54 => 0,                                  // FSM idle
             0x58..=0x94 => self.w[((off - 0x58) / 4) as usize],
             0xa4 => 0,                                  // SUS_STATUS
@@ -119,17 +169,17 @@ impl SpiMem {
             match c {
                 0x03 | 0x0b | 0x3b | 0x6b | 0xbb | 0xeb => { let d = rd(addr, miso_bytes); self.set_w_bytes(&d); }
                 0x9f => { let j = self.jedec; self.set_w_bytes(&j); }
-                0x05 => { let s = self.status; self.set_w_bytes(&[s as u8]); }
+                0x05 => { let s = self.status | self.wip(); self.set_w_bytes(&[s as u8]); }
                 0x35 => { let s = self.status; self.set_w_bytes(&[(s >> 8) as u8]); }
                 0x06 => self.status |= 0x02,                       // WREN: set WEL
                 0x04 => self.status &= !0x02,                      // WRDI
                 0x01 | 0x31 | 0x11 => self.status &= !0x02,        // WRSR*: latch consumed (keep QE set)
                 0x15 => self.set_w_bytes(&[0x00]),
-                0x02 | 0x32 | 0x38 => { let d = self.w_bytes(mosi_bytes); for (i, b) in d.iter().enumerate() { let x = addr as usize + i; if x < fsize { flash[x] &= *b; } } self.dirty.push((DirtyMem::Flash, addr as usize, d.len())); self.status &= !0x02; }
-                0x20 => { let a = (addr as usize) & !0xfff; for b in flash.iter_mut().take((a + 0x1000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x1000)); self.status &= !0x02; }
-                0x52 => { let a = (addr as usize) & !0x7fff; for b in flash.iter_mut().take((a + 0x8000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x8000)); self.status &= !0x02; }
-                0xd8 => { let a = (addr as usize) & !0xffff; for b in flash.iter_mut().take((a + 0x10000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x10000)); self.status &= !0x02; }
-                0xc7 | 0x60 => { for b in flash.iter_mut() { *b = 0xff; } self.dirty.push((DirtyMem::Flash, 0, fsize)); self.status &= !0x02; }
+                0x02 | 0x32 | 0x38 => { let d = self.w_bytes(mosi_bytes); for (i, b) in d.iter().enumerate() { let x = addr as usize + i; if x < fsize { flash[x] &= *b; } } self.dirty.push((DirtyMem::Flash, addr as usize, d.len())); self.status &= !0x02; self.busy(addr as usize, d.len(), false); }
+                0x20 => { let a = (addr as usize) & !0xfff; for b in flash.iter_mut().take((a + 0x1000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x1000)); self.status &= !0x02; self.busy(a, 0x1000, true); }
+                0x52 => { let a = (addr as usize) & !0x7fff; for b in flash.iter_mut().take((a + 0x8000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x8000)); self.status &= !0x02; self.busy(a, 0x8000, true); }
+                0xd8 => { let a = (addr as usize) & !0xffff; for b in flash.iter_mut().take((a + 0x10000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x10000)); self.status &= !0x02; self.busy(a, 0x10000, true); }
+                0xc7 | 0x60 => { for b in flash.iter_mut() { *b = 0xff; } self.dirty.push((DirtyMem::Flash, 0, fsize)); self.status &= !0x02; self.busy(0, fsize, true); }
                 _ => { if has_miso { self.set_w_bytes(&vec![0u8; miso_bytes]); } }
             }
             return;
@@ -146,10 +196,11 @@ impl SpiMem {
             for (i, b) in d.iter().enumerate() { let x = (fixed & 0xff_ffff) as usize + i; if x < fsize { flash[x] &= *b; } }
             self.dirty.push((DirtyMem::Flash, (fixed & 0xff_ffff) as usize, d.len()));
             self.status &= !0x02;
+            self.busy((fixed & 0xff_ffff) as usize, d.len(), false);
         }
-        if cmd & (1 << 24) != 0 { let a = (fixed as usize) & !0xfff; for b in flash.iter_mut().take((a + 0x1000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x1000)); self.status &= !0x02; }      // SE
-        if cmd & (1 << 23) != 0 { let a = (fixed as usize) & !0xffff; for b in flash.iter_mut().take((a + 0x10000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x10000)); }    // BE
-        if cmd & (1 << 22) != 0 { for b in flash.iter_mut() { *b = 0xff; } self.dirty.push((DirtyMem::Flash, 0, fsize)); }                          // CE
+        if cmd & (1 << 24) != 0 { let a = (fixed as usize) & !0xfff; for b in flash.iter_mut().take((a + 0x1000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x1000)); self.status &= !0x02; self.busy(a, 0x1000, true); }      // SE
+        if cmd & (1 << 23) != 0 { let a = (fixed as usize) & !0xffff; for b in flash.iter_mut().take((a + 0x10000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x10000)); self.busy(a, 0x10000, true); }    // BE
+        if cmd & (1 << 22) != 0 { for b in flash.iter_mut() { *b = 0xff; } self.dirty.push((DirtyMem::Flash, 0, fsize)); self.busy(0, fsize, true); }                          // CE
     }
 }
 
@@ -162,7 +213,54 @@ impl Device for SpiMem {
 
 #[cfg(test)]
 mod tests {
-    use super::SpiMem;
+    use super::{FlashOp, FlashTiming, SpiMem};
+
+    /// RDSR through a user command, at `now`: the status register's low byte.
+    fn rdsr(spi: &mut SpiMem, flash: &mut [u8], now: u64) -> u32 {
+        spi.now_ns = now;
+        spi.write(0x34, 2);
+        spi.write(0x18, (1 << 31) | (1 << 28));
+        spi.write(0x20, 0x05);
+        spi.write(0x28, 7);
+        spi.write(0, 1 << 18);
+        spi.execute(flash, &mut []);
+        spi.w[0] & 0xff
+    }
+
+    /// A timed program or erase holds WIP for its time, through RDSR and RD_STATUS alike, and is
+    /// logged; untimed, nothing is ever busy.
+    #[test]
+    fn a_timed_program_and_erase_hold_wip_for_their_time() {
+        let mut flash = vec![0xffu8; 0x20000];
+        let mut spi = SpiMem::new(true);
+        let t = FlashTiming { program_first_ns: 30_000, program_byte_ns: 2_500, sector_ns: 45_000_000, block32_ns: 1, block64_ns: 1, chip_ns: 1 };
+        spi.timing = Some(t);
+        spi.now_ns = 1_000;
+        spi.write(0x04, (4 << 24) | 0x100);
+        spi.write(0x58, 0);
+        spi.write(0, 1 << 25);
+        spi.execute(&mut flash, &mut []);
+        assert_eq!(t.program_ns(4), 37_500);
+        assert_eq!(rdsr(&mut spi, &mut flash, 38_499) & 1, 1, "programming");
+        assert_eq!(spi.read(0x2c) & 1, 1, "RD_STATUS agrees");
+        assert_eq!(rdsr(&mut spi, &mut flash, 38_500) & 1, 0, "programmed");
+        spi.now_ns = 100_000;
+        spi.write(0x04, 0x1000);
+        spi.write(0, 1 << 24);
+        spi.execute(&mut flash, &mut []);
+        assert_eq!(rdsr(&mut spi, &mut flash, 45_099_999) & 1, 1, "erasing");
+        assert_eq!(rdsr(&mut spi, &mut flash, 45_100_000) & 1, 0, "erased");
+        assert_eq!(spi.ops, vec![
+            FlashOp { start_ns: 1_000, end_ns: 38_500, addr: 0x100, len: 4, erase: false },
+            FlashOp { start_ns: 100_000, end_ns: 45_100_000, addr: 0x1000, len: 0x1000, erase: true },
+        ]);
+        let mut untimed = SpiMem::new(true);
+        untimed.write(0x04, 0x1000);
+        untimed.write(0, 1 << 24);
+        untimed.execute(&mut flash, &mut []);
+        assert_eq!(rdsr(&mut untimed, &mut flash, 0) & 1, 0);
+        assert!(untimed.ops.is_empty());
+    }
 
     /// IDF v5.5.4 hal/esp32/include/hal/spi_flash_ll.h:365-378: the classic ESP32 shifts SPI_ADDR_REG out MSB first,
     /// so a 24-bit user address is written as `(addr << 8) | 0xff`, and the DIO read 0xBB uses a 28-bit address

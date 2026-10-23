@@ -119,6 +119,10 @@ pub struct SocBus {
     pub cur_core: usize,
     /// each hart's LR reservation (the word); a store by the other hart to it breaks it
     pub reservation: [Option<u32>; 2],
+    /// the flash's program and erase times (`None`: instant), kept across a reset
+    pub flash_timing: Option<esp_periph::spi_mem::FlashTiming>,
+    /// every timed program and erase since power-on
+    pub flash_ops: Vec<esp_periph::spi_mem::FlashOp>,
 }
 
 impl SocBus {
@@ -130,6 +134,7 @@ impl SocBus {
             mmu_flash: Box::new([0; MMU_ENTRIES]), mmu_psram: Box::new([0; MMU_ENTRIES]), mmu_flash_index: 0, mmu_psram_index: 0,
             periph: Peripherals::new(mac, wafer), wafer, board: Box::new(esp_soc::NoBoard),
             cycles: 0, last_fault: None, irq_dirty: true, gpio_events: None, debug: Default::default(), cur_core: 0, reservation: [None; 2],
+            flash_timing: None, flash_ops: Vec::new(),
         }
     }
 
@@ -264,8 +269,11 @@ impl SocBus {
     /// Execute a pending SPI1 command against the flash image.
     fn run_spi(&mut self) {
         self.periph.spi_exec = false;
+        self.periph.spi1.timing = self.flash_timing;
+        self.periph.spi1.now_ns = self.periph.now_ns();
         self.periph.spi1.execute(&mut self.flash, &mut []);
         self.periph.spi1.dirty.clear();
+        if !self.periph.spi1.ops.is_empty() { self.flash_ops.append(&mut self.periph.spi1.ops); }
     }
 
     /// Execute a pending PSRAM controller command against the PSRAM array.
