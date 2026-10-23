@@ -1225,7 +1225,45 @@ The loss reaches the firmware 2.3 s after the cut as `smb2_service: POLLERR`, th
 logged. c4c538c then fails every clip left in the pass, and because a failed stat reads as an
 absent file it drops the manifest rows of the clips it had archived and retries the manifest save
 after each clip. f08bb82 stops the pass at that first failure, saves nothing, and its next pass
-resumes the clip in flight.
+resumes the clip in flight. Rerun on teslausb-p4 7f8d2a6 (branch smb-followups) and f08bb82 with
+the relay fixed below, the cut test gives the same figures on both builds to the 100 ms slice:
+the pass ends at 81.1 s, three SMB calls and no failure line before the next session at 130.2 s,
+every clip on the share at 167.4 s.
+
+**A half-open SMB link** (`external_oxidrive_shared_pass_ends_when_its_smb_link_goes_half_open`).
+The same scenario (`smb_fault`), with `Relay::half_open` in place of `cut`: everything both ways
+is read and dropped and nothing is closed, live connections and new ones alike, as when the NAS
+vanishes without a reset; the relay passes again 100 s later. Nothing on the wire ends the pass,
+so the firmware's own timeouts must. The test asserts the faulted pass ends within 90 s, no
+main-loop iteration is longer, and a pass on the silent link gives up within 30 s.
+
+| | f08bb82 | 7f8d2a6 |
+| --- | --- | --- |
+| the faulted pass ends | 319.1 s, 240.3 s after the fault: the SMB thread waited on the write for ever, the archiver gave up at `STALL_BUDGET` (120 s) and its disconnect waited another 120 s behind the stuck call | 142.2 s, 63.4 s after the fault: libsmb2's 60 s request timeout (`SMB2_STATUS_IO_TIMEOUT`) on the write in flight |
+| longest main-loop iteration after the fault | 250.4 s | 73.5 s, of which 9 s came before the fault |
+| a pass while the link is still silent | none: the next pass came at 560.3 s, after the link was back, and still found no session | 159.2 s, after 16.0 s: the 15 s connect timeout |
+| next session | never in 900 s; every pass blocked the main loop about 241 s | 263.3 s, the pass a backed-off two minutes later |
+| clips on the share, byte for byte | 3 of 8 at 900 s | 8 of 8 at 300.5 s |
+| host time | 1214 s for 900 s | 656 s for 302.5 s |
+
+f08bb82 has no request timeout, so the write in flight waits for replies that never come, and
+the SMB thread with it, after the link is back too: the bytes dropped while it was silent leave
+the server waiting for the rest of a request. Every later call queues behind it. The new build
+times the write out, fails the calls queued behind it at once, and treats a call that outlives
+`STALL_BUDGET` as a stuck thread to stop waiting on.
+
+**The relay and a half-close.** The first half-open runs never reconnected after the link came
+back: the firmware's connect timed out with "Timeout expired and no connection exists", and the
+NAT logged no SYN for it. The NAT holds at most 64 TCP flows (`nat.rs`, `MAX_FLOWS`) and evicts
+only one in TIME_WAIT or closed; a SYN that finds it full of others is dropped without a word.
+The firmware's NAS probe connects and closes about once a second, and each probe left a flow
+whose host side never closed: after the probe's FIN the relay shut its sockets down, which on
+macOS sent nothing to a peer that had already half-closed, and `Relay::cut` kept a clone of every
+socket, so the last handle never closed either. Instrumented, the table held 42 such flows at
+80 s and 63 at 220 s. Once a connection's pumps end, its handles now leave `live`, so the last
+one's close sends the FIN; a client that half-closes reads 0 from the relay at once (it waited
+10 s for nothing before), as `a_relay_passes_goes_deaf_one_way_and_cuts` now checks. The cut
+test never noticed, because `cut` closes everything held.
 
 ## The temperature sensor
 

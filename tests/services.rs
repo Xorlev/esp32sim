@@ -205,18 +205,22 @@ impl Drop for Listener {
 }
 
 /// A TCP relay on 127.0.0.1 in front of a service, which a test can cut (every connection
-/// closed, new ones closed as they arrive) or make deaf one way (what the client sends is read
-/// and dropped, what the service sends still arrives), standing in for a network that drops the
-/// device or loses its acknowledgements. Its threads end with the process. A clone controls the
-/// same relay, for a test whose rig is held by a car.
+/// closed, new ones closed as they arrive), make deaf one way (what the client sends is read
+/// and dropped, what the service sends still arrives) or make silent (both ways dropped, nothing
+/// closed: a half-open link, as when a peer vanishes without a reset), standing in for a network
+/// that drops the device or loses its acknowledgements. Its threads end with the process. A clone
+/// controls the same relay, for a test whose rig is held by a car.
 #[derive(Clone)]
 pub struct Relay { pub port: u16, state: std::sync::Arc<RelayState> }
 
-struct RelayState { mode: std::sync::atomic::AtomicU8, live: std::sync::Mutex<Vec<TcpStream>> }
+/// `live` holds each connection's two sockets, by id, for `cut`; a connection's entry goes when
+/// its pumps end, so its last handle closes and the client sees the close.
+struct RelayState { mode: std::sync::atomic::AtomicU8, live: std::sync::Mutex<Vec<(u64, TcpStream, TcpStream)>> }
 
 const RELAY_PASS: u8 = 0;
 const RELAY_DEAF: u8 = 1;
 const RELAY_CUT: u8 = 2;
+const RELAY_SILENT: u8 = 3;
 
 impl Relay {
     pub fn start(target: SocketAddr) -> Result<Relay, String> {
@@ -226,14 +230,14 @@ impl Relay {
         let state = Arc::new(RelayState { mode: RELAY_PASS.into(), live: Default::default() });
         let st = state.clone();
         std::thread::spawn(move || {
-            for client in listener.incoming().flatten() {
+            for (id, client) in listener.incoming().flatten().enumerate() {
                 if st.mode.load(Ordering::SeqCst) == RELAY_CUT { continue; }
                 let Ok(server) = TcpStream::connect(target) else { continue };
                 let (Ok(c2), Ok(s2), Ok(c3), Ok(s3)) = (client.try_clone(), server.try_clone(), client.try_clone(), server.try_clone()) else { continue };
-                st.live.lock().unwrap().extend([c3, s3]);
-                let up = st.clone();
-                std::thread::spawn(move || pump(client, server, Some(up.as_ref())));
-                std::thread::spawn(move || pump(s2, c2, None));
+                st.live.lock().unwrap().push((id as u64, c3, s3));
+                let (up, down) = (st.clone(), st.clone());
+                std::thread::spawn(move || pump(client, server, &up, true, id as u64));
+                std::thread::spawn(move || pump(s2, c2, &down, false, id as u64));
             }
         });
         Ok(Relay { port, state })
@@ -244,27 +248,41 @@ impl Relay {
     /// Close every connection both ways, and every new one as it arrives, until `restore`.
     pub fn cut(&self) {
         self.state.mode.store(RELAY_CUT, std::sync::atomic::Ordering::SeqCst);
-        for s in self.state.live.lock().unwrap().drain(..) { let _ = s.shutdown(std::net::Shutdown::Both); }
+        for (_, c, s) in self.state.live.lock().unwrap().drain(..) {
+            let _ = c.shutdown(std::net::Shutdown::Both);
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
     }
 
     /// Drop what clients send from now on; the service's side still flows to them.
     pub fn deafen(&self) { self.state.mode.store(RELAY_DEAF, std::sync::atomic::Ordering::SeqCst); }
 
+    /// Drop everything both ways from now on and close nothing, live connections and new ones
+    /// alike: a half-open link, which no reset ends.
+    pub fn half_open(&self) { self.state.mode.store(RELAY_SILENT, std::sync::atomic::Ordering::SeqCst); }
+
     pub fn restore(&self) { self.state.mode.store(RELAY_PASS, std::sync::atomic::Ordering::SeqCst); }
 }
 
-/// Copy `from` to `to` until either end closes, then close both. `deaf_if` is the relay whose
-/// deaf mode drops this direction's bytes.
-fn pump(mut from: TcpStream, mut to: TcpStream, deaf_if: Option<&RelayState>) {
+/// Copy `from` to `to` until either end closes, then close both. `upstream` is the client's
+/// direction, which deaf mode drops; silent mode drops both. A shutdown of a socket whose peer
+/// has already half-closed it need not send a FIN, so the connection's handles in `live` are
+/// dropped too, and the last handle's close sends it.
+fn pump(mut from: TcpStream, mut to: TcpStream, state: &RelayState, upstream: bool, id: u64) {
     use std::io::{Read, Write};
     let mut buf = [0u8; 4096];
     loop {
         let n = match from.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => n };
-        if deaf_if.is_some_and(|s| s.mode.load(std::sync::atomic::Ordering::SeqCst) == RELAY_DEAF) { continue; }
+        match state.mode.load(std::sync::atomic::Ordering::SeqCst) {
+            RELAY_SILENT => continue,
+            RELAY_DEAF if upstream => continue,
+            _ => {}
+        }
         if to.write_all(&buf[..n]).is_err() { break; }
     }
     let _ = from.shutdown(std::net::Shutdown::Both);
     let _ = to.shutdown(std::net::Shutdown::Both);
+    state.live.lock().unwrap().retain(|e| e.0 != id);
 }
 
 fn samba_tool(var: &str, name: &str) -> Result<PathBuf, String> {
@@ -388,7 +406,8 @@ fn the_service_configurations_keep_to_loopback_and_their_directory() {
 }
 
 /// The relay against an echo server: it passes both ways, drops only what the client sends
-/// while deaf, closes the live connection and refuses new ones while cut, and passes again after.
+/// while deaf, drops everything and closes nothing while half-open, closes the live connection
+/// and refuses new ones while cut, and passes again after.
 #[test]
 fn a_relay_passes_goes_deaf_one_way_and_cuts() {
     use std::io::{Read, Write};
@@ -412,6 +431,19 @@ fn a_relay_passes_goes_deaf_one_way_and_cuts() {
     assert_eq!(echoed(&mut s, b"two"), None, "the server never heard it, so nothing came back");
     relay.restore();
     assert_eq!(echoed(&mut s, b"three").as_deref(), Some(&b"three"[..]));
+    relay.half_open();
+    assert_eq!(echoed(&mut s, b"silent"), None, "nothing came back");
+    let mut quiet = open();
+    assert_eq!(echoed(&mut quiet, b"new"), None, "a new connection is silent too");
+    let mut b = [0u8; 1];
+    assert!(matches!(s.read(&mut b), Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)), "and nothing was closed");
+    relay.restore();
+    assert_eq!(echoed(&mut s, b"back").as_deref(), Some(&b"back"[..]));
+    // A client that half-closes sees the relay close too, as it would see the service close.
+    let mut half = open();
+    assert_eq!(echoed(&mut half, b"bye").as_deref(), Some(&b"bye"[..]));
+    half.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(matches!(half.read(&mut b), Ok(0)), "the relay closed after the client's FIN");
     relay.cut();
     let mut b = [0u8; 8];
     assert!(matches!(s.read(&mut b), Ok(0) | Err(_)), "the live connection is closed");
