@@ -2391,14 +2391,17 @@ last save (its `up_ms`):
 | service time, buckets <=10, 25, 50, 100, 250, 500 ms, more | [1196, 0, 12, 0, 3, 0, 0] | [1196, 0, 12, 0, 3, 0, 0] |
 | longest write | 151.712 ms | 151.684 ms (card side) |
 | from the card's return to the car's first command / first write | 572 / 3624 ms | 549 / 3601 ms |
+| MQTT sessions lost (the console's `session down`) | 4 | 4 |
 
 The return is timed from the console line, whose slice ends up to 100 ms after the event, so the
 emulator's gaps are short by the line's lag; the test allows 150 ms. The device's last save came
 60.3 s after the car's last write, as its schedule says. Three saves in the boot: at boot, 60 s
 after the car's first four events while a shared pass uploaded them, and 60 s after its last
 write; the longest held the flash for 3.7 ms, and no car command was in flight during any flash
-operation. The figures were the same on three runs, apart from two more TEST UNIT READY polls in
-one (both sides). 656 s wall for 207 s emulated.
+operation. The figures were the same on every run, apart from two more TEST UNIT READY polls in
+one (both sides) and the gaps after the window, which move with where the car's poll falls. An
+earlier build counted MQTT reconnects from the supervisor's tick, which a window or a pass holds,
+and reported 1 for these 4; it counts esp-mqtt's disconnects now. 656 s wall for 207 s emulated.
 
 ### What saving costs the car
 
@@ -2413,7 +2416,7 @@ nothing, and the car never goes quiet for a window.
 | car commands, buckets <=10, 25, 50, 100, 250, 500 ms, more | [13260, 0, 0, 0, 0, 0, 0] | [13260, 0, 0, 0, 0, 0, 0] |
 | longest car command | 5.63 ms | 5.63 ms |
 | flash busy spells in the 330 s | 5 (1.0-1.1 ms) | 6 (5 of 1.1-1.2 ms, 1 of 2.69 ms) |
-| car commands in flight during one | 2 (at most 620 us longer than their median) | 3 (the same) |
+| car commands in flight during one | 2-3 a run, at most 620 us over their median | the same |
 | ... during one of the report's saves | | 0 |
 
 The five spells common to both are oxidrive's journal, written after every shared pass whether or

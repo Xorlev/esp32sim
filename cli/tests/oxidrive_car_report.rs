@@ -223,6 +223,7 @@ fn external_oxidrive_car_report_survives_a_power_cut() {
         (car.disk.dev.times.take().unwrap(), returned, last_write)
     };
     let cut_at = r.cs.now_ns;
+    let downs = r.p4_lines().iter().filter(|l| l.contains("oxidrive::net::mqtt: session down")).count();
     let sd = r.sd_writes.as_ref().unwrap().borrow().clone();
     let ops_boot1 = r.cs.p4.bus.flash_ops.clone();
     eprintln!("[report] boot 1: {} car commands, {} card writes, {} flash operations; power cut at {}", times.len(), sd.len(), ops_boot1.len(), secs(cut_at));
@@ -252,6 +253,7 @@ fn external_oxidrive_car_report_survives_a_power_cut() {
         pair("car sectors", num(&one, "writes.sectors"), truth.sectors as i64),
         pair("windows", num(&one, "windows.n"), 1),
         pair("windows not written after", num(&one, "windows.no_write"), 0),
+        pair("MQTT sessions lost and back", num(&one, "net.mqtt_reconnects"), downs as i64),
     ];
     let dev_tur = hist(&one, "scsi.tur_gaps");
     let dev_write = hist(&one, "writes.hist");
