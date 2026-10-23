@@ -23,6 +23,8 @@ pub struct VirtualNet {
     pub dhcp_acks: u64,
     pub dns_answers: u64,
     pub ntp_answers: u64,
+    /// NTP requests before this emulated time go unanswered: a time server slow to come up.
+    pub ntp_from_us: u64,
     pub tcp_rejects: u64,
     pub arp_replies: u64,
     pub pings: u64,
@@ -44,7 +46,7 @@ impl VirtualNet {
     pub fn new(log: bool) -> Self {
         VirtualNet { gw_mac: GATEWAY_MAC, gw_ip: [10, 0, 2, 2], dns_ip: [10, 0, 2, 3],
                      sta_ip: [10, 0, 2, 15], mask: [255, 255, 255, 0],
-                     log, nat: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, now_us: 0, epoch_us: None }
+                     log, nat: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, ntp_from_us: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, now_us: 0, epoch_us: None }
     }
 
     /// Handle one Ethernet frame from the station; returns frames to send back to it.
@@ -224,6 +226,7 @@ impl VirtualNet {
     #[allow(clippy::identity_op, reason = "the zero leap-indicator field remains visible in the packed header")]
     fn ntp(&mut self, q: &[u8], src: &[u8; 6], sip: &[u8; 4], dip: &[u8; 4], sport: u16) -> Vec<Vec<u8>> {
         if q.len() < 48 { return Vec::new(); }
+        if self.now_us < self.ntp_from_us { return Vec::new(); }
         let now_us = self.now_us;
         let epoch = *self.epoch_us.get_or_insert_with(|| (crate::host::unix_time_ms() * 1000).saturating_sub(now_us));
         let now = std::time::Duration::from_micros(epoch + now_us);
@@ -283,6 +286,15 @@ mod tests {
         let first = transmit(&mut host, 1_000_000);
         assert!(host.epoch_us.is_some(), "fixed at the first answer");
         assert_eq!(transmit(&mut host, 11_000_000), first + 10, "then emulated time, not the host's");
+    }
+
+    /// A server slow to come up leaves requests unanswered until its time, then answers.
+    #[test]
+    fn sntp_answers_only_from_its_time_on() {
+        let mut net = VirtualNet::new(false);
+        net.ntp_from_us = 20_000_000;
+        let mut ask = |now_us: u64| { net.now_us = now_us; net.ntp(&[0x23; 48], &[2; 6], &net.sta_ip.clone(), &net.gw_ip.clone(), 123).len() };
+        assert_eq!([ask(7_000_000), ask(19_999_999), ask(20_000_000)], [0, 0, 1]);
     }
 
     #[test]

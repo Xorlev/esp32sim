@@ -81,6 +81,9 @@ struct Tcp {
     to_host: VecDeque<u8>,
     unacked: VecDeque<Sent>,
     last_activity_us: u64,
+    opened_us: u64,
+    /// Bytes this flow may still move each way under its `Shape`, and when that was last topped up.
+    up_budget: u64, down_budget: u64, budget_us: u64,
 }
 
 impl Tcp {
@@ -151,11 +154,13 @@ impl Tcp {
     }
 }
 
-/// Preserve every unwritten byte across short writes and WouldBlock. Returns bytes actually sent.
-fn flush_pending(writer: &mut impl Write, pending: &mut VecDeque<u8>) -> io::Result<usize> {
+/// Preserve every unwritten byte across short writes and WouldBlock, sending at most `cap`.
+/// Returns bytes actually sent.
+fn flush_pending(writer: &mut impl Write, pending: &mut VecDeque<u8>, cap: usize) -> io::Result<usize> {
     let mut written = 0;
-    while !pending.is_empty() {
-        match writer.write(pending.as_slices().0) {
+    while !pending.is_empty() && written < cap {
+        let front = pending.as_slices().0;
+        match writer.write(&front[..front.len().min(cap - written)]) {
             Ok(0) => return Err(ErrorKind::WriteZero.into()),
             Ok(n) => { pending.drain(..n); written += n; }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -171,6 +176,17 @@ struct Udp {
     reply_src: [u8; 4], // DNS's guest-visible address, before host resolver redirection
     sock: UdpSocket,
     last_activity_us: u64,
+}
+
+/// Emulated-time shaping of the TCP flows to one guest-side port: a byte rate each way and a delay
+/// before the handshake completes. In emulated time, unlike a host-side relay, so it holds at any
+/// emulation speed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shape { pub port: u16, pub bytes_per_s: Option<u64>, pub connect_delay_us: u64 }
+
+impl Shape {
+    /// The most a flow may bank while idle: a tenth of a second at the rate, at least one segment.
+    fn burst(rate: u64) -> u64 { (rate / 10).max(MSS as u64) }
 }
 
 /// TCP to `guest` (an address and port the guest connects to) goes to `host` instead.
@@ -203,13 +219,15 @@ pub struct Nat {
     /// A flow idle this long is dropped without telling either end (120 s by default). A server
     /// on the guest's own LAN keeps an idle connection; a test standing in for one can raise it.
     pub idle_close_us: u64,
+    pub shapes: Vec<Shape>,
 }
 
 impl Nat {
     pub fn new(log: bool) -> Self {
         Self { tcp: Vec::new(), udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), log, outbound: true, forwards: Vec::new(),
-            tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0, idle_close_us: IDLE_CLOSE_US }
+            tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0, idle_close_us: IDLE_CLOSE_US, shapes: Vec::new() }
     }
+
 
     /// A NAT that relays the forwards and nothing else (`--net none,fwd=...`).
     pub fn forward_only(log: bool, forwards: Vec<Forward>) -> Self {
@@ -290,7 +308,8 @@ impl Nat {
             self.tcp.push(Tcp { guest_mac: *gmac, guest_ip: *gip, guest_port: sport, dst_ip: *dip, dst_port: dport,
                 transport: Transport::Connecting(pending), guest_write: GuestWrite::Open, host_closed: false,
                 our_seq: self.isn, guest_seq: seq.wrapping_add(1), guest_window: window,
-                to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us });
+                to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us, opened_us: now_us,
+                up_budget: 0, down_budget: 0, budget_us: now_us });
             if self.log { eprintln!("[nat] TCP {}:{} -> {}:{} connecting{}", ip(gip), sport, ip(dip), dport,
                                     if target == address(dip, dport) { String::new() } else { format!(" (forwarded to {target})") }); }
             return Vec::new();
@@ -318,8 +337,18 @@ impl Nat {
     /// Pump a bounded amount of host traffic, then retransmit and expire flows.
     pub fn poll(&mut self, now_us: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
+        let shapes = self.shapes.clone();
         for c in &mut self.tcp {
             if c.closed() { continue; }
+            let shape = shapes.iter().find(|s| s.port == c.dst_port).copied().unwrap_or_default();
+            if let Some(rate) = shape.bytes_per_s {
+                let add = rate.saturating_mul(now_us.saturating_sub(c.budget_us)) / 1_000_000;
+                if add > 0 {
+                    c.up_budget = (c.up_budget + add).min(Shape::burst(rate));
+                    c.down_budget = (c.down_budget + add).min(Shape::burst(rate));
+                    c.budget_us = now_us;
+                }
+            }
             if c.host_closed && c.guest_write == GuestWrite::Closed && c.unacked.is_empty()
                 && matches!(c.transport, Transport::Connected(_)) {
                 // Release the host socket but keep enough state to re-ACK a lost final ACK.
@@ -327,11 +356,12 @@ impl Nat {
                 c.last_activity_us = now_us;
             }
             if let Transport::Connecting(rx) = &c.transport {
-                let result = match rx.try_recv() {
+                let due = now_us.saturating_sub(c.opened_us) >= shape.connect_delay_us;
+                let result = if !due { None } else { match rx.try_recv() {
                     Ok(result) => Some(result),
                     Err(TryRecvError::Disconnected) => Some(Err(ErrorKind::ConnectionAborted.into())),
                     Err(TryRecvError::Empty) => None,
-                };
+                } };
                 match result {
                     Some(Ok(sock)) => {
                         c.transport = Transport::Connected(sock);
@@ -351,8 +381,12 @@ impl Nat {
             if matches!(c.transport, Transport::Connected(_)) && !c.handshake_pending() {
                 let Transport::Connected(sock) = &mut c.transport else { unreachable!() };
                 let queued = c.to_host.len();
-                match flush_pending(sock, &mut c.to_host) {
-                    Ok(n) => self.bytes_to_host += n as u64,
+                let cap = shape.bytes_per_s.map_or(usize::MAX, |_| c.up_budget as usize);
+                match flush_pending(sock, &mut c.to_host, cap) {
+                    Ok(n) => {
+                        self.bytes_to_host += n as u64;
+                        if shape.bytes_per_s.is_some() { c.up_budget -= n as u64; }
+                    }
                     Err(_) => { out.push(c.segment(RST | ACK, &[], c.our_seq)); c.transport = Transport::Closed; continue; }
                 }
                 if c.guest_write == GuestWrite::Draining && c.to_host.is_empty() {
@@ -365,6 +399,8 @@ impl Nat {
                 let send_window = usize::from(c.guest_window.clamp(1, WINDOW));
                 while !c.host_closed && c.in_flight() < send_window {
                     let room = send_window - c.in_flight();
+                    let room = match shape.bytes_per_s { Some(_) => room.min(c.down_budget as usize), None => room };
+                    if room == 0 { break; }
                     let mut buf = [0; MSS];
                     let Transport::Connected(sock) = &mut c.transport else { break };
                     match sock.read(&mut buf[..room.min(MSS)]) {
@@ -372,6 +408,7 @@ impl Nat {
                         Ok(n) => {
                             if self.log { eprintln!("[nat] TCP {}:{} -> guest {} bytes (seq {})", ip(&c.dst_ip), c.dst_port, n, c.our_seq); }
                             self.bytes_to_guest += n as u64;
+                            if shape.bytes_per_s.is_some() { c.down_budget -= n as u64; }
                             c.last_activity_us = now_us;
                             out.push(c.send(PSH | ACK, buf[..n].to_vec(), now_us));
                         }

@@ -6,7 +6,8 @@ fn flow() -> Tcp {
         dst_ip: [127, 0, 0, 1], dst_port: 80, transport: Transport::Closed,
         guest_write: GuestWrite::Open, host_closed: false,
         our_seq: 100, guest_seq: 200, guest_window: WINDOW,
-        to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: 0 }
+        to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: 0, opened_us: 0,
+        up_budget: 0, down_budget: 0, budget_us: 0 }
 }
 
 fn segment(seq: u32, ack: u32, flags: u8, data: &[u8]) -> Vec<u8> {
@@ -114,11 +115,11 @@ impl Write for ShortWriter {
 fn short_write_and_would_block_preserve_exact_remaining_bytes() {
     let mut writer = ShortWriter { bytes: Vec::new(), allowance: 3 };
     let mut queue = VecDeque::from(b"abcdefgh".to_vec());
-    assert_eq!(flush_pending(&mut writer, &mut queue).unwrap(), 3);
+    assert_eq!(flush_pending(&mut writer, &mut queue, usize::MAX).unwrap(), 3);
     assert_eq!(queue.make_contiguous(), b"defgh");
-    assert_eq!(flush_pending(&mut writer, &mut queue).unwrap(), 0);
+    assert_eq!(flush_pending(&mut writer, &mut queue, usize::MAX).unwrap(), 0);
     writer.allowance = 100;
-    assert_eq!(flush_pending(&mut writer, &mut queue).unwrap(), 5);
+    assert_eq!(flush_pending(&mut writer, &mut queue, usize::MAX).unwrap(), 5);
     assert!(queue.is_empty());
     assert_eq!(writer.bytes, b"abcdefgh");
 }
@@ -371,4 +372,51 @@ fn a_forward_only_network_refuses_the_rest_and_answers_dns_and_ntp_itself() {
     assert_eq!((net.tcp_rejects, net.dns_answers, net.ntp_answers), (1, 1, 1));
     let nat = net.nat.as_ref().unwrap();
     assert_eq!((nat.tcp_opened, nat.udp_flows), (0, 0), "nothing went to the host");
+}
+
+/// A shaped flow moves bytes at its rate in emulated time, each way, whatever the host offers.
+#[test]
+fn a_shaped_flow_moves_at_its_rate_in_emulated_time() {
+    let (ours, mut host) = socket_pair();
+    let mut nat = Nat::new(false);
+    nat.shapes.push(Shape { port: 80, bytes_per_s: Some(10_000), connect_delay_us: 0 });
+    let mut c = flow();
+    c.transport = Transport::Connected(ours);
+    c.to_host.extend(std::iter::repeat_n(5u8, 5000));
+    nat.tcp.push(c);
+    nat.poll(0);
+    assert_eq!(nat.bytes_to_host, 0, "nothing banked at the start");
+    nat.poll(100_000);
+    assert_eq!(nat.bytes_to_host, 1000, "a tenth of a second at 10 kB/s");
+    let mut got = vec![0; 1000];
+    host.read_exact(&mut got).unwrap();
+    nat.poll(10_000_000);
+    assert_eq!(nat.bytes_to_host, 1000 + Shape::burst(10_000), "an idle spell banks at most the burst");
+
+    host.write_all(&[9; 4000]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    nat.poll(10_050_000);
+    let banked = Shape::burst(10_000);
+    assert_eq!(nat.bytes_to_guest, banked, "the burst banked while idle");
+    let sent = nat.tcp[0].our_seq;
+    nat.tcp[0].acknowledge(sent);
+    nat.poll(10_150_000);
+    assert_eq!(nat.bytes_to_guest, banked + 1000, "then the same rate back");
+}
+
+/// A shaped handshake completes only after its delay.
+#[test]
+fn a_shaped_handshake_waits_its_delay() {
+    let (ours, _host) = socket_pair();
+    let (tx, rx) = channel();
+    tx.send(Ok(ours)).unwrap();
+    let mut nat = Nat::new(false);
+    nat.shapes.push(Shape { port: 80, bytes_per_s: None, connect_delay_us: 700_000 });
+    let mut c = flow();
+    c.transport = Transport::Connecting(rx);
+    nat.tcp.push(c);
+    assert!(nat.poll(699_999).is_empty(), "still connecting");
+    let out = nat.poll(700_000);
+    assert_eq!(out.len(), 1, "the SYN-ACK");
+    assert_eq!(out[0][47] & (SYN | ACK), SYN | ACK);
 }
