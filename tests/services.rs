@@ -175,6 +175,33 @@ impl MqttClient {
         if let Some(s) = expiry_s { c.args(["-D", "publish", "message-expiry-interval", &s.to_string()]); }
         run_tool(&mut c, "").map(|_| ())
     }
+    /// A subscriber on `topics` from now until the `Listener` is dropped, for messages that are
+    /// not retained. mosquitto_sub writes each message as it arrives; the wait after starting it
+    /// lets the subscription reach the broker before the caller runs the firmware on.
+    pub fn listen(&self, topics: &[&str]) -> Result<Listener, String> {
+        let out = temp_dir("mosquitto-sub").join("messages");
+        let file = std::fs::File::create(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        let mut c = self.tool("mosquitto_sub")?;
+        c.arg("-v");
+        for t in topics { c.args(["-t", t]); }
+        let child = c.stdin(Stdio::null()).stdout(file).stderr(Stdio::null()).spawn().map_err(|e| format!("mosquitto_sub: {e}"))?;
+        std::thread::sleep(Duration::from_millis(500));
+        Ok(Listener { child, out })
+    }
+}
+
+/// A running `mosquitto_sub`; `MqttClient::listen`.
+pub struct Listener { child: Child, out: PathBuf }
+
+impl Listener {
+    /// Every message so far, as (topic, payload).
+    pub fn messages(&self) -> Vec<(String, String)> {
+        std::fs::read_to_string(&self.out).unwrap_or_default().lines().filter_map(|l| l.split_once(' ').map(|(t, p)| (t.to_string(), p.to_string()))).collect()
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); }
 }
 
 /// A TCP relay on 127.0.0.1 in front of a service, which a test can cut (every connection
