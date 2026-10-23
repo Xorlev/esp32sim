@@ -365,6 +365,40 @@ fn fat32_refuses_a_bpb_that_does_not_add_up() {
     }
 }
 
+/// Each command's submission and completion, kept only when asked for: a WRITE(10) split at
+/// 240 blocks is two commands, a CHECK CONDITION is the failed command and its REQUEST SENSE, and
+/// the NAKed CSW shows in its command's latency.
+#[test]
+fn command_times_are_kept_on_request() {
+    let mut dev = FakeMsc::new(4096);
+    dev.knobs.not_ready = 1;
+    let mut port = FakePort::new(dev);
+    let mut m = msc(&mut port);
+    assert_eq!(m.times, None, "nothing kept by default");
+    m.times = Some(Vec::new());
+    let t0 = m.host.now_ns();
+    m.test_unit_ready().unwrap_err();
+    m.write10(100, &vec![0x5a; 300 * 512]).unwrap();
+    m.read10(100, 8).unwrap();
+    let t1 = m.host.now_ns();
+    m.test_unit_ready().unwrap();
+    let times = m.times.take().unwrap();
+    assert_eq!(times.iter().map(|t| (t.op, t.lba, t.blocks, t.ok)).collect::<Vec<_>>(),
+               [(op::TEST_UNIT_READY, 0, 0, false), (op::REQUEST_SENSE, 0, 0, true), (op::WRITE10, 100, 240, true), (op::WRITE10, 340, 60, true),
+                (op::READ10, 100, 8, true), (op::TEST_UNIT_READY, 0, 0, true)]);
+    assert_eq!((times[0].submit_ns, times[4].done_ns), (t0, t1));
+    assert!(times.windows(2).all(|w| w[0].submit_ns < w[0].done_ns && w[0].done_ns <= w[1].submit_ns), "one command at a time: {times:?}");
+    assert!(times[2].latency_ns() > times[3].latency_ns(), "240 blocks take longer than 60");
+    let mut dev = FakeMsc::new(2048);
+    dev.knobs.nak_in = 8;
+    let mut port = FakePort::new(dev);
+    let mut m = msc(&mut port);
+    m.times = Some(Vec::new());
+    m.test_unit_ready().unwrap();
+    let t = m.times.take().unwrap()[0];
+    assert!((1_000_000..1_400_000).contains(&t.latency_ns()), "8 NAKs on the CSW, one retry a microframe: {t:?}");
+}
+
 #[test]
 fn fat32_files_written_like_linux_and_read_back() {
     let img = std::env::temp_dir().join(format!("usbhost-fat-{}.img", std::process::id()));
