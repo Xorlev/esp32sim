@@ -377,6 +377,48 @@ impl Device for AnaMst {
     }
 }
 
+/// LP_TSENS (0x5012F000), the die temperature sensor at a fixed temperature. CTRL.OUT (7:0) and
+/// READY (8) read the sensor while POWER_UP (22) is set: OUT is the inverse of IDF's conversion,
+/// 0.4386 * OUT - 27.88 * offset - 20.52, for the offset of the DAC range the driver last wrote
+/// over regi2c (I2C_SAR_ADC 0x69, register 6, bits 3:0). IDF v5.5.3
+/// register/hw_ver1/soc/tsens_struct.h, include/soc/regi2c_saradc.h:18,53-55,
+/// hal/esp32p4/include/hal/temperature_sensor_ll.h, soc/esp32p4/temperature_sensor_periph.c,
+/// esp_hw_support/sar_periph_ctrl_common.c (temperature_sensor_get_raw_value).
+pub struct Tsens {
+    /// the die's temperature in degrees Celsius
+    pub celsius: f64,
+    /// the DAC range field, copied from the analog I2C master before each access
+    pub dac: Option<u8>,
+    ram: RegRam,
+}
+impl Default for Tsens {
+    fn default() -> Self {
+        let mut ram = RegRam::new();
+        // CTRL's reset value: WAKEUP_MASK and INT_EN set, CLK_DIV 6 (tsens_struct.h)
+        ram.write(0, 1 << 10 | 1 << 12 | 6 << 14);
+        Tsens { celsius: 25.0, dac: None, ram }
+    }
+}
+impl Tsens {
+    /// OUT for the selected range, nearest; none for a DAC value outside IDF's table.
+    pub fn out(&self) -> Option<u32> {
+        let offset = match self.dac? { 5 => -2.0, 7 => -1.0, 15 => 0.0, 11 => 1.0, 10 => 2.0, _ => return None };
+        Some(((self.celsius + 20.52 + 27.88 * offset) / 0.4386).round().clamp(0.0, 255.0) as u32)
+    }
+}
+impl Device for Tsens {
+    fn read(&mut self, off: u32) -> u32 {
+        let v = self.ram.read(off);
+        if off != 0 { return v; }
+        let reading = if v & 1 << 22 != 0 { self.out() } else { None };
+        (v & !0x1ff) | reading.map_or(0, |out| 1 << 8 | out)
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        self.ram.write(off, if off == 0 { v & !0x1ff } else { v });
+        WriteEffect::NONE
+    }
+}
+
 /// ASSIST_DEBUG (0x3FF06000): the ROM prints core 0's recorded PC as `Saved PC` after a reset.
 /// IDF v5.5.3 register/hw_ver1/soc/assist_debug_reg.h: CORE_0_RCD_PDEBUGPC at 0x48.
 #[derive(Default)]
@@ -551,6 +593,7 @@ pub struct Peripherals {
     pub hp_clkrst: HpClkRst,
     pub lp: LpAon,
     pub ana_mst: AnaMst,
+    pub tsens: Tsens,
     pub assist_debug: AssistDebug,
     /// WDEV_RND_REG = LP_SYSTEM_REG_RNG_DATA (0x501101A4) on rev < 3
     /// (IDF v5.5.3 register/hw_ver1/soc/wdev_reg.h:16, lp_system_reg.h:1251)
@@ -600,6 +643,7 @@ device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Xtal, 9), (Cloc
     0x50112 "LP_TIMER" alias (lp) delta 0x2000 => [];
     0x50124 "I2C_ANA_MST" (ana_mst) => [];
     0x5012d "EFUSE" (efuse) => [];
+    0x5012f "LP_TSENS" (tsens) => [];
 }
 
 impl DeviceSet for Peripherals {
@@ -618,6 +662,8 @@ impl DeviceSet for Peripherals {
             self.sdmmc.card_detect_n = cd;
             self.sdmmc.write_protect = wp;
         }
+        // I2C_SAR_ADC (0x69) register I2C_SARADC_TSENS_DAC (6), bits 3:0 (regi2c_saradc.h)
+        if block == 0x5012f { self.tsens.dac = self.ana_mst.ana.get(0, 0x69, 6).map(|v| v & 0xf); }
     }
 }
 
@@ -633,7 +679,7 @@ impl Peripherals {
             efuse: efuse_p4(mac, wafer, (0, 3)),
             spi0: MspiCache(flash_controller(false)), psram0: MspiCache(RegRam::new()), spi1: flash_controller(true), psram1: psram_controller(),
             sha: Sha::new(), intmtx: IntMatrix::new(), clic: Clic::default(), cache: Cache::new(), hp_sys: HpSys::default(), hp_clkrst: HpClkRst::new(),
-            lp: LpAon::new(), ana_mst: AnaMst::default(), assist_debug: AssistDebug::default(), rng: Rng::new(),
+            lp: LpAon::new(), ana_mst: AnaMst::default(), tsens: Tsens::default(), assist_debug: AssistDebug::default(), rng: Rng::new(),
             misc: Misc::new(), spi_exec: false, psram_exec: false, clock: Self::new_clock(), cycle_base: 0, last_status: [0; 4],
         }
     }
@@ -829,6 +875,28 @@ mod tests {
         p.write32(0x500e_5010, 0);
         p.refresh_lines();
         assert_eq!(p.clic.core[0].candidate(), None);
+    }
+
+    /// IDF's driver powers the sensor, writes a DAC range over regi2c and reads OUT: 25 C is 104 in
+    /// the -10..80 C range (DAC 15, offset 0) and 40 in 20..100 C (DAC 7, offset -1), which
+    /// 0.4386 * OUT - 27.88 * offset - 20.52 turns back into 25.09 and 24.90.
+    #[test]
+    fn the_temperature_sensor_reads_the_die_in_the_range_written_over_regi2c() {
+        let mut p = Peripherals::new([0; 6], (1, 0));
+        let dac = |p: &mut Peripherals, v: u32| p.write32(0x5012_4000, 0x69 | 6 << 8 | 1 << 24 | v << 16);
+        assert_eq!(p.read32(0x5012_f000), 1 << 10 | 1 << 12 | 6 << 14, "reset value, powered down: no reading");
+        let ctrl = p.read32(0x5012_f000);
+        p.write32(0x5012_f000, ctrl | 1 << 22 | 0xff);
+        assert_eq!(p.read32(0x5012_f000) & 0x1ff, 0, "powered, but no range written yet");
+        dac(&mut p, 15);
+        assert_eq!(p.read32(0x5012_f000) & 0x1ff, 1 << 8 | 104);
+        dac(&mut p, 7);
+        assert_eq!(p.read32(0x5012_f000) & 0xff, 40);
+        p.tsens.celsius = 90.0;
+        assert_eq!(p.read32(0x5012_f000) & 0xff, 188, "0.4386 * 188 + 27.88 - 20.52 = 89.8");
+        let ctrl = p.read32(0x5012_f000);
+        p.write32(0x5012_f000, ctrl & !(1 << 22));
+        assert_eq!(p.read32(0x5012_f000) & 0x1ff, 0);
     }
 
     #[test]
