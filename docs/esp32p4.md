@@ -1182,15 +1182,15 @@ is the relay cut until the broker has published the device's will (`avail` = `of
 `CoSim::p4` reset as a chip reset (`Machine::reboot`: flash and card kept), with the relay
 restored before the emulator runs again. The tests that send commands while the device is away
 wait for `session up (resumed)`, the firmware's log of CONNACK's session-present flag. Results
-on teslausb-p4 6ca4b86, all passing, 19-28 s on the host each:
+on teslausb-p4 ded3c80 (and before it 6ca4b86), all passing, 19-28 s on the host each:
 
 | Test | Published while away (expiry) | What the firmware did |
 | --- | --- | --- |
-| `external_oxidrive_runs_a_command_queued_across_a_reboot_and_drops_an_expired_one` | `ble_probe` (2 s), `update_status` (600 s), then 4 s of the host's time | session resumed at 7.307 s after the reset; `update_status` arrived in the same millisecond, before the firmware subscribed again, and ran once; `ble_probe` never arrived |
+| `external_oxidrive_runs_a_command_queued_across_a_reboot_and_drops_an_expired_one` | `ble_probe` (2 s), `update_status` (600 s), then 4 s of the host's time | session resumed about 7.3 s after the reset; `update_status` arrived within a millisecond of CONNACK, before the firmware subscribed again, and ran once; `ble_probe` never arrived |
 | `external_oxidrive_acts_once_on_a_redelivered_command` | none: `update_status` sent while connected, the relay deaf, so its PUBACK was lost; then the connection cut | ran it once; 15 s later, on the resumed session, `command 1 delivered again within 120s; ignored` |
 | `external_oxidrive_cancel_queued_behind_an_update_now_wins` | `update V now` and `update_cancel V` (300 s each), V staged as in the update test | both arrived 3 ms apart after CONNACK; `update to V cancelled before it started`, the card never taken, the retained state's `ota.phase` `cancelled`; then `update V now`, sent after the cancel, took the card |
 | `external_oxidrive_never_sees_an_update_now_that_expired_while_it_was_away` | `update V now` (2 s), `update_status` (600 s), then 4 s | only `update_status` arrived; the card never taken |
-| `external_oxidrive_cancel_gives_back_the_card_an_update_holds` | none: `update V now` sent while connected, `update_cancel V` once the update had taken the card | the cancel arrived at 11.186 s and the card was back with the car at 11.341 s, `cancelling the update to V` |
+| `external_oxidrive_cancel_gives_back_the_card_an_update_holds` | none: `update V now` sent while connected, `update_cancel V` once the update had taken the card | the card was back with the car 155 ms after the cancel arrived, `cancelling the update to V` |
 
 The redelivery test is the only one that needs the deaf relay: a QoS 1 message is sent again
 only on the next session, and only when its acknowledgement was lost. mosquitto 2.1.2 sent it
