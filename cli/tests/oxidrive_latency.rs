@@ -480,7 +480,7 @@ fn external_a_shared_pass_completes_without_racing_the_car() { car_write_latency
 /// WRITE(10) counts the reader's and the link's bus time inside it.
 #[test]
 fn the_reader_is_what_the_car_did_not_ask_for() {
-    let cmd = |op, lba, blocks, submit_ns, done_ns| CmdTime { op, lba, blocks, submit_ns, done_ns, ok: true };
+    let cmd = |op, lba, blocks, submit_ns, done_ns| CmdTime { op, lba, blocks, submit_ns, done_ns, ok: true, sense: None };
     let op = |sdio, cmd, arg, start_ns, end_ns| BusOp { sdio, cmd, arg, start_ns, end_ns, bytes: ((end_ns - start_ns) / 10) as u32, answered: true, resp: 0 };
     let cmds = [cmd(READ10, 50, 1, 0, 100), cmd(WRITE10, 1000, 128, 200, 1000), cmd(WRITE10, 2000, 128, 1200, 2000)];
     let bus = [op(false, CMD_READ_SINGLE, 50, 10, 20), op(false, CMD_READ_MULTIPLE, 9000, 150, 300), op(false, CMD_WRITE_MULTIPLE, 1000, 400, 900),
@@ -495,7 +495,7 @@ fn the_reader_is_what_the_car_did_not_ask_for() {
 /// that stopped early and a missing event fails them.
 #[test]
 fn the_fixed_reader_checks_fail_on_each_hazard() {
-    let cmd = |op, submit_ns, done_ns| CmdTime { op, lba: 1000, blocks: 128, submit_ns, done_ns, ok: true };
+    let cmd = |op, submit_ns, done_ns| CmdTime { op, lba: 1000, blocks: 128, submit_ns, done_ns, ok: true, sense: None };
     let read = |answered| BusOp { sdio: false, cmd: CMD_READ_MULTIPLE, arg: 9000, start_ns: 10, end_ns: 20, bytes: 32768, answered, resp: 0 };
     let report = |slow: bool, answered| Report::new(&[cmd(WRITE10, 0, if slow { 100_000_000 } else { 2_620_000 })], &[read(answered)], (0, 1_000_000_000), Some((0, 1_000_000_000)));
     let fails = |c: FixedChecks| c.verdict().is_err();

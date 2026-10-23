@@ -220,7 +220,11 @@ impl<'p> Msc<'p> {
         if self.times.is_some() {
             let done_ns = self.host.now_ns();
             let ok = matches!(&r, Ok(reply) if reply.csw.status == 0);
-            if let Some(t) = self.times.as_mut() { t.push(CmdTime::new(cdb, submit_ns, done_ns, ok)); }
+            let sense = match &r {
+                Ok(reply) if cdb.first() == Some(&op::REQUEST_SENSE) && reply.data.len() >= 14 => Some((reply.data[2] & 15, reply.data[12], reply.data[13])),
+                _ => None,
+            };
+            if let Some(t) = self.times.as_mut() { t.push(CmdTime { sense, ..CmdTime::new(cdb, submit_ns, done_ns, ok) }); }
         }
         r
     }

@@ -14,6 +14,8 @@ pub struct CmdTime {
     pub done_ns: u64,
     /// ended in a CSW with good status
     pub ok: bool,
+    /// a REQUEST SENSE's key, ASC and ASCQ, as the device returned them
+    pub sense: Option<(u8, u8, u8)>,
 }
 
 impl CmdTime {
@@ -21,7 +23,7 @@ impl CmdTime {
     pub fn new(cdb: &[u8], submit_ns: u64, done_ns: u64, ok: bool) -> Self {
         let rw = matches!(cdb.first(), Some(&(super::msc::op::READ10 | super::msc::op::WRITE10))) && cdb.len() >= 9;
         let (lba, blocks) = if rw { (u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]), u16::from_be_bytes([cdb[7], cdb[8]])) } else { (0, 0) };
-        CmdTime { op: cdb.first().copied().unwrap_or(0), lba, blocks, submit_ns, done_ns, ok }
+        CmdTime { op: cdb.first().copied().unwrap_or(0), lba, blocks, submit_ns, done_ns, ok, sense: None }
     }
     pub fn latency_ns(&self) -> u64 { self.done_ns.saturating_sub(self.submit_ns) }
 }
