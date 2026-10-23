@@ -12,6 +12,7 @@ Pocket Tank (from part 6 also the C6 WiFi station). One file per part:
 | 3 | `p4/03-chip` | [03-chip.md](03-chip.md) | [EX242](../../experiments.md#ex242) |
 | 4 | `p4/04-sdmmc` | [04-sdmmc.md](04-sdmmc.md) | [EX243](../../experiments.md#ex243) |
 | 5 | `p4/05-usb` | [05-usb.md](05-usb.md) | [EX244](../../experiments.md#ex244) |
+| 6 | `p4/06-coproc` | [06-coproc.md](06-coproc.md) | [EX245](../../experiments.md#ex245) |
 
 ## Method
 
