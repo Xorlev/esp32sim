@@ -210,12 +210,69 @@ impl Drop for Listener {
 /// closed: a half-open link, as when a peer vanishes without a reset), standing in for a network
 /// that drops the device or loses its acknowledgements. Its threads end with the process. A clone
 /// controls the same relay, for a test whose rig is held by a car.
+///
+/// In front of an SMB server (`start_smb`) it also reads what clients send as SMB2 messages, so
+/// a test can set a `trap` that ends a connection at one request. Signing leaves the headers
+/// and bodies readable; an encrypted session would hide them, and the test server does not
+/// require encryption.
 #[derive(Clone)]
 pub struct Relay { pub port: u16, state: std::sync::Arc<RelayState> }
 
 /// `live` holds each connection's two sockets, by id, for `cut`; a connection's entry goes when
 /// its pumps end, so its last handle closes and the client sees the close.
-struct RelayState { mode: std::sync::atomic::AtomicU8, live: std::sync::Mutex<Vec<(u64, TcpStream, TcpStream)>> }
+struct RelayState {
+    mode: std::sync::atomic::AtomicU8,
+    live: std::sync::Mutex<Vec<(u64, TcpStream, TcpStream)>>,
+    smb: bool,
+    trap: std::sync::Mutex<Option<Trap>>,
+    sprung: std::sync::atomic::AtomicU32,
+}
+
+/// A request that ends its connection: the client's message is matched against `pred`, one SMB2
+/// message of a compound at a time. Without `after` the matching frame is dropped and the
+/// connection closed, so the server never sees it; with it the frame goes through and the
+/// connection closes that long later, so the request is carried out and its reply lost. `times`
+/// counts down; `u32::MAX` never does.
+pub struct Trap { pub pred: Box<Matcher>, pub after: Option<std::time::Duration>, pub times: u32 }
+
+/// What a `Trap` matches one SMB2 message with.
+pub type Matcher = dyn Fn(&[u8]) -> bool + Send;
+
+/// Readers of client SMB2 messages, for a `Trap`.
+pub mod smb2 {
+    const CREATE: u16 = 0x05;
+    const SET_INFO: u16 = 0x11;
+    fn u16le(b: &[u8], at: usize) -> Option<u16> { Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?)) }
+    fn u32le(b: &[u8], at: usize) -> Option<u32> { Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?)) }
+    fn command(msg: &[u8]) -> Option<u16> { (msg.get(..4)? == b"\xfeSMB").then(|| u16le(msg, 12)).flatten() }
+    /// Each message of a compound in one frame (after its four-byte length).
+    pub fn messages(frame: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut rest = frame;
+        while rest.len() >= 64 {
+            let next = u32le(rest, 20).unwrap_or(0) as usize;
+            if next == 0 || next > rest.len() { out.push(rest); break; }
+            out.push(&rest[..next]);
+            rest = &rest[next..];
+        }
+        out
+    }
+    pub fn is_create(msg: &[u8]) -> bool { command(msg) == Some(CREATE) }
+    /// The new name of a SET_INFO FileRenameInformation, with `/` for `\\`.
+    pub fn rename_target(msg: &[u8]) -> Option<String> {
+        if command(msg)? != SET_INFO || *msg.get(66)? != 1 || *msg.get(67)? != 10 { return None; }
+        let buf = u16le(msg, 72)? as usize;
+        let len = u32le(msg, buf + 16)? as usize;
+        let name = msg.get(buf + 20..buf + 20 + len)?;
+        let units: Vec<u16> = name.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
+        Some(String::from_utf16_lossy(&units).replace('\\', "/"))
+    }
+    /// A rename onto exactly `name`.
+    pub fn renames_to(name: &str) -> impl Fn(&[u8]) -> bool + Send + 'static {
+        let name = name.to_string();
+        move |msg| rename_target(msg).is_some_and(|t| t == name)
+    }
+}
 
 const RELAY_PASS: u8 = 0;
 const RELAY_DEAF: u8 = 1;
@@ -223,11 +280,16 @@ const RELAY_CUT: u8 = 2;
 const RELAY_SILENT: u8 = 3;
 
 impl Relay {
-    pub fn start(target: SocketAddr) -> Result<Relay, String> {
+    pub fn start(target: SocketAddr) -> Result<Relay, String> { Self::start_with(target, false) }
+
+    /// In front of an SMB server, which a `trap` can read.
+    pub fn start_smb(target: SocketAddr) -> Result<Relay, String> { Self::start_with(target, true) }
+
+    fn start_with(target: SocketAddr, smb: bool) -> Result<Relay, String> {
         use std::sync::{atomic::Ordering, Arc};
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| format!("relay: {e}"))?;
         let port = listener.local_addr().unwrap().port();
-        let state = Arc::new(RelayState { mode: RELAY_PASS.into(), live: Default::default() });
+        let state = Arc::new(RelayState { mode: RELAY_PASS.into(), live: Default::default(), smb, trap: Default::default(), sprung: 0.into() });
         let st = state.clone();
         std::thread::spawn(move || {
             for (id, client) in listener.incoming().flatten().enumerate() {
@@ -262,23 +324,69 @@ impl Relay {
     pub fn half_open(&self) { self.state.mode.store(RELAY_SILENT, std::sync::atomic::Ordering::SeqCst); }
 
     pub fn restore(&self) { self.state.mode.store(RELAY_PASS, std::sync::atomic::Ordering::SeqCst); }
+
+    /// End a connection at the next client requests `trap` matches (`start_smb` only).
+    pub fn trap(&self, trap: Trap) {
+        assert!(self.state.smb, "a trap needs a relay started with start_smb");
+        *self.state.trap.lock().unwrap() = Some(trap);
+    }
+    pub fn untrap(&self) { *self.state.trap.lock().unwrap() = None; }
+    /// How many connections a trap has ended.
+    pub fn sprung(&self) -> u32 { self.state.sprung.load(std::sync::atomic::Ordering::SeqCst) }
+}
+
+/// Whether a trap ends the connection at this frame, and how long after forwarding it.
+fn sprung(state: &RelayState, frame: &[u8]) -> Option<Option<std::time::Duration>> {
+    let mut trap = state.trap.lock().unwrap();
+    let t = trap.as_mut()?;
+    if t.times == 0 || !smb2::messages(frame).iter().any(|m| (t.pred)(m)) { return None; }
+    if t.times != u32::MAX { t.times -= 1; }
+    state.sprung.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Some(t.after)
 }
 
 /// Copy `from` to `to` until either end closes, then close both. `upstream` is the client's
 /// direction, which deaf mode drops; silent mode drops both. A shutdown of a socket whose peer
 /// has already half-closed it need not send a FIN, so the connection's handles in `live` are
 /// dropped too, and the last handle's close sends it.
+///
+/// An SMB client's stream is passed on a whole frame at a time (a four-byte length, then the
+/// messages), for `trap`; once bytes have been dropped the stream is no longer framed and passes
+/// as it comes.
 fn pump(mut from: TcpStream, mut to: TcpStream, state: &RelayState, upstream: bool, id: u64) {
     use std::io::{Read, Write};
     let mut buf = [0u8; 4096];
-    loop {
+    let mut framed = upstream && state.smb;
+    let mut pending: Vec<u8> = Vec::new();
+    'conn: loop {
         let n = match from.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => n };
         match state.mode.load(std::sync::atomic::Ordering::SeqCst) {
-            RELAY_SILENT => continue,
-            RELAY_DEAF if upstream => continue,
+            RELAY_SILENT => { framed = false; continue }
+            RELAY_DEAF if upstream => { framed = false; continue }
             _ => {}
         }
-        if to.write_all(&buf[..n]).is_err() { break; }
+        if !framed {
+            if !pending.is_empty() && to.write_all(&std::mem::take(&mut pending)).is_err() { break; }
+            if to.write_all(&buf[..n]).is_err() { break; }
+            continue;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        while pending.len() >= 4 {
+            let len = 4 + (u32::from_be_bytes([0, pending[1], pending[2], pending[3]]) as usize);
+            if pending.len() < len { break; }
+            let frame: Vec<u8> = pending.drain(..len).collect();
+            match sprung(state, &frame[4..]) {
+                None => if to.write_all(&frame).is_err() { break 'conn; },
+                Some(None) => break 'conn,
+                // The client's side closes first, so the reply has nowhere to go.
+                Some(Some(after)) => {
+                    let _ = from.shutdown(std::net::Shutdown::Both);
+                    let _ = to.write_all(&frame);
+                    std::thread::sleep(after);
+                    break 'conn;
+                }
+            }
+        }
     }
     let _ = from.shutdown(std::net::Shutdown::Both);
     let _ = to.shutdown(std::net::Shutdown::Both);
@@ -452,6 +560,94 @@ fn a_relay_passes_goes_deaf_one_way_and_cuts() {
     relay.restore();
     let mut again = open();
     assert_eq!(echoed(&mut again, b"four").as_deref(), Some(&b"four"[..]));
+}
+
+/// One SMB2 message: the header with `command`, then `body`; `last` leaves NextCommand 0.
+fn smb2_message(command: u16, body: &[u8], last: bool) -> Vec<u8> {
+    let mut m = vec![0u8; 64];
+    m[..4].copy_from_slice(b"\xfeSMB");
+    m[4..6].copy_from_slice(&64u16.to_le_bytes());
+    m[12..14].copy_from_slice(&command.to_le_bytes());
+    m.extend_from_slice(body);
+    while !m.len().is_multiple_of(8) { m.push(0); }
+    if !last { let next = m.len() as u32; m[20..24].copy_from_slice(&next.to_le_bytes()); }
+    m
+}
+
+/// A SET_INFO FileRenameInformation onto `name`, as libsmb2 sends it.
+fn smb2_rename(name: &str) -> Vec<u8> {
+    let utf16: Vec<u8> = name.replace('/', "\\").encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut body = vec![0u8; 32];
+    body[..2].copy_from_slice(&33u16.to_le_bytes());
+    body[2] = 1;
+    body[3] = 10;
+    body[4..8].copy_from_slice(&(20 + utf16.len() as u32).to_le_bytes());
+    body[8..10].copy_from_slice(&96u16.to_le_bytes());
+    let mut info = vec![0u8; 16];
+    info.extend_from_slice(&(utf16.len() as u32).to_le_bytes());
+    info.extend_from_slice(&utf16);
+    body.extend_from_slice(&info);
+    body
+}
+
+fn frame(messages: &[Vec<u8>]) -> Vec<u8> {
+    let body: Vec<u8> = messages.concat();
+    let mut f = (body.len() as u32).to_be_bytes().to_vec();
+    f[0] = 0;
+    f.extend_from_slice(&body);
+    f
+}
+
+/// Traps against a server that records each frame and answers it with one byte: a rename onto
+/// another name passes, one onto the trapped name inside a compound ends the connection before
+/// the server sees it, and with `after` the server sees it and the client never hears back.
+#[test]
+fn a_relay_trap_ends_a_connection_at_one_smb2_request() {
+    use std::io::{Read, Write};
+    let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let target = server.local_addr().unwrap();
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let h = heard.clone();
+    std::thread::spawn(move || {
+        for mut s in server.incoming().flatten() {
+            let h = h.clone();
+            std::thread::spawn(move || loop {
+                let mut len = [0u8; 4];
+                if s.read_exact(&mut len).is_err() { break; }
+                let mut body = vec![0u8; u32::from_be_bytes([0, len[1], len[2], len[3]]) as usize];
+                if s.read_exact(&mut body).is_err() { break; }
+                h.lock().unwrap().push(body);
+                if s.write_all(b"k").is_err() { break; }
+            });
+        }
+    });
+    let relay = Relay::start_smb(target).unwrap();
+    let open = || { let s = TcpStream::connect(relay.addr()).unwrap(); s.set_read_timeout(Some(Duration::from_millis(500))).unwrap(); s };
+    let ask = |s: &mut TcpStream, f: &[u8]| -> bool { let mut b = [0u8; 1]; s.write_all(f).is_ok() && s.read_exact(&mut b).is_ok() };
+    let create = smb2_message(0x05, &[0u8; 56], false);
+    let index = |name: &str| frame(&[create.clone(), smb2_message(0x11, &smb2_rename(name), true)]);
+    assert_eq!(smb2::rename_target(smb2::messages(&index("a/b.mp4")[4..])[1]).as_deref(), Some("a/b.mp4"));
+
+    relay.trap(Trap { pred: Box::new(smb2::renames_to(".oxidrive-index.tsv")), after: None, times: 1 });
+    let mut s = open();
+    assert!(ask(&mut s, &index(".oxidrive-index.tsv.prev")), "another name passes");
+    assert!(!ask(&mut s, &index(".oxidrive-index.tsv")), "the trapped name ends the connection");
+    assert_eq!(relay.sprung(), 1);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(heard.lock().unwrap().len(), 1, "the server never saw it");
+    let mut s = open();
+    assert!(ask(&mut s, &index(".oxidrive-index.tsv")), "spent after one");
+
+    relay.trap(Trap { pred: Box::new(smb2::is_create), after: Some(Duration::from_millis(50)), times: u32::MAX });
+    for _ in 0..2 {
+        let mut s = open();
+        assert!(!ask(&mut s, &index("x")), "no reply");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(heard.lock().unwrap().len(), 4, "but the server carried both out");
+    assert_eq!(relay.sprung(), 3);
+    relay.untrap();
+    assert!(ask(&mut open(), &index("x")));
 }
 
 /// Both servers from this machine's install: a file through the share and back, a retained

@@ -7,7 +7,7 @@ use crate::common::*;
 use crate::oxidrive_board;
 use crate::services::{Mosquitto, Relay, Samba};
 use esp32sim::cosim::{CoSim, Config};
-use esp_soc::nat::{Forward, Nat};
+use esp_soc::nat::{Forward, Nat, Shape};
 use std::cell::RefCell;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::rc::Rc;
@@ -40,7 +40,8 @@ pub fn endpoint(csv: &str, scheme: &str, default_port: u16) -> Endpoint {
 }
 
 /// The committed ESP-Hosted slave on a C6 booted from its mask ROM, the virtual access point on
-/// its radio and `nat` behind it, the network's clock fixed.
+/// its radio and `nat` behind it, the network's clock fixed (`OXIDRIVE_NTP_FROM_S` holds its
+/// NTP answers back until then).
 pub fn hosted_slave(nat: Nat) -> esp32c6::Machine {
     let read = |name: &str| std::fs::read(root().join(FW).join(name)).unwrap_or_else(|e| panic!("{FW}/{name}: {e}"));
     let mut c6 = esp32c6::machine([0x40, 0x4c, 0xca, 0x00, 0x11, 0x22], 4 << 20);
@@ -51,6 +52,10 @@ pub fn hosted_slave(nat: Nat) -> esp32c6::Machine {
     c6.stubs.insert(0x420b_ac5c, 0);
     let ap = esp_soc::wifi::ApConfig::parse(&format!("ssid=esp32sim,psk=esp32sim-pass,epoch={EPOCH_S}")).unwrap();
     esp_soc::SocBus::attach_wifi(&mut c6.bus, ap, Some(nat)).unwrap();
+    // OXIDRIVE_NTP_FROM_S: the network answers NTP only from then on, so the clock's first step
+    // lands later in the run.
+    let from_s: u64 = std::env::var("OXIDRIVE_NTP_FROM_S").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if let Some(net) = c6.bus.periph.wifi_mac.link.net_mut() { net.ntp_from_us = from_s * 1_000_000; }
     c6.boot_rom();
     c6
 }
@@ -122,9 +127,12 @@ pub struct RigOpts {
     pub mqtt_relay: bool,
     /// put a `Relay` between the firmware and the share (`Rig::smb_relay`)
     pub smb_relay: bool,
+    /// the share's link shaped in emulated time: a byte rate each way and a handshake delay
+    pub smb_rate: Option<u64>,
+    pub smb_connect_delay_ms: u64,
 }
 impl RigOpts {
-    pub fn new(dir: String) -> Self { RigOpts { dir, card_name: "oxidrive.img".into(), card_bytes: 4 << 30, car: false, image: None, prg_us: None, timed: None, log_writes: false, slow: [(0, 0); 2], sd_writes: false, flash_timing: None, nvs_extra: String::new(), mqtt_relay: false, smb_relay: false } }
+    pub fn new(dir: String) -> Self { RigOpts { dir, card_name: "oxidrive.img".into(), card_bytes: 4 << 30, car: false, image: None, prg_us: None, timed: None, log_writes: false, slow: [(0, 0); 2], sd_writes: false, flash_timing: None, nvs_extra: String::new(), mqtt_relay: false, smb_relay: false, smb_rate: None, smb_connect_delay_ms: 0 } }
 }
 
 pub fn rig_with(o: RigOpts) -> Rig {
@@ -156,11 +164,15 @@ pub fn rig_with(o: RigOpts) -> Rig {
     let log = std::env::var("OXIDRIVE_NET_LOG").is_ok_and(|v| v == "1");
     let relay = o.mqtt_relay.then(|| Relay::start(mqtt.svc.addr()).unwrap_or_else(|e| panic!("{e}")));
     let broker = relay.as_ref().map_or(mqtt.svc.addr(), Relay::addr);
-    let smb_relay = o.smb_relay.then(|| Relay::start(smb.svc.addr()).unwrap_or_else(|e| panic!("{e}")));
+    let smb_relay = o.smb_relay.then(|| Relay::start_smb(smb.svc.addr()).unwrap_or_else(|e| panic!("{e}")));
     let smb_host = smb_relay.as_ref().map_or(smb.svc.addr(), Relay::addr);
     let forwards = vec![Forward { guest: smb_at.guest, host: smb_host }, Forward { guest: mqtt_at.guest, host: broker }];
     for f in &forwards { eprintln!("[oxidrive] forwarding {} to {}", f.guest, f.host); }
-    let cs = CoSim::new(p4, hosted_slave(Nat::forward_only(log, forwards)), Config::default());
+    let mut nat = Nat::forward_only(log, forwards);
+    if o.smb_rate.is_some() || o.smb_connect_delay_ms > 0 {
+        nat.shapes.push(Shape { port: smb_at.guest.port(), bytes_per_s: o.smb_rate, connect_delay_us: o.smb_connect_delay_ms * 1000 });
+    }
+    let cs = CoSim::new(p4, hosted_slave(nat), Config::default());
     Rig { cs, smb, mqtt, card, id, lines: Vec::new(), samples: Vec::new(), relay, smb_relay, shared: Rc::new(RefCell::new(Shared::default())), card_log, sd_writes }
 }
 

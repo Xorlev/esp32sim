@@ -69,7 +69,8 @@ fn endpoint(csv: &str, scheme: &str, default_port: u16) -> Endpoint {
     Endpoint { guest: SocketAddrV4::new(ip, port), path: path.to_string() }
 }
 
-/// The committed ESP-Hosted slave on a C6, the virtual access point and `nat` behind it.
+/// The committed ESP-Hosted slave on a C6, the virtual access point and `nat` behind it
+/// (`OXIDRIVE_NTP_FROM_S` holds its NTP answers back until then, as in `oxidrive_rig`).
 fn hosted_slave(nat: Nat) -> esp32c6::Machine {
     let read = |name: &str| std::fs::read(root().join(FW).join(name)).unwrap_or_else(|e| panic!("{FW}/{name}: {e}"));
     let mut c6 = esp32c6::machine([0x40, 0x4c, 0xca, 0x00, 0x11, 0x22], 4 << 20);
@@ -80,6 +81,8 @@ fn hosted_slave(nat: Nat) -> esp32c6::Machine {
     c6.stubs.insert(0x420b_ac5c, 0);
     let ap = esp_soc::wifi::ApConfig::parse(&format!("ssid=esp32sim,psk=esp32sim-pass,epoch={EPOCH_S}")).unwrap();
     esp_soc::SocBus::attach_wifi(&mut c6.bus, ap, Some(nat)).unwrap();
+    let from_s: u64 = std::env::var("OXIDRIVE_NTP_FROM_S").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if let Some(net) = c6.bus.periph.wifi_mac.link.net_mut() { net.ntp_from_us = from_s * 1_000_000; }
     c6.boot_rom();
     c6
 }
