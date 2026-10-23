@@ -74,6 +74,10 @@ pub struct CardOpts {
     pub timed: Option<bool>,
     /// every block the card is written, in order
     pub log: Option<std::rc::Rc<std::cell::RefCell<Vec<u64>>>>,
+    /// slower programming now and then (`SdCardConfig::slow`)
+    pub slow: [(u64, u64); 2],
+    /// every write command as the card served it (`SdCardConfig::writes`)
+    pub writes: Option<std::rc::Rc<std::cell::RefCell<Vec<esp_periph::sdmmc::SdWrite>>>>,
 }
 
 /// The card's blocks as written, logged.
@@ -109,7 +113,7 @@ pub fn boot_in(dir: &str, card_name: &str, write_through: bool, o: CardOpts) -> 
     }
     let timed_bus = o.timed.unwrap_or_else(|| std::env::var("OXIDRIVE_SD_TIMING").is_ok_and(|v| v == "1"));
     let prg_us = o.prg_us.or_else(|| std::env::var("OXIDRIVE_SD_PRG_US").ok().and_then(|v| v.parse().ok())).unwrap_or(0);
-    let config = esp_periph::sdmmc::SdCardConfig { serial, timed_bus, prg_ns: prg_us * 1000, ..Default::default() };
+    let config = esp_periph::sdmmc::SdCardConfig { serial, timed_bus, prg_ns: prg_us * 1000, slow: o.slow, writes: o.writes.clone(), ..Default::default() };
     let path = card.to_str().unwrap();
     let store = if write_through { esp_periph::sdmmc::FileStore::write_through(path) } else { esp_periph::sdmmc::FileStore::copy_on_write(path) };
     let store: Box<dyn esp_periph::sdmmc::SdStore> = match o.log { Some(log) => Box::new(LoggedStore { inner: Box::new(store.unwrap()), log }), None => Box::new(store.unwrap()) };

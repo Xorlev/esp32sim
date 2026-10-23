@@ -2338,6 +2338,115 @@ here was built at 037647d, whose trace code matches b905a73's.
 - **Not modelled**: rename, rmdir, truncate other than to 0, TexFAT's second FAT, sectors other
   than 512 bytes, the up-case table's full contents (the image's is the mandatory part).
 
+## A report per boot, through a power cut
+
+oxidrive's car report (its `car_report` module, on oxidrive's car-report branch; not merged, not in
+this repository) keeps per-boot figures about the car in NVS, a record per boot in a ring of eight,
+and publishes each boot to MQTT and syslog once the device is home: the car's write service times
+as a histogram, the card lock, the car's SCSI commands and the gaps between its TEST UNIT READY
+polls, the sense data it was sent, the gaps after a window, the radio, the network, shared
+reading, health, and what saving the record cost. `cli/tests/oxidrive_car_report.rs` checks the
+figures against the emulator's own record and measures what the saves cost the car. Fixtures:
+`OXIDRIVE_CAR_REPORT_DIR` (the branch's build, `oxidrive-car-report`) and `OXIDRIVE_BASELINE_DIR`
+(`oxidrive-bc40b82`, a build without the report).
+
+### What the model gained
+
+- **Flash that takes time to program and erase** (`spi_mem::FlashTiming`, set on the P4 as
+  `SocBus::flash_timing`, `RigOpts::flash_timing`). After a page program or an erase the status
+  register's WIP bit stays set for the part's time, through RDSR and RD_STATUS alike, so IDF's
+  wait-idle loop waits it out. IDF's own code holds the other core in its IPC stall and masks the
+  non-IRAM interrupts meanwhile, as compiled, so the car's commands wait as long as on a board. The
+  cache is still not modelled: code that runs from flash during the operation is not caught. Each
+  timed operation is logged (`SocBus::flash_ops`: start, end, address, length, erase). The times
+  are GigaDevice GD25Q-class typical figures (a page program 30 us plus 2.5 us a byte, a 4 KiB
+  sector erase 45 ms): an assumption for the board's 32 MB part, not a measurement.
+  `OXIDRIVE_FLASH_ERASE_MS` and `OXIDRIVE_FLASH_BYTE_NS` vary them. Untimed, as before, by
+  default.
+- **A card that stalls now and then** (`SdCardConfig::slow`: every `n`th programming period lasts
+  longer) **and its writes as served** (`SdCardConfig::writes`: each write command from CMD24 or
+  CMD25 to the end of its programming), the ground truth for a write tap's service time.
+- **Sense data per REQUEST SENSE** in `CmdTime::sense`.
+- **A power cut**: a P4 reset with the power-on cause (`request_reset(RST_POWERON)`). RAM survives it
+  here; the firmware re-initialises what it uses. The car is a new host after it: the old one is
+  dropped and, where a test wants a car again, it enumerates afresh.
+
+### Ground truth
+
+`external_oxidrive_car_report_survives_a_power_cut`: a car records four 4 MiB saved events on a
+card that programs for 1.5 ms after each write, 30 ms every 97th and 150 ms every 401st, polls TEST
+UNIT READY every 1.5 s, meets a forced window and records a 2 MiB event after it, then idles 75 s.
+The P4 then loses power before it has published anything about that boot; it boots again with no
+car and publishes it; a second power cut, and the third boot publishes the second boot's report
+and not the first's again. Every count is the device's against the emulator's, up to the device's
+last save (its `up_ms`):
+
+| Figure | Device | Emulator |
+| --- | --- | --- |
+| TEST UNIT READY / REQUEST SENSE / READ CAPACITY / INQUIRY | 109 / 15 / 2 / 0 | 109 / 15 / 2 / 0 |
+| sense 2/3A/00, 6/28/00, none, other | 14, 1, 0, 0 | 14, 1, 0, 0 |
+| TUR gaps, buckets <=0.5, 1, 2, 5, 10, 30 s, more | [0, 0, 108, 0, 0, 0, 0] | [0, 0, 108, 0, 0, 0, 0] |
+| car writes (the tap's calls; card write commands) | 1211 | 1211 |
+| sectors | 37940 | 37940 |
+| service time, buckets <=10, 25, 50, 100, 250, 500 ms, more | [1196, 0, 12, 0, 3, 0, 0] | [1196, 0, 12, 0, 3, 0, 0] |
+| longest write | 151.712 ms | 151.684 ms (card side) |
+| from the card's return to the car's first command / first write | 572 / 3624 ms | 549 / 3601 ms |
+
+The return is timed from the console line, whose slice ends up to 100 ms after the event, so the
+emulator's gaps are short by the line's lag; the test allows 150 ms. The device's last save came
+60.3 s after the car's last write, as its schedule says. Three saves in the boot: at boot, 60 s
+after the car's first four events while a shared pass uploaded them, and 60 s after its last
+write; the longest held the flash for 3.7 ms, and no car command was in flight during any flash
+operation. The figures were the same on three runs, apart from two more TEST UNIT READY polls in
+one (both sides). 656 s wall for 207 s emulated.
+
+### What saving costs the car
+
+`external_oxidrive_car_report_costs_the_car_little`: the same car on bc40b82 and on the report's
+build, the flash timed in both. It records the way a Linux flusher writes back on a timer: a 4 MiB
+clip as 64 KiB WRITE(10)s every 16 ms (about a second), then nothing but a TEST UNIT READY every
+2 s until five seconds have passed, for 330 s. RecentClips only, so shared passes list and read
+nothing, and the car never goes quiet for a window.
+
+| | without the report | with it |
+| --- | --- | --- |
+| car commands, buckets <=10, 25, 50, 100, 250, 500 ms, more | [13260, 0, 0, 0, 0, 0, 0] | [13260, 0, 0, 0, 0, 0, 0] |
+| longest car command | 5.63 ms | 5.63 ms |
+| flash busy spells in the 330 s | 5 (1.0-1.1 ms) | 6 (5 of 1.1-1.2 ms, 1 of 2.69 ms) |
+| car commands in flight during one | 2 (at most 620 us longer than their median) | 3 (the same) |
+| ... during one of the report's saves | | 0 |
+
+The five spells common to both are oxidrive's journal, written after every shared pass whether or
+not the car is writing (`archiver.rs`, `run_shared_pass`): those are the car WRITE(10)s that met a
+busy flash, in both builds. The report's own save five minutes in landed in a gap between bursts
+and held the flash for 2.69 ms with no car command in flight; the report the next boot published
+counted it (`persist`: one save before its own, 2.4 ms, histogram bucket <=5 ms, nothing during or
+just after). No sector erase came due in either run, so the 45 ms tail an NVS page reclaim costs
+was not exercised. 1271 s wall.
+
+### A crash the first runs found
+
+The first runs of the cost test lost the P4 a minute or two in: FreeRTOS asserted in
+`xTaskPriorityDisinherit` (`pxTCB == pxCurrentTCBs[...]`) on core 1 with the TinyUSB task in
+oxidrive's write tap. The core dump (`espcoredump.py info_corefile` on the coredump partition, read
+out of `SocBus::flash`) put the give inside `card_lock::take`: it built its guard with
+`bool::then_some(Held(m))`, which evaluates its argument whether the take succeeded or not, so a
+failed take dropped a guard and gave the mutex the reader held. On bc40b82 only a car write that
+waits out its 10 ms, or a shared read its 50 ms, fails a take; the report's build tries the lock
+once without waiting first, so every car write that met the reader did. Fixed on the car-report
+branch with `then(|| Held(m))`; the runs above are on that build.
+
+### Limits
+
+- **The flash's times are assumed**, and the cache is not modelled: the cost is IDF's software
+  stall for the part's typical times, not a board's.
+- **The car's write pattern is the emulator's.** Whether a Tesla leaves gaps between bursts, and
+  how long, is not measured; the report's TUR gaps and save counts from a car will say.
+- **The power cut keeps RAM**, and the boots after it run with no car.
+- **The return of the card** is timed from a console line, to 100 ms.
+- **No erase** came due in the cost runs; its cost is the part's assumed 45 ms, reasoned rather
+  than measured.
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,
@@ -2435,7 +2544,7 @@ car meanwhile; with the co-processor it comes up ("The co-processor").
 | CPU | two RV32IMAFC cores (`Cpu::new_esp32p4`, `misa` 0x40001125): F with the lazy FPU traps, EXT_ILL, Zicntr, CLIC mode, `mhartid`; core 1 held in reset until HP_SYS_CLKRST releases it. Xesppie and the hardware loops decode as illegal |
 | Memory | 128 KB mask ROM at 0x4FC00000 (reset vector), 768 KB L2MEM at 0x4FF00000 and its uncached alias at 0x8FF00000, 8 KB TCM at 0x30100000, LP ROM (empty) and 32 KB LP RAM; flash (0x40000000) and PSRAM (0x48000000) windows behind two 1024-entry MMUs of 64 KB pages, reached through SPI_MEM_C / SPI_MEM_S item registers, with their uncached aliases |
 | Interrupts | both interrupt matrices (128 sources, rev < 3) and both CLIC register blocks, delivered through the cores' CLIC mode |
-| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back, kept through a chip reset), the die temperature sensor at a fixed temperature, ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`), an SDIO function on slot 1 with its interrupt on DAT1 (`--coproc`: an ESP32-C6 running ESP-Hosted's slave, "The co-processor"); everything else is register RAM, listed by `--log-periph` |
+| Peripherals | UART0/1, USB-Serial/JTAG, systimer (16 MHz from XTAL), TIMG0/1, SHA, efuse (v1.0, block v0.3, security efuses zero), the flash controller (SPI0 cache side, SPI1 commands, a GigaDevice part answering RDID, its programs and erases instant or, with `SocBus::flash_timing`, timed), the PSRAM controller with an AP Memory x16 PSRAM, the cache controller, HP_SYSTEM (cross-core interrupts, stall status), HP_SYS_CLKRST (divider update, PLL calibration done, core 1 clock and reset), LP_SYSTEM / LP_CLKRST / LP_TIMER (reset cause, software reset, core 1 boot address, RTC counter, the SDMMC reset), the analog I2C master (regi2c read-back, kept through a chip reset), the die temperature sensor at a fixed temperature, ASSIST_DEBUG's saved PC, the RNG, GPIO with the P4's register layout, the SDMMC host with its IDMAC and an SD card in the board's socket (`--sd`), the high-speed USB-OTG core as a device with buffer DMA and a host on its port (`--usb-host`), an SDIO function on slot 1 with its interrupt on DAT1 (`--coproc`: an ESP32-C6 running ESP-Hosted's slave, "The co-processor"); everything else is register RAM, listed by `--log-periph` |
 | Time base | 360 MHz, the rev < 3 application clock; one instruction is one cycle |
 
 The revision is a type parameter (`esp32p4::Revision`, `RevLt3`): rev >= 3 (its own ROM, the

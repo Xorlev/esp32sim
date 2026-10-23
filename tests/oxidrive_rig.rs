@@ -62,6 +62,8 @@ pub struct Rig {
     /// the P4's console lines and the card's writes, readable while a car holds the rig as its port
     pub shared: Rc<RefCell<Shared>>,
     card_log: Option<Rc<RefCell<Vec<u64>>>>,
+    /// every write command as the card served it, when `RigOpts::sd_writes`
+    pub sd_writes: Option<Rc<RefCell<Vec<esp_periph::sdmmc::SdWrite>>>>,
 }
 
 /// What a test reads while a car drives the rig: the P4's console lines and the card's writes,
@@ -105,9 +107,14 @@ pub struct RigOpts {
     pub timed: Option<bool>,
     /// log every block written to the card (`Shared::writes`)
     pub log_writes: bool,
+    /// slower programming now and then (`SdCardConfig::slow`), and each write's service kept
+    pub slow: [(u64, u64); 2],
+    pub sd_writes: bool,
+    /// the P4's flash takes time to program and erase (`SocBus::flash_timing`)
+    pub flash_timing: Option<esp_periph::spi_mem::FlashTiming>,
 }
 impl RigOpts {
-    pub fn new(dir: String) -> Self { RigOpts { dir, card_name: "oxidrive.img".into(), card_bytes: 4 << 30, car: false, image: None, prg_us: None, timed: None, log_writes: false } }
+    pub fn new(dir: String) -> Self { RigOpts { dir, card_name: "oxidrive.img".into(), card_bytes: 4 << 30, car: false, image: None, prg_us: None, timed: None, log_writes: false, slow: [(0, 0); 2], sd_writes: false, flash_timing: None } }
 }
 
 pub fn rig_with(o: RigOpts) -> Rig {
@@ -119,8 +126,10 @@ pub fn rig_with(o: RigOpts) -> Rig {
     let smb = Samba::start(&share, SHARE_USER, SHARE_PASS).unwrap_or_else(|e| panic!("samba: {e}"));
     let mqtt = Mosquitto::start(BROKER_USER, BROKER_PASS).unwrap_or_else(|e| panic!("mosquitto: {e}"));
     let card_log = o.log_writes.then(|| Rc::new(RefCell::new(Vec::new())));
-    let opts = oxidrive_board::CardOpts { size: Some(o.card_bytes), image: o.image.clone(), prg_us: o.prg_us, timed: o.timed, log: card_log.clone() };
+    let sd_writes = o.sd_writes.then(|| Rc::new(RefCell::new(Vec::new())));
+    let opts = oxidrive_board::CardOpts { size: Some(o.card_bytes), image: o.image.clone(), prg_us: o.prg_us, timed: o.timed, log: card_log.clone(), slow: o.slow, writes: sd_writes.clone() };
     let (mut p4, board_log, card) = oxidrive_board::boot_in(&dir, &o.card_name, true, opts);
+    p4.bus.flash_timing = o.flash_timing;
     let table = std::fs::read(format!("{dir}/partition-table.bin")).unwrap();
     let (off, size) = oxidrive_board::nvs_partition(&table).expect("an NVS partition in partition-table.bin");
     p4.write_flash(off, &oxidrive_board::nvs_image(&csv_path, size)).unwrap();
@@ -133,7 +142,7 @@ pub fn rig_with(o: RigOpts) -> Rig {
     let forwards = vec![Forward { guest: smb_at.guest, host: smb.svc.addr() }, Forward { guest: mqtt_at.guest, host: mqtt.svc.addr() }];
     for f in &forwards { eprintln!("[oxidrive] forwarding {} to {}", f.guest, f.host); }
     let cs = CoSim::new(p4, hosted_slave(Nat::forward_only(log, forwards)), Config::default());
-    Rig { cs, smb, mqtt, card, id, lines: Vec::new(), samples: Vec::new(), shared: Rc::new(RefCell::new(Shared::default())), card_log }
+    Rig { cs, smb, mqtt, card, id, lines: Vec::new(), samples: Vec::new(), shared: Rc::new(RefCell::new(Shared::default())), card_log, sd_writes }
 }
 
 impl Rig {
