@@ -314,6 +314,89 @@ fn sd_card_p4() {
     assert_eq!(files, want, "the files the example left on the card");
 }
 
+/// IDF's USB mass-storage example on the P4 (`examples/usb_msc-p4`), the card in its socket and a
+/// host on its high-speed USB port (`host.txt`): enumeration, the card's capacity, raw blocks
+/// written and read back, a FAT32 file written in 64 KiB chunks and read back, an eject that
+/// hands the card to the example's application (TEST UNIT READY: MEDIUM NOT PRESENT), the
+/// application writing README.MD (`console.txt`) and exposing the card again, the host reading
+/// that file, suspend, resume and unplug. Pinned: the console, the host's log with its emulated
+/// times, the instruction count, and what is on the card afterwards.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn usb_msc_p4() {
+    let card = tmp("usbmsc-p4.img");
+    sd_image::fat32(&card, 64 << 20, 512, "").unwrap();
+    let rom = rom("esp32p4_rev0");
+    let r = run(BIN_P4, &["--rom", rom.to_str().unwrap(), "--flash-mb", "4", "--bootloader", &fetched("p4-usbmsc-bootloader.bin"),
+        "--ptable", &fetched("p4-usbmsc-ptable.bin"), "--app", &fetched("p4-usbmsc.bin"), "--sd-rw", card.to_str().unwrap(),
+        "--script", "examples/usb_msc-p4/console.txt", "--usb-host", "examples/usb_msc-p4/host.txt", "--max-seconds", "2"]);
+    let host: String = r.stderr.lines().filter(|l| l.starts_with("[usb-host]")).map(|l| format!("{l}\n")).collect();
+    for line in ["port reset: High speed", "device 303a:4002", "interface 0: class 08/06/50, endpoints 01 (512 bytes) 81 (512 bytes)",
+                 "READ CAPACITY: 131072 blocks of 512 bytes", "verify 16 blocks at 131056: all a5", "fat-read FILE0001.BIN: 1048576 bytes",
+                 "matches what was written", "TEST UNIT READY: sense 2/3a/00 (MEDIUM NOT PRESENT)", "root: FILE0001.BIN (1048576), README.MD (379)", "script done"] {
+        assert!(host.contains(line), "missing {line:?} in the host's log:\n{host}");
+    }
+    assert!(r.stdout.contains("TinyUSB Driver installed on port 1") && r.stdout.contains("README.MD doesn't exist yet, creating"), "{}", r.stdout);
+    expect_text("usbmsc-p4.console.txt", &r.stdout);
+    expect_text("usbmsc-p4.host.txt", &host);
+    expect_u64("usbmsc-p4.insns", r.insns);
+    let files = sd_image::Volume::open(&card).unwrap().root_files();
+    assert_eq!(files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["FILE0001.BIN", "README.MD"]);
+    assert!(files[0].1 == esp_soc::usb_host::fat32::file_bytes("FILE0001.BIN", 1 << 20), "the file on the card is the one the host wrote");
+    assert!(String::from_utf8_lossy(&files[1].1).starts_with("Mass Storage Devices are one of the most common USB devices."));
+    let image = std::fs::read(&card).unwrap();
+    assert!(image[131056 * 512..131072 * 512].iter().all(|&b| b == 0xa5), "the raw blocks the host wrote");
+}
+
+/// The example against the faults a host meets (examples/usb_msc-p4/faults.txt): a command that
+/// times out mid-transfer and the port reset Linux's usb-storage recovers with, a port reset after
+/// an eject (tud_mount_cb takes the card back from the application), and VBUS lost mid-write
+/// (tud_umount_cb gives it to the application).
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn usb_msc_p4_faults() {
+    let card = tmp("usbmsc-p4-faults.img");
+    sd_image::fat32(&card, 64 << 20, 512, "").unwrap();
+    let rom = rom("esp32p4_rev0");
+    let r = run(BIN_P4, &["--rom", rom.to_str().unwrap(), "--flash-mb", "4", "--bootloader", &fetched("p4-usbmsc-bootloader.bin"),
+        "--ptable", &fetched("p4-usbmsc-ptable.bin"), "--app", &fetched("p4-usbmsc.bin"), "--sd-rw", card.to_str().unwrap(),
+        "--usb-host", "examples/usb_msc-p4/faults.txt", "--max-seconds", "3"]);
+    let host: String = r.stderr.lines().filter(|l| l.starts_with("[usb-host]")).map(|l| format!("{l}\n")).collect();
+    for line in ["command aborted after 5 ms", "port reset", "failed, going on: timeout", "verify 240 blocks at 130000: all 5a", "ejected",
+                 "device reset, configuration 1 restored", "no device on the port", "failed, going on: device disconnected",
+                 "root: FILE0002.BIN (0)", "script done"] {
+        assert!(host.contains(line), "missing {line:?} in the host's log:\n{host}");
+    }
+    // boot, enumeration, eject, the port reset, VBUS lost, attached again, the final unplug
+    let owner: Vec<&str> = r.stdout.lines().filter_map(|l| l.split("Storage mounted to application: ").nth(1)).collect();
+    assert_eq!(owner, ["Yes", "No", "Yes", "No", "Yes", "No", "Yes"], "{}", r.stdout);
+    assert!(r.stdout.contains("storage exposed over USB: Yes"), "{}", r.stdout);
+    // the cut file: an entry of size 0 and no cluster, its clusters allocated in the FAT
+    let image = std::fs::read(&card).unwrap();
+    let v = &image[2048 * 512..];
+    let (reserved, fat_sectors) = (u16::from_le_bytes([v[14], v[15]]) as usize, u32::from_le_bytes(v[36..40].try_into().unwrap()) as usize);
+    let fat = &v[reserved * 512..(reserved + fat_sectors) * 512];
+    let used = fat.as_chunks::<4>().0.iter().skip(3).filter(|&&e| u32::from_le_bytes(e) & 0x0fff_ffff != 0).count();
+    let files = sd_image::Volume::open(&card).unwrap().root_files();
+    assert!(files.iter().any(|f| f.0 == "FILE0002.BIN" && f.1.is_empty()), "{:?}", files.iter().map(|f| (&f.0, f.1.len())).collect::<Vec<_>>());
+    assert!(used > 0, "the clusters the cut file was given are still allocated");
+    expect_text("usbmsc-p4-faults.console.txt", &r.stdout);
+    expect_text("usbmsc-p4-faults.host.txt", &host);
+    expect_u64("usbmsc-p4-faults.insns", r.insns);
+}
+
+/// `--max-insns` bounds the host's script as it bounds a run: the script stops at the limit and
+/// the run ends there.
+#[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]
+fn usb_host_script_counts_against_max_insns() {
+    let card = tmp("usbmsc-p4-insns.img");
+    sd_image::fat32(&card, 64 << 20, 512, "").unwrap();
+    let rom = rom("esp32p4_rev0");
+    let r = run(BIN_P4, &["--rom", rom.to_str().unwrap(), "--flash-mb", "4", "--bootloader", &fetched("p4-usbmsc-bootloader.bin"),
+        "--ptable", &fetched("p4-usbmsc-ptable.bin"), "--app", &fetched("p4-usbmsc.bin"), "--sd-rw", card.to_str().unwrap(),
+        "--usb-host", "examples/usb_msc-p4/host.txt", "--max-insns", "20000000", "--max-seconds", "2"]);
+    assert!(r.stderr.contains("failed: the run's instruction limit"), "{}", r.stderr);
+    assert!(r.stderr.contains("[emu] stop: MaxInsns — core0 20000000 +"), "{}", r.stderr);
+}
+
 /// The same firmware with an unformatted card (FatFs finds no volume and the example does not
 /// format) and with an empty socket (every command times out).
 #[test] #[ignore = "needs the ESP32-P4 mask ROM ELF"]

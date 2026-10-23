@@ -18,7 +18,10 @@ p4-hello-smp_world.bin 9476bccf819114fe30ad55dde4d0917e7f5213df34ec6f159b81c4a84
 p4-sdcard-bootloader.bin 985366855e83f25f6b9399c79aa3eac01742e0950d3e6406e24db0a32bd76816 $BASE/p4-sdcard-bootloader.bin
 p4-sdcard.bin 411c93b78fc0efb199e3576c510bf0de23f74086a87cc3a9204c67a207428749 $BASE/p4-sdcard.bin
 p4-sdsectors-bootloader.bin 7a2e21c03a9ae5e6ac3d4b90e981843ca2348264e70cb302085e06b189a0dd71 $BASE/p4-sdsectors-bootloader.bin
-p4-sdsectors.bin e658889c0ed35e7ca4ca0ca2acecbf4a48e1e4d87057341e6f31143c8d057062 $BASE/p4-sdsectors.bin"
+p4-sdsectors.bin e658889c0ed35e7ca4ca0ca2acecbf4a48e1e4d87057341e6f31143c8d057062 $BASE/p4-sdsectors.bin
+p4-usbmsc-bootloader.bin 365a7cafa9e101bb564422724a5d46d22b8dd18ea1594457b559dbeae2f8f485 $BASE/p4-usbmsc-bootloader.bin
+p4-usbmsc-ptable.bin f6992f2eded46b7b73dccaf32c0702dd50c683bf834222916c5cddf7b85dac74 $BASE/p4-usbmsc-ptable.bin
+p4-usbmsc.bin f47d38b4eae7c954e0c874a2ff6cfbba3a96a93c0765927672634517e4bb4150 $BASE/p4-usbmsc.bin"
 
 sha256_ok() {  # FILE HASH; -c without GNU-only --status, so macOS shasum and sha256sum both work
   if command -v shasum >/dev/null 2>&1; then echo "$2  $1" | shasum -a 256 -c >/dev/null 2>&1
