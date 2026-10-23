@@ -149,11 +149,21 @@ pub struct SdCardConfig {
     /// the host's bus takes its time: commands and data at the card clock and width
     /// (`Sdmmc::timed`)
     pub timed_bus: bool,
+    /// `(n, ns)`: every `n`th programming period lasts `ns` rather than `prg_ns`, as a card's
+    /// garbage collection stalls a write now and then; the longest that applies wins, `n` 0 is off
+    pub slow: [(u64, u64); 2],
+    /// each write as the card served it, kept while `Some`
+    pub writes: Option<std::rc::Rc<std::cell::RefCell<Vec<SdWrite>>>>,
 }
 impl Default for SdCardConfig {
     /// MID 0 (no manufacturer's), "ES", "SIMSD", revision 1.0, 2024-01.
-    fn default() -> Self { SdCardConfig { prg_ns: 0, init_polls: 1, mid: 0, oid: *b"ES", name: *b"SIMSD", revision: 0x10, serial: None, date: (2024, 1), timed_bus: false } }
+    fn default() -> Self { SdCardConfig { prg_ns: 0, init_polls: 1, mid: 0, oid: *b"ES", name: *b"SIMSD", revision: 0x10, serial: None, date: (2024, 1), timed_bus: false, slow: [(0, 0); 2], writes: None } }
 }
+
+/// One write command, from CMD24 or CMD25 to the end of the programming after it: the time the
+/// host's write takes on the card, less its own overheads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SdWrite { pub start_ns: u64, pub end_ns: u64, pub lba: u64, pub blocks: u32 }
 
 pub struct SdCard {
     store: Box<dyn SdStore>,
@@ -175,6 +185,10 @@ pub struct SdCard {
     written: u32,
     /// end of the programming period in progress, in nanoseconds
     busy_until: u64,
+    /// programming periods so far, for `SdCardConfig::slow`
+    programs: u64,
+    /// the write command in progress: when it came and where it starts
+    write_began: Option<(u64, u64)>,
     serial: u32,
     pub log: bool,
     pub commands: u64,
@@ -196,7 +210,7 @@ impl SdCard {
         let serial = config.serial.unwrap_or((blocks as u32).wrapping_mul(0x9e37_79b9) ^ 0x5d1c_0b17);
         let init_left = config.init_polls;
         Ok(SdCard { store, config, blocks, state: CardState::Idle, rca: 0, status: 0, app_cmd: false, if_cond: false, init_left, high_speed: false, wide: false,
-                    block_count: None, erase: (None, None), data: Phase::None, written: 0, busy_until: 0, serial, log: false, commands: 0, blocks_read: 0, blocks_written: 0 })
+                    block_count: None, erase: (None, None), data: Phase::None, written: 0, busy_until: 0, programs: 0, write_began: None, serial, log: false, commands: 0, blocks_read: 0, blocks_written: 0 })
     }
     pub fn state(&self) -> CardState { self.state }
     pub fn blocks(&self) -> u64 { self.blocks }
@@ -277,6 +291,7 @@ impl SdCard {
         self.erase = (None, None);
         self.data = Phase::None;
         self.busy_until = 0;
+        self.write_began = None;
     }
 
     /// The card status word of an R1 response: CURRENT_STATE is the state the command found
@@ -288,8 +303,14 @@ impl SdCard {
 
     /// Programming from `now` for the configured time (SD spec §4.3.4): prg, then tran.
     fn program(&mut self, now: u64) {
-        self.busy_until = now.saturating_add(self.config.prg_ns);
-        self.state = if self.config.prg_ns > 0 { CardState::Prg } else { CardState::Tran };
+        self.programs += 1;
+        let n = self.programs;
+        let prg = self.config.slow.iter().filter(|&&(every, _)| every > 0 && n.is_multiple_of(every)).fold(self.config.prg_ns, |p, &(_, ns)| p.max(ns));
+        self.busy_until = now.saturating_add(prg);
+        self.state = if prg > 0 { CardState::Prg } else { CardState::Tran };
+        if let (Some((start_ns, lba)), Some(log)) = (self.write_began.take(), &self.config.writes) {
+            log.borrow_mut().push(SdWrite { start_ns, end_ns: self.busy_until, lba, blocks: self.written });
+        }
     }
 
     /// When programming has ended: prg goes to tran, dis (deselected while programming) to
@@ -398,6 +419,7 @@ impl SdCard {
                 if lba >= self.blocks { self.status |= OUT_OF_RANGE; return Ok(Reply::R1); }
                 let left = if cmd == 25 { count } else { None };
                 self.written = 0;
+                self.write_began = Some((now, lba));
                 self.data = Phase::Write { lba, buf: Vec::with_capacity(BLOCK), multi: cmd == 25, left };
                 self.state = Rcv;
                 Ok(Reply::R1)
