@@ -1,9 +1,10 @@
 //! The owner's oxidrive firmware (not in this repository) on the P4 with ESP-Hosted's slave on the
 //! C6, its MQTT broker and SMB server running on the host (`services`), and a host on its USB port:
 //! the rig the `oxidrive_*` tests in `cli/tests` share, included with `#[path]` next to `common`,
-//! `sd_image`, `oxidrive_board` and `services`.
+//! `sd_image`, `oxidrive_board`, `services` and `hosted_slave`.
 #![allow(dead_code)]
 use crate::common::*;
+use crate::hosted_slave::{self, Slave};
 use crate::oxidrive_board;
 use crate::services::{Mosquitto, Relay, Samba};
 use esp32sim::cosim::{CoSim, Config};
@@ -39,17 +40,18 @@ pub fn endpoint(csv: &str, scheme: &str, default_port: u16) -> Endpoint {
     Endpoint { guest: SocketAddrV4::new(ip, port), path: path.to_string() }
 }
 
-/// The committed ESP-Hosted slave on a C6 booted from its mask ROM, the virtual access point on
-/// its radio and `nat` behind it, the network's clock fixed (`OXIDRIVE_NTP_FROM_S` holds its
+/// An ESP-Hosted slave (`hosted_slave::Slave::from_env`: the committed 2.12.13 one unless
+/// `OXIDRIVE_SLAVE_DIR` names another) on a C6 booted from its mask ROM, the virtual access point
+/// on its radio and `nat` behind it, the network's clock fixed (`OXIDRIVE_NTP_FROM_S` holds its
 /// NTP answers back until then).
-pub fn hosted_slave(nat: Nat) -> esp32c6::Machine {
-    let read = |name: &str| std::fs::read(root().join(FW).join(name)).unwrap_or_else(|e| panic!("{FW}/{name}: {e}"));
+pub fn hosted_slave(nat: Nat) -> esp32c6::Machine { hosted_slave_from(&Slave::from_env(), nat) }
+
+pub fn hosted_slave_from(slave: &Slave, nat: Nat) -> esp32c6::Machine {
     let mut c6 = esp32c6::machine([0x40, 0x4c, 0xca, 0x00, 0x11, 0x22], 4 << 20);
     esp_soc::SocBus::set_flash_size(&mut c6.bus, 4 << 20);
     c6.load_rom(&std::fs::read(rom("esp32c6_rev0")).unwrap()).unwrap();
-    for (off, f) in [(0, "c6-hosted-bootloader.bin"), (0x8000, "c6-hosted-ptable.bin"), (0xd000, "c6-hosted-otadata.bin"), (0x10000, "c6-hosted-slave.bin")] { c6.write_flash(off, &read(f)).unwrap(); }
-    // bb_init, the PHY's baseband calibration (riscv32-esp-elf-nm on network_adapter.elf)
-    c6.stubs.insert(0x420b_ac5c, 0);
+    slave.flash(&mut c6);
+    hosted_slave::stub_booted(&mut c6, &hosted_slave::known(slave));
     let ap = esp_soc::wifi::ApConfig::parse(&format!("ssid=esp32sim,psk=esp32sim-pass,epoch={EPOCH_S}")).unwrap();
     esp_soc::SocBus::attach_wifi(&mut c6.bus, ap, Some(nat)).unwrap();
     // OXIDRIVE_NTP_FROM_S: the network answers NTP only from then on, so the clock's first step
@@ -172,7 +174,11 @@ pub fn rig_with(o: RigOpts) -> Rig {
     if o.smb_rate.is_some() || o.smb_connect_delay_ms > 0 {
         nat.shapes.push(Shape { port: smb_at.guest.port(), bytes_per_s: o.smb_rate, connect_delay_us: o.smb_connect_delay_ms * 1000 });
     }
-    let cs = CoSim::new(p4, hosted_slave(nat), Config::default());
+    let slave = Slave::from_env();
+    let cs = CoSim::new(p4, hosted_slave_from(&slave, nat), Config::default());
+    // A C6 that installs another slave over the air boots it at its next reset.
+    let known = hosted_slave::known(&slave);
+    cs.c6.borrow_mut().on_reset = Some(Box::new(move |m| hosted_slave::stub_booted(m, &known)));
     Rig { cs, smb, mqtt, card, id, lines: Vec::new(), samples: Vec::new(), relay, smb_relay, shared: Rc::new(RefCell::new(Shared::default())), card_log, sd_writes }
 }
 

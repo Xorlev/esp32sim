@@ -84,11 +84,14 @@ pub struct Coproc {
     pub late_commands: u64,
     /// the faults the link injects, and their state
     pub faults: FaultState,
+    /// run after every reset, before the chip's first instruction: a test that installs a new
+    /// image on the C6 points its stubs at the image the bootloader is about to load
+    pub on_reset: Option<Box<dyn FnMut(&mut C6Machine)>>,
 }
 
 impl Coproc {
     pub fn new(m: C6Machine) -> Self {
-        Coproc { m, origin: 0, held: false, held_at: 0, en_glitches: 0, halted: None, reboot: true, console_mask: 2, console: Vec::new(), power_ups: 0, resets: 0, late_commands: 0, faults: FaultState::default() }
+        Coproc { m, origin: 0, held: false, held_at: 0, en_glitches: 0, halted: None, reboot: true, console_mask: 2, console: Vec::new(), power_ups: 0, resets: 0, late_commands: 0, faults: FaultState::default(), on_reset: None }
     }
 
     /// Where the C6 stands on the shared clock, in its own cycles.
@@ -115,7 +118,7 @@ impl Coproc {
             self.collect_console();
             match r {
                 RunUntil::Reached | RunUntil::Yield => {}
-                RunUntil::Stop(Stop::SwReset) if self.reboot => { self.m.reboot(); self.resets += 1; }
+                RunUntil::Stop(Stop::SwReset) if self.reboot => { self.m.reboot(); self.after_reset(); self.resets += 1; }
                 RunUntil::Stop(s) => self.halted = Some(format!("{s:?}")),
             }
         }
@@ -135,9 +138,14 @@ impl Coproc {
         if ns - self.held_at < EN_RESET_NS { self.en_glitches += 1; return; }
         if self.halted.is_some() { return; }
         self.m.reboot();
+        self.after_reset();
         self.m.bus.set_reset_cause(esp_periph::RST_POWERON);
         self.origin = c6_cycle_of_ns(ns).saturating_sub(self.m.bus.cycles());
         self.power_ups += 1;
+    }
+
+    fn after_reset(&mut self) {
+        if let Some(f) = self.on_reset.as_mut() { f(&mut self.m); }
     }
 
     fn collect_console(&mut self) {

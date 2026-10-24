@@ -17,6 +17,8 @@ mod sd_image;
 mod oxidrive_board;
 #[path = "../../tests/services.rs"]
 mod services;
+#[path = "../../tests/hosted_slave.rs"]
+mod hosted_slave;
 use common::*;
 use esp32sim::cosim::{CoSim, Config};
 use esp_periph::sdmmc::{SdCmdError, SdDataError, SdDevice, SdResponse};
@@ -27,13 +29,12 @@ use std::cell::RefCell;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::rc::Rc;
 
-// The services' accounts, the network's clock and the C6's images, as in oxidrive_services.rs.
+// The services' accounts and the network's clock, as in oxidrive_services.rs.
 const SHARE_USER: &str = "esp32sim";
 const SHARE_PASS: &str = "esp32sim-smb";
 const BROKER_USER: &str = "esp32sim";
 const BROKER_PASS: &str = "esp32sim-mqtt";
 const EPOCH_S: u64 = 1_767_225_600;
-const FW: &str = "web/wasm/fw/public";
 /// LP_TSENS CTRL's OUT seeded to read 25 C: oxidrive vetoes every pass without a temperature
 /// (oxidrive_services.rs has the derivation).
 const TSENS_CTRL: u32 = 0x5012_f000;
@@ -69,16 +70,15 @@ fn endpoint(csv: &str, scheme: &str, default_port: u16) -> Endpoint {
     Endpoint { guest: SocketAddrV4::new(ip, port), path: path.to_string() }
 }
 
-/// The committed ESP-Hosted slave on a C6, the virtual access point and `nat` behind it
-/// (`OXIDRIVE_NTP_FROM_S` holds its NTP answers back until then, as in `oxidrive_rig`).
+/// The slave (`hosted_slave::Slave::from_env`) on a C6, the virtual access point and `nat` behind
+/// it (`OXIDRIVE_NTP_FROM_S` holds its NTP answers back until then, as in `oxidrive_rig`).
 fn hosted_slave(nat: Nat) -> esp32c6::Machine {
-    let read = |name: &str| std::fs::read(root().join(FW).join(name)).unwrap_or_else(|e| panic!("{FW}/{name}: {e}"));
+    let slave = hosted_slave::Slave::from_env();
     let mut c6 = esp32c6::machine([0x40, 0x4c, 0xca, 0x00, 0x11, 0x22], 4 << 20);
     esp_soc::SocBus::set_flash_size(&mut c6.bus, 4 << 20);
     c6.load_rom(&std::fs::read(rom("esp32c6_rev0")).unwrap()).unwrap();
-    for (off, f) in [(0, "c6-hosted-bootloader.bin"), (0x8000, "c6-hosted-ptable.bin"), (0xd000, "c6-hosted-otadata.bin"), (0x10000, "c6-hosted-slave.bin")] { c6.write_flash(off, &read(f)).unwrap(); }
-    // bb_init, the PHY's baseband calibration (riscv32-esp-elf-nm on network_adapter.elf)
-    c6.stubs.insert(0x420b_ac5c, 0);
+    slave.flash(&mut c6);
+    hosted_slave::stub_booted(&mut c6, &hosted_slave::known(&slave));
     let ap = esp_soc::wifi::ApConfig::parse(&format!("ssid=esp32sim,psk=esp32sim-pass,epoch={EPOCH_S}")).unwrap();
     esp_soc::SocBus::attach_wifi(&mut c6.bus, ap, Some(nat)).unwrap();
     let from_s: u64 = std::env::var("OXIDRIVE_NTP_FROM_S").ok().and_then(|v| v.parse().ok()).unwrap_or(0);

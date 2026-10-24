@@ -23,6 +23,8 @@ mod sd_image;
 mod oxidrive_board;
 #[path = "../../tests/services.rs"]
 mod services;
+#[path = "../../tests/hosted_slave.rs"]
+mod hosted_slave;
 #[path = "../../tests/oxidrive_rig.rs"]
 mod oxidrive_rig;
 use esp_soc::usb_host::car::{Car, CarCfg, CarFile, Recorded};
