@@ -418,6 +418,7 @@ fn car_write_latency(dir: &str, shared: bool, fixed: bool) {
     assert!(data_writes as u64 >= window_ns / GAP_NS - 2, "{data_writes} data WRITE(10)s timed in the window");
     assert!(report.writes.iter().all(|w| w.t.ok), "a WRITE(10) failed");
     if shared { assert!(!reads.is_empty(), "the firmware never read the card after the force"); } else { assert!(report.reader.iter().all(|o| o.start_ns < window.0 || o.start_ns >= window.1), "the firmware read the card in the control's window"); }
+    if std::env::var("LATENCY_REPORT").is_ok_and(|v| v == "1") { car_report(&mut r); }
     if fixed {
         let after: Vec<&str> = r.lines.iter().filter(|(t, _)| *t > forced).map(|(_, l)| l.as_str()).collect();
         let held_back = EVENTS.len() - 1;
@@ -427,6 +428,34 @@ fn car_write_latency(dir: &str, shared: bool, fixed: bool) {
         eprintln!("[latency] {label}: {}", checks.summary());
         if let Err(e) = checks.verdict() { panic!("{label}: {e}; {}", checks.summary()); }
     }
+}
+
+/// `LATENCY_REPORT=1`: what the firmware itself counted over the run, from its car report
+/// (oxidrive's `car_report`): idle past the minute after which it saves the report, cut the
+/// power, and read the boot's report from the broker when the next boot publishes it. Its lines
+/// from the C components (`H_SDIO_DRV: task still writing Rx data to queue!` and the rest) are
+/// counted from its log hook, which the console does not show past the start of `main`.
+fn car_report(r: &mut Rig) {
+    let idle = r.cs.now_ns + 80_000_000_000;
+    r.advance(idle).unwrap_or_else(|e| panic!("{e}"));
+    let cut = r.lines.len();
+    esp_soc::SocBus::request_reset(&mut r.cs.p4.bus, esp_periph::RST_POWERON);
+    let by = r.cs.now_ns + 120_000_000_000;
+    while r.cs.now_ns < by && !r.lines[cut..].iter().any(|(_, l)| l.contains("car_report: car 1/")) {
+        let t = r.cs.now_ns + 1_000_000_000;
+        r.advance(t).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let topic = format!("oxidrive/{}/car_report/1", r.id);
+    let got = r.mqtt.client.retained(&[&topic], std::time::Duration::from_secs(1)).unwrap();
+    let Some((_, doc)) = got.into_iter().next() else { eprintln!("[latency] no car report published"); return };
+    let j = esp_soc::json::parse_json(&doc).unwrap_or_else(|e| panic!("{e}: {doc}"));
+    let num = |path: &str| {
+        let mut at = &j;
+        for k in path.split('.') { match at.get(k) { Some(v) => at = v, None => return None } }
+        at.as_i64()
+    };
+    let fields = ["radio.rxq_full", "radio.sdio_errors", "radio.dead", "radio.link_lost", "net.smb_stalls", "net.mqtt_reconnects", "health.heap_min", "health.psram_min", "writes.max_us", "writes.slow"];
+    eprintln!("[latency] car report: {}", fields.iter().map(|f| format!("{f} {}", num(f).map_or("-".into(), |v| v.to_string()))).collect::<Vec<_>>().join(", "));
 }
 
 /// What a shared reader that shares a lock with the car's writes, and keeps libsmb2 off its core,

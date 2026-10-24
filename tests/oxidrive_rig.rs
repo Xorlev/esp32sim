@@ -159,6 +159,14 @@ pub fn rig_with(o: RigOpts) -> Rig {
     let (off, size) = oxidrive_board::nvs_partition(&table).expect("an NVS partition in partition-table.bin");
     p4.write_flash(off, &oxidrive_board::nvs_image(&csv_path, size)).unwrap();
     if std::env::var_os("ESP_EMU_DEBUG").is_some() { p4.set_debug(&esp_soc::DebugFlags::from_env()); }
+    // OXIDRIVE_P4_PROBES: functions of the firmware's app.elf whose every call is printed (`[fn]`).
+    if let Ok(names) = std::env::var("OXIDRIVE_P4_PROBES") {
+        let elf = esp_soc::elf::parse(&std::fs::read(format!("{dir}/app.elf")).unwrap_or_else(|e| panic!("{dir}/app.elf: {e}"))).unwrap();
+        for n in names.split(',').filter(|n| !n.is_empty()) {
+            let a = *elf.by_name.get(n).unwrap_or_else(|| panic!("no {n} in {dir}/app.elf"));
+            p4.fn_probes.insert(a & !1, n.to_string());
+        }
+    }
     if o.car { esp_soc::SocBus::attach_usb_host(&mut p4.bus, Default::default()).unwrap(); }
     // the firmware's id: the factory MAC's last three bytes (its main.rs)
     let mac = oxidrive_board::board_mac(&board_log);

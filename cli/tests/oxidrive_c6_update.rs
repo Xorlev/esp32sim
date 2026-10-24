@@ -209,3 +209,65 @@ fn external_oxidrive_c6_that_never_answers_reverts() {
     let state = c6_state(&r);
     assert!(state.contains("\"fw\":\"2.12.13\"") && state.contains("\"phase\":\"failed\""), "{state}");
 }
+
+/// What the firmware's own log ring holds about the hosted link, and its heap, a while after
+/// boot: the console does not carry the C components' lines past the start of `main`, the ring
+/// (`diag log`) does. With the committed 2.12.13 slave under a 2.13.1 host the ring holds the
+/// version mismatch; with a matching slave it does not. `OXIDRIVE_SLAVE_DIR` picks the slave.
+#[test]
+#[ignore = "needs OXIDRIVE_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxidrive_c6_link_report() {
+    let end = Rig::env_secs("OXIDRIVE_SECONDS", 120) * 1_000_000_000;
+    let mut r = c6_rig("oxidrive-c6-link.img", end);
+    let base = format!("oxidrive/{}", r.id);
+    let heard = r.mqtt.client.listen(&[&format!("{base}/diag/rsp")]).unwrap();
+    let t = r.cs.now_ns + 20_000_000_000;
+    r.run_to(t);
+    for (id, req) in [(1, r#"{"id":1,"cmd":"log","n":96}"#), (2, r#"{"id":2,"cmd":"heap"}"#)] {
+        r.mqtt.client.publish(&format!("{base}/diag/req"), req).unwrap();
+        let t = r.cs.now_ns + 3_000_000_000;
+        r.run_to(t);
+        for (_, p) in heard.messages().iter().filter(|(t, p)| t.ends_with("/diag/rsp") && p.contains(&format!(r#""id":{id},"#))) {
+            if id == 2 { eprintln!("[oxidrive] heap: {p}"); continue; }
+            for l in p.split("\",\"").filter(|l| ["H_SDIO", "transport", "mismatch", "rpc", "Co-proc", "slave", "RPC"].iter().any(|k| l.contains(k))) { eprintln!("[oxidrive] ring: {l}"); }
+        }
+    }
+    let p4: Vec<&str> = r.p4_lines().into_iter().filter(|l| l.contains("c6: runs")).collect();
+    eprintln!("[oxidrive] {p4:?}");
+}
+
+/// (c), through the owner's tooling: `bin/oxi-update c6-deploy` (`OXI_UPDATE` names it, its
+/// `OXI_OTA_KEY_DIR` the throwaway key) pointed at this rig's share and broker stages the slave,
+/// sends `c6_update`, follows the state document across the P4's restart, and exits 0 once the C6
+/// reports the pushed ELF hash. The emulator runs while the script waits.
+#[test]
+#[ignore = "needs OXIDRIVE_DIR (a build with c6_update), OXIDRIVE_C6_IMAGE, OXI_UPDATE, OXI_OTA_KEY_DIR, OXIDRIVE_SLAVE_KNOWN, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+fn external_oxi_update_c6_deploy_drives_it() {
+    let end = Rig::env_secs("OXIDRIVE_SECONDS", 400) * 1_000_000_000;
+    let mut r = c6_rig("oxidrive-c6-deploy.img", end);
+    let script = std::env::var("OXI_UPDATE").expect("set OXI_UPDATE to oxidrive's bin/oxi-update");
+    let image = std::env::var("OXIDRIVE_C6_IMAGE").expect("set OXIDRIVE_C6_IMAGE");
+    let out = std::env::temp_dir().join(format!("oxi-update-c6-{}.log", std::process::id()));
+    let mut child = std::process::Command::new(&script)
+        .args(["c6-deploy", &image, "--timeout", "900"])
+        .env("OXI_OTA_URL", format!("smb://127.0.0.1:{}/{}", r.smb.svc.port, r.smb.share))
+        .env("OXI_OTA_USER", SHARE_USER).env("OXI_SMB_PASS", SHARE_PASS)
+        .env("OXI_MQTT_HOST", "127.0.0.1").env("OXI_MQTT_PORT", r.mqtt.svc.port.to_string())
+        .env("OXI_MQTT_USER", BROKER_USER).env("OXI_MQTT_PASS", BROKER_PASS).env("OXI_DEVICE_ID", &r.id)
+        .stdin(std::process::Stdio::null()).stdout(std::fs::File::create(&out).unwrap()).stderr(std::process::Stdio::from(std::fs::File::create(out.with_extension("err")).unwrap()))
+        .spawn().unwrap_or_else(|e| panic!("{script}: {e}"));
+    let mark = r.lines.len();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() { break Some(s); }
+        if r.cs.now_ns >= end { let _ = child.kill(); break None; }
+        let t = r.cs.now_ns + 500_000_000;
+        r.run_to(t);
+    };
+    let said = format!("{}{}", std::fs::read_to_string(&out).unwrap_or_default(), std::fs::read_to_string(out.with_extension("err")).unwrap_or_default());
+    for l in said.lines().filter(|l| !l.starts_with("warning") && !l.trim_start().starts_with('|') && !l.trim().is_empty() && !l.contains("-->") && !l.trim_start().starts_with('=')) { eprintln!("[oxi-update] {}", l.split("sig=").next().unwrap()); }
+    show(&r, mark);
+    eprintln!("[oxidrive] the state's c6: {}", c6_state(&r));
+    r.report(5);
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "c6-deploy did not succeed");
+    assert!(said.contains("read back after the restart"), "c6-deploy did not report the C6 confirmed");
+}
