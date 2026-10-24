@@ -2655,6 +2655,89 @@ branch with `then(|| Held(m))`, and on oxidrive's main since; the runs above are
 - **One reclaim was measured**, forced by a pre-filled partition, at the part's assumed 45 ms erase.
   The datasheet's maximum is several times that; the run does not say how a car takes it.
 
+## The C6's own update
+
+oxidrive replaces its C6's ESP-Hosted slave over the air (`c6_update`, on oxidrive's hosted-2.13
+branch; not in this repository): the image staged on the share with a signed manifest, downloaded
+into PSRAM, verified, pushed through ESP-Hosted's slave OTA (`esp_hosted_slave_ota_begin`,
+`_write`, `_end`, `_activate`) into the C6's other slot, and met after the P4 restarts. The new
+slave confirms itself on the host's first RPC or, unconfirmed at its sixth boot or after 90 s,
+marks its own slot invalid and restarts into the previous one. `cli/tests/oxidrive_c6_update.rs`
+runs all of it on the rig of "Services". Inputs, none in this repository: `OXIDRIVE_DIR`, a build
+with `c6_update` whose OTA key is a throwaway one; `OXIDRIVE_C6_IMAGE` and `OXIDRIVE_C6_MANIFEST`,
+an ESP-Hosted 2.13.1 slave signed with that key; `OXIDRIVE_C6_BROKEN_IMAGE` and its manifest, a
+slave built for SPI that never answers the P4; `OXIDRIVE_SLAVE_KNOWN`, the slave builds'
+directories; and for the last test `OXI_UPDATE`, oxidrive's `bin/oxi-update`.
+
+### What the rig gained
+
+- **A slave other than the committed one** (`tests/hosted_slave.rs`): `OXIDRIVE_SLAVE_DIR` names
+  an ESP-IDF slave project or a flat build, else the committed 2.12.13 images are flashed. The
+  rig and the latency test load it.
+- **A stub that follows the image.** The PHY calibration (`bb_init`) is stubbed at its address in
+  one image, and an address in one image is some other function in another.
+  `Coproc::on_reset` (cli/src/cosim.rs) runs after every C6 reset, before its first instruction;
+  the rig reads the two otadata sectors as ESP-IDF v5.5's `bootloader_utility` picks a slot (the
+  highest sequence number not blank, invalid or aborted; `ota_0` when there is none), reads the
+  app descriptor's ELF hash in that slot, and stubs that image's `bb_init`.
+- **The log ring over MQTT** (`external_oxidrive_c6_link_report`). Past the start of `main` the
+  P4's console carries none of the C components' lines; the firmware's log ring does, and
+  `diag log` returns its tail.
+- **Function probes** (`OXIDRIVE_P4_PROBES`): every call to the named functions of `app.elf` is
+  printed as a `[fn]` line.
+- **A car report after a latency run** (`LATENCY_REPORT=1`): idle past the report's save, a power
+  cut, and the boot's report read from the broker.
+
+### The update
+
+From the command, in emulated time, with the committed 2.12.13 slave updated to a 2.13.1 one
+(1,212,416 bytes): the card taken at 1.2 s; the image downloaded, verified and pushed by 14.3 s
+(the C6's `esp_ota_begin` to its `end`, 9.6 s of 1400-byte writes); the P4 restarted and booted
+by 16.3 s; the C6 read at 19.3 s and the update confirmed at 19.4 s. The slave's guard said
+"boot 1 of 5" (its own restart after `activate`) and "boot 2 of 5" (the P4 resetting it at boot),
+then "host link confirmed" at the first RPC. One P4 reset in all.
+
+| Test | What happens |
+|---|---|
+| `external_oxidrive_updates_its_c6` | as above; the state document's `c6` reads `confirmed`, the new version and ELF hash |
+| `external_oxidrive_refuses_a_c6_image_it_cannot_verify` | one byte changed: refused on its CRC-32 after the download, card back; a forged signature: refused, card back; no `sig`: refused before the card is taken; no restart, the C6 keeps 2.12.13 |
+| `external_oxidrive_cancels_a_c6_update_before_the_push_ends` | `c6_update_cancel` sent once the card is taken: cancelled during the download (458,752 bytes in), card back, no restart |
+| `external_oxidrive_c6_that_never_answers_reverts` | the SPI slave is pushed and booted; the P4's `Wifi::new` fails and, retrying every 30 s, resets the C6 each time; at its sixth boot the guard marks the image invalid and the C6 returns to 2.12.13; the P4 records the update failed (`came back on 2.12.13`) 159 s after the command, with the one planned P4 reset |
+| `external_oxi_update_c6_deploy_drives_it` | `bin/oxi-update c6-deploy`, pointed at the rig's share and broker, stages, commands, follows across the restart, and exits 0 on the read-back ELF hash |
+
+### Host 2.13.1 against each slave
+
+oxidrive built three ways from one commit, ESP-Hosted 2.12.13, 2.13.1 with Rx double buffering
+(the default) and 2.13.1 without it, against the committed 2.12.13 slave and a 2.13.1 one.
+RawTP is `examples/esp-hosted-p4`'s receive test (the C6 sending) rebuilt with each host, 12 s
+of traffic with the SD bus timed; drops are `H_SDIO_DRV: task still writing Rx data to queue!`
+counted by the firmware's car report over a latency run (`LATENCY_REPORT=1`, the defaults of
+"Car write latency under a shared reader"); heap is `diag heap` 31 s after boot.
+
+| Host | Slave | Version warning | RawTP | Drops per latency run | PSRAM free at boot | Internal min at boot |
+|---|---|---|---|---|---|---|
+| 2.12.13 | 2.12.13 | none | 139.5 Mbit/s | 10 | 32,982,620 | 323,895 |
+| 2.13.1 | 2.12.13 | `Version mismatch`, no transport size | 139.5 | 0, 2 | 32,923,804 | 322,999 |
+| 2.13.1 | 2.13.1 | none; transport size 1536 matches | 139.5 | 6, 7 | 32,923,804 | 323,731 |
+| 2.13.1, single buffer | 2.12.13 | as above | 127.1 | 0 | 32,954,528 | 323,655 |
+| 2.13.1, single buffer | 2.13.1 | none | 127.1 | 0, 0 | 32,954,528 | 323,487 |
+
+In every row of the latency workload the car's commands were the same (none of 20 ms or more,
+data WRITE(10) p99 3.75-4.25 ms), the pass uploaded at 0.18 MB/s, and the firmware counted no
+SDIO errors, SMB stalls or lost links. Its internal low-water over the run was 77.5-77.8 KB.
+The car report's power-cut test (a forced window with read-backs) passes on each, with no drops counted in any. A probe on `hosted_malloc_align` through an
+archive window with read-backs (`OXIDRIVE_P4_PROBES`) saw the two 30,720-byte receive buffers
+allocated when the slave reported in, and no allocation after.
+
+### Limits
+
+- **The C6's flash erases instantly.** A 2.12 slave erases its whole 1920 KB slot inside `begin`;
+  on a board that takes seconds and may outlast the host's 15 s wait, a path the firmware handles
+  and this run does not exercise.
+- **The slave that never answers is one kind of failure.** A slave that answers RPCs but cannot
+  associate, and one that crashes before NVS starts, are not run.
+- **One or two runs a row.** The servers answer in host time, so two runs of one variant differ a little.
+
 ## Compared with a board
 
 The owner's oxidrive firmware (not in this repository) was booted from the same bootloader,

@@ -65,7 +65,10 @@ writes) is `tests/oxidrive_rig.rs`. `cli/tests/oxidrive_hazards.rs` runs a later
 (`OXIDRIVE_CURRENT_DIR`) against the car's hazards of milestone 4c: writes into a window, a car
 keeping its FAT, windows shorter than its poll, Linux's writeback, the fsck burst after a mount,
 and the die temperature after a restart (esp32p4.md, "The car's hazards").
-`cli/tests/oxidrive_latency.rs` times every car command while oxidrive's shared pass reads the
+`cli/tests/oxidrive_c6_update.rs` runs oxidrive's update of its C6's slave firmware end to end
+(`OXIDRIVE_C6_*`, esp32p4.md, "The C6's own update"); `tests/hosted_slave.rs` loads a slave other
+than the committed one (`OXIDRIVE_SLAVE_DIR`) and points the C6's PHY stub at whichever image it
+boots. `cli/tests/oxidrive_latency.rs` times every car command while oxidrive's shared pass reads the
 card (`OXIDRIVE_SD_PRG_US`, `LATENCY_*`; esp32p4.md, "Car write latency under a shared reader").
 `cli/tests/oxidrive_exfat.rs` runs oxidrive's exFAT builds (`OXIDRIVE_EXFAT_DIR`,
 `OXIDRIVE_EXFAT_TRACE_DIR`) against a car writing exFAT, and checks the SD_TRACE build's trace,
