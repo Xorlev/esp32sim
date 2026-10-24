@@ -1316,6 +1316,23 @@ written, one waiting for its reply, or the connect depended on the build's timin
 eb81ae4 passed it. `OXIDRIVE_NTP_FROM_S=20` puts the step inside the pass on every build, as the
 last row shows.
 
+**libsmb2 on a monotonic clock.** 39fe424 worked around the step: a session opened before the
+clock was set ran without a request timeout until it was. If NTP never answers, as after a boot
+away from home WiFi, that is the whole boot. teslausb-p4 3f445d4 vendors libsmb2 and measures its
+request timeouts and connect wait on `CLOCK_MONOTONIC` (esp_timer time since boot), so the
+timeout is on from the first request, and drops the workarounds. Fixtures `oxidrive-smb-followups`
+(39fe424) and `oxidrive-smb-monoclock` (3f445d4):
+
+| | 39fe424 | 3f445d4 |
+| --- | --- | --- |
+| the half-open test with `OXIDRIVE_NTP_FROM_S=100000`: NTP never answers | connected with `0s request timeout`; the faulted pass ends 120.2 s after the fault, at `STALL_BUDGET`, and the SMB thread never comes back; 2 passes after the restore find no session; 3 of 8 | connected with `60s request timeout`; 63.6 s; reconnected 269.5 s; 8 of 8 at 309.8 s |
+| the latency test with `OXIDRIVE_NTP_FROM_S=20`: the step mid-pass | passes, the session's timeout taken mid-pass | passes with `60s request timeout` from the connect: one session, no `Bad SMB2 signature` in smbd's log |
+
+On 3f445d4 the share-fault tests, cut, half-open, the update tests in `oxidrive_services.rs`,
+the latency test and the car report's power-cut and update tests pass as on 39fe424. The NTLMv2
+timestamp is still `time()`; in the run where NTP never answered, smbd accepted every session
+with the wall clock at 1970.
+
 **An update in flight.** No test makes an SMB call during an update: `Ota::busy` keeps windows,
 passes, crash uploads and trace uploads from starting, so the courier's new refusal during a
 job is not reachable from the rig. The update tests in `oxidrive_services.rs` pass on 39fe424.
