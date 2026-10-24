@@ -83,6 +83,29 @@ fn ota_slots(flash: &[u8]) -> [usize; 2] {
     slots
 }
 
+/// The two otadata entries (0xd000 and 0xe000): their sequence numbers and states, `None` for a
+/// blank one.
+pub fn otadata(flash: &[u8]) -> [Option<(u32, u32)>; 2] {
+    [0xd000, 0xe000].map(|off: usize| {
+        let e = flash.get(off..off + 32)?;
+        let seq = u32::from_le_bytes(e[0..4].try_into().ok()?);
+        (seq != u32::MAX).then(|| (seq, u32::from_le_bytes(e[24..28].try_into().unwrap())))
+    })
+}
+
+/// Erase the otadata sector holding the lower sequence number, as on a C6 whose bootloader never
+/// wrote the entry for the image it first booted: the entry the last update wrote is then the
+/// only one, and ESP-IDF refuses a rollback from it. Returns the sector erased.
+pub fn blank_older_otadata(c6: &mut esp32c6::Machine) -> Option<usize> {
+    let [a, b] = otadata(&c6.bus.flash);
+    let off = match (a, b) {
+        (Some((sa, _)), Some((sb, _))) => if sa < sb { 0xd000 } else { 0xe000 },
+        _ => return None,
+    };
+    c6.write_flash(off, &[0xff; 0x1000]).unwrap();
+    Some(off)
+}
+
 /// The slot the bootloader boots, as ESP-IDF v5.5's bootloader_utility picks it: the otadata
 /// entry with the highest sequence number among those not blank, invalid (3) or aborted (4), its
 /// slot `(seq - 1) % 2`; `ota_0` when there is none. CRCs are not checked: only ESP-IDF writes

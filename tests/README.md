@@ -59,7 +59,9 @@ fixture is dropped (setup in [esp32p4.md](../docs/esp32p4.md), "Services"). Its 
 everywhere with `sh` and `sleep` (readiness, early exit, timeout, the group gone after the drop,
 the configurations); `external_samba_and_mosquitto_serve_a_test_client` needs the servers.
 `cli/tests/oxidrive_services.rs` uses it for the owner's oxidrive firmware (`OXIDRIVE_DIR`):
-its broker and NAS, an archive window with the car, and an unsigned update refused. The rig they
+its broker and NAS, an archive window with the car, and an unsigned update refused; the update
+tests that need the card taken sign their manifest with the throwaway key in `OXI_OTA_KEY_DIR`
+(`openssl`). The rig they
 share (the P4 and its C6, the services, the forwards, a car on the USB port, a log of the card's
 writes) is `tests/oxidrive_rig.rs`. `cli/tests/oxidrive_hazards.rs` runs a later build
 (`OXIDRIVE_CURRENT_DIR`) against the car's hazards of milestone 4c: writes into a window, a car
@@ -67,8 +69,9 @@ keeping its FAT, windows shorter than its poll, Linux's writeback, the fsck burs
 and the die temperature after a restart (esp32p4.md, "The car's hazards").
 `cli/tests/oxidrive_c6_update.rs` runs oxidrive's update of its C6's slave firmware end to end
 (`OXIDRIVE_C6_*`, esp32p4.md, "The C6's own update"); `tests/hosted_slave.rs` loads a slave other
-than the committed one (`OXIDRIVE_SLAVE_DIR`) and points the C6's PHY stub at whichever image it
-boots. `cli/tests/oxidrive_latency.rs` times every car command while oxidrive's shared pass reads the
+than the committed one (`OXIDRIVE_SLAVE_DIR`), points the C6's PHY stub at whichever image it
+boots, and reads or erases the C6's otadata; the rig can rename or rekey the C6's access point
+mid-run. `cli/tests/oxidrive_latency.rs` times every car command while oxidrive's shared pass reads the
 card (`OXIDRIVE_SD_PRG_US`, `LATENCY_*`; esp32p4.md, "Car write latency under a shared reader").
 `cli/tests/oxidrive_exfat.rs` runs oxidrive's exFAT builds (`OXIDRIVE_EXFAT_DIR`,
 `OXIDRIVE_EXFAT_TRACE_DIR`) against a car writing exFAT, and checks the SD_TRACE build's trace,

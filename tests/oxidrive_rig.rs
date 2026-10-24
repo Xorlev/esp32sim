@@ -245,6 +245,23 @@ impl Rig {
         for l in &p4[p4.len().saturating_sub(last)..] { eprintln!("[oxidrive]   {l}"); }
     }
     pub fn env_secs(name: &str, default: u64) -> u64 { std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
+
+    /// Rename the access point. Under a name the firmware does not know the C6 finds no network
+    /// to join, while its scans still answer; the old name back restores it.
+    pub fn set_ap_ssid(&mut self, ssid: &str) {
+        eprintln!("[oxidrive] t={:.3} s: the access point is now {ssid:?}", self.cs.now_ns as f64 / 1e9);
+        let mut c = self.cs.c6.borrow_mut();
+        c.m.bus.periph.wifi_mac.link.ap_mut().expect("an access point on the C6's radio").cfg.ssid = ssid.into();
+    }
+
+    /// Give the access point another pairwise master key, as if its passphrase had changed: the
+    /// C6 still finds it and is refused at the 4-way handshake. Returns the key it had, for
+    /// `set_ap_pmk` to put back.
+    pub fn set_ap_pmk(&mut self, pmk: [u8; 32]) -> [u8; 32] {
+        eprintln!("[oxidrive] t={:.3} s: the access point's key changed", self.cs.now_ns as f64 / 1e9);
+        let mut c = self.cs.c6.borrow_mut();
+        std::mem::replace(&mut c.m.bus.periph.wifi_mac.link.ap_mut().expect("an access point on the C6's radio").wpa.pmk, pmk)
+    }
 }
 
 /// The car on the P4's USB port, through the pair; the console lines kept as `run_to` keeps them.

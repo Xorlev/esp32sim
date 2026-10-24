@@ -1163,14 +1163,16 @@ committed):
   wants understanding before the window changes: a burst the 5840-byte window never let through
   meets something on the way (the C6's buffers, the access point's queue, the NAT).
 
-**An update** (`external_oxidrive_refuses_an_unsigned_update`, goal 4, not passing). oxidrive
-fetches an update from the share and checks a signature only the owner's key makes, so the test
-can only exercise the refusal: a manifest with the image's true size, CRC-32 and SHA-256 and a
-signature no key made. The firmware checks the manifest, takes the card for the update, and then
-stops: it hashes the download with the SHA accelerator in DMA mode, which on the P4 runs through
-the AXI GDMA (IDF v5.5.3 `mbedtls/port/crypto_shared_gdma`, `SOC_AXI_GDMA_SUPPORTED`), not
-modelled, so SHA_BUSY (0x50091018) never clears and core 0 spins on it. The card stays with the
-application. mbedTLS's AES in DMA mode goes the same way on the P4.
+**An update** (`external_oxidrive_refuses_an_unsigned_update`, goal 4). A manifest with the
+image's true size, CRC-32 and SHA-256 and a signature no key made. From oxidrive's hosted-2.13
+review fixes the firmware checks the manifest's signature in software before it takes the card,
+so it refuses this one 1 s after the command and the card never leaves the car; that passes.
+Before them it took the card and then stopped: it hashes the download with the SHA accelerator
+in DMA mode, which on the P4 runs through the AXI GDMA (IDF v5.5.3
+`mbedtls/port/crypto_shared_gdma`, `SOC_AXI_GDMA_SUPPORTED`), not modelled, so SHA_BUSY
+(0x50091018) never clears and core 0 spins on it. A validly signed update still stops there,
+after the take (`stage_update(.., true)`, signed with the fixture's throwaway key); mbedTLS's
+AES in DMA mode goes the same way on the P4.
 
 **Commands sent while it is away.** From teslausb-p4 cfdcace oxidrive keeps a persistent MQTT
 session (clean session off, its device id as the client id), so the broker queues QoS 1
@@ -2661,13 +2663,15 @@ oxidrive replaces its C6's ESP-Hosted slave over the air (`c6_update`, on oxidri
 branch; not in this repository): the image staged on the share with a signed manifest, downloaded
 into PSRAM, verified, pushed through ESP-Hosted's slave OTA (`esp_hosted_slave_ota_begin`,
 `_write`, `_end`, `_activate`) into the C6's other slot, and met after the P4 restarts. The new
-slave confirms itself on the host's first RPC or, unconfirmed at its sixth boot or after 90 s,
-marks its own slot invalid and restarts into the previous one. `cli/tests/oxidrive_c6_update.rs`
-runs all of it on the rig of "Services". Inputs, none in this repository: `OXIDRIVE_DIR`, a build
-with `c6_update` whose OTA key is a throwaway one; `OXIDRIVE_C6_IMAGE` and `OXIDRIVE_C6_MANIFEST`,
-an ESP-Hosted 2.13.1 slave signed with that key; `OXIDRIVE_C6_BROKEN_IMAGE` and its manifest, a
-slave built for SPI that never answers the P4; `OXIDRIVE_SLAVE_KNOWN`, the slave builds'
-directories; and for the last test `OXI_UPDATE`, oxidrive's `bin/oxi-update`.
+slave keeps itself once the P4 confirms it (a peer-data message the P4 sends when its WiFi and
+the NAS are up) or, unconfirmed at its sixth boot, 90 s after a boot with no RPC or 300 s after
+one with no confirmation, marks its own slot invalid and restarts into the previous one.
+`cli/tests/oxidrive_c6_update.rs` runs all of it on the rig of "Services". Inputs, none in this
+repository: `OXIDRIVE_DIR`, a build with `c6_update` whose OTA key is a throwaway one;
+`OXIDRIVE_C6_IMAGE` and `OXIDRIVE_C6_MANIFEST`, an ESP-Hosted 2.13.1 slave signed with that key;
+`OXIDRIVE_C6_BROKEN_IMAGE` and its manifest, a slave built for SPI that never answers the P4;
+`OXIDRIVE_SLAVE_KNOWN`, the slave builds' directories; and for the last test `OXI_UPDATE`,
+oxidrive's `bin/oxi-update`.
 
 ### What the rig gained
 
@@ -2687,23 +2691,44 @@ directories; and for the last test `OXI_UPDATE`, oxidrive's `bin/oxi-update`.
   printed as a `[fn]` line.
 - **A car report after a latency run** (`LATENCY_REPORT=1`): idle past the report's save, a power
   cut, and the boot's report read from the broker.
+- **The C6's otadata and its network, changed mid-run** (`hosted_slave::otadata`,
+  `blank_older_otadata`; `Rig::set_ap_ssid`, `set_ap_pmk`): the older otadata entry erased, as on
+  a C6 whose bootloader never wrote one; the access point renamed, so the C6 finds no network, or
+  given another key, so the 4-way handshake fails.
+- **Signed P4 updates** (`oxidrive_services`): a manifest the firmware refuses before taking the
+  card needs a signature it accepts to reach the take, so the update tests that need the card
+  sign with the throwaway key in `OXI_OTA_KEY_DIR`, by `openssl`.
 
 ### The update
 
 From the command, in emulated time, with the committed 2.12.13 slave updated to a 2.13.1 one
-(1,212,416 bytes): the card taken at 1.2 s; the image downloaded, verified and pushed by 14.3 s
-(the C6's `esp_ota_begin` to its `end`, 9.6 s of 1400-byte writes); the P4 restarted and booted
-by 16.3 s; the C6 read at 19.3 s and the update confirmed at 19.4 s. The slave's guard said
-"boot 1 of 5" (its own restart after `activate`) and "boot 2 of 5" (the P4 resetting it at boot),
-then "host link confirmed" at the first RPC. One P4 reset in all.
+(1,213,584 bytes): the card taken at 1.2 s; the image downloaded, verified and pushed by 14.3 s
+(the C6's `esp_ota_begin` to its `end`, 9.5 s of 1400-byte writes); the P4 restarted, the card
+still taken, and booted by 16.3 s; the C6 read at 19.3 s; the P4's confirmation sent once its
+WiFi and the NAS were up, kept by the slave, and the update confirmed at 23.4 s. The slave's
+guard said "boot 1 of 5" (its own restart after `activate`) and "boot 2 of 5" (the P4 resetting
+it at boot), then "confirmed by the host". One P4 reset in all. The build before the review fixes
+confirmed at 19.4 s, on the first RPC, and gave the card back to the car two seconds before the
+restart took it again.
 
 | Test | What happens |
 |---|---|
 | `external_oxidrive_updates_its_c6` | as above; the state document's `c6` reads `confirmed`, the new version and ELF hash |
-| `external_oxidrive_refuses_a_c6_image_it_cannot_verify` | one byte changed: refused on its CRC-32 after the download, card back; a forged signature: refused, card back; no `sig`: refused before the card is taken; no restart, the C6 keeps 2.12.13 |
+| `external_oxidrive_refuses_a_c6_image_it_cannot_verify` | one byte changed: refused on its CRC-32 after the download, card back; a forged signature and no `sig`: refused before the card is taken; `c6_update 2.12.14-oxi1` under the 2.13 host: refused on the version, the share not read; no restart, the C6 keeps 2.12.13 |
 | `external_oxidrive_cancels_a_c6_update_before_the_push_ends` | `c6_update_cancel` sent once the card is taken: cancelled during the download (458,752 bytes in), card back, no restart |
 | `external_oxidrive_c6_that_never_answers_reverts` | the SPI slave is pushed and booted; the P4's `Wifi::new` fails and, retrying every 30 s, resets the C6 each time; at its sixth boot the guard marks the image invalid and the C6 returns to 2.12.13; the P4 records the update failed (`came back on 2.12.13`) 159 s after the command, with the one planned P4 reset |
+| `external_oxidrive_c6_takes_a_good_image_after_one_that_reverted` | the SPI slave reverts as above, then the good slave counts its boots from 1 and is confirmed |
+| `external_oxidrive_c6_takes_a_good_image_after_two_that_reverted` | two pushes of the SPI slave, each with the whole trial and reverted, then the good slave, confirmed |
+| `external_oxidrive_c6_reverts_with_the_other_otadata_entry_blank` | after the SPI slave's push the sector with the older otadata entry is erased; at the sixth boot ESP-IDF refuses the rollback (`ESP_ERR_OTA_ROLLBACK_FAILED`), the guard sets the other slot to boot itself, and the P4 records `came back on 2.12.13` 159 s after the command |
+| `external_oxidrive_c6_that_cannot_associate_reverts`, `external_oxidrive_c6_refused_by_the_access_point_reverts` | the good slave, with the access point renamed or rekeyed from the push on: the slave answers the P4, which never has WiFi, never confirms it, and restarts its radio every 121 s; at the sixth boot the guard reverts the image, 501 s after the command, with five P4 resets |
 | `external_oxi_update_c6_deploy_drives_it` | `bin/oxi-update c6-deploy`, pointed at the rig's share and broker, stages, commands, follows across the restart, and exits 0 on the read-back ELF hash |
+
+The same tests against the build before the review fixes (its slave confirmed itself on the first
+RPC and kept one boot count for every image): a good slave after one that reverted reverts at its
+own first boot ("unconfirmed after the boot limit"), and so after two; with the older otadata entry
+erased, the guard logs `revert failed (ESP_ERR_OTA_ROLLBACK_FAILED); staying on this image` at
+every boot and the C6 never comes back; with the access point renamed the image is confirmed 5 s
+later, before the C6 has joined any network; and the forged manifest takes the card first.
 
 ### Host 2.13.1 against each slave
 
@@ -2907,8 +2932,8 @@ the update refusal (goal 4) still stops on SHA's DMA mode ("An update").
    SYN-ACK, and the round trip taken apart (where the 10.7 ms go) before the rate is compared
    with the board's; first why a window of 16384 or 65535 bytes stalls the first 1.5 MB write
    ("Upload throughput").
-8. **The AXI GDMA** for SHA's (and AES's) DMA mode, which the update path and TLS need, then
-   `external_oxidrive_refuses_an_unsigned_update` should pass.
+8. **The AXI GDMA** for SHA's (and AES's) DMA mode, which the update path and TLS need, then a
+   signed P4 update can run past the take.
 10. **The owner's radio wedge** (carried from 4b's plan): a one-shot stub that makes the P4's
    `hosted_malloc_align` (esp_hosted's `port_esp_hosted_host_os.c`) return NULL at its Nth call
    would reproduce the board's wedge chain end to end; the fault hooks show where such a chain

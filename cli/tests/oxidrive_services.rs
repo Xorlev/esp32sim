@@ -354,46 +354,68 @@ fn crc32(data: &[u8]) -> u32 {
     !data.iter().fold(!0u32, |c, &b| (0..8).fold(c ^ b as u32, |c, _| if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 }))
 }
 
-/// Goal 4 of milestone 4b, the refusal half: an update fetched over the same SMB path, whose
-/// manifest names the image's true size, CRC-32 and SHA-256 but carries a signature no key made.
-/// oxidrive should take the card for the update, download and check the image, refuse it on the
-/// signature, and give the card back; the running image stays. A signed image needs the owner's
-/// private key, which no test uses. It does not pass yet: the firmware hashes the download with
-/// the SHA accelerator in DMA mode, which on the P4 goes through the AXI GDMA (not modelled), so
-/// SHA_BUSY (0x50091018) never clears and the update stops after taking the card.
 /// An update for `version` on the share: an image and a manifest naming its true size, CRC-32
-/// and SHA-256, with a signature no key made. The checks pass and the card is taken; the
-/// signature fails only after the download.
-fn stage_update(r: &Rig, version: &str) {
+/// and SHA-256. `signed`: signed with the throwaway key in `OXI_OTA_KEY_DIR`, the one the
+/// fixture's build embeds, so the manifest verifies and the card is taken; the download is
+/// not an image and fails later. Otherwise the signature is one no key made, refused before the
+/// card is taken.
+fn stage_update(r: &Rig, version: &str, signed: bool) {
     use esp_soc::usb_host::fat32::clip_bytes;
     let file = format!("oxidrive-{version}.bin");
     let image = clip_bytes("not an image", 256 << 10);
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    let sig = hex(&[sha256(b"r"), sha256(b"s")].concat());
+    let statement = format!("oxidrive-ota-v1\nversion={version}\nsize={}\nsha256={}\n", image.len(), hex(&sha256(&image)));
+    let sig = if signed { hex(&sign_with_test_key(statement.as_bytes())) } else { hex(&[sha256(b"r"), sha256(b"s")].concat()) };
     let dir = r.smb.path().join("oxidrive-ota");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(&file), &image).unwrap();
     std::fs::write(dir.join("manifest"), format!("version={version}\nfile={file}\nsize={}\ncrc32={:08x}\nsha256={}\nsig={sig}\n", image.len(), crc32(&image), hex(&sha256(&image)))).unwrap();
 }
 
+/// ECDSA P-256 over SHA-256 of `msg` with the throwaway key in `OXI_OTA_KEY_DIR`, by openssl, as
+/// the manifest carries it: `r || s`.
+fn sign_with_test_key(msg: &[u8]) -> [u8; 64] {
+    let dir = std::env::var("OXI_OTA_KEY_DIR").expect("set OXI_OTA_KEY_DIR to the throwaway OTA key the fixture's build embeds");
+    let path = tmp("ota-statement");
+    std::fs::write(&path, msg).unwrap();
+    let out = std::process::Command::new("openssl").args(["dgst", "-sha256", "-sign"]).arg(format!("{dir}/ota-signing-key.pem")).arg(&path).output()
+        .unwrap_or_else(|e| panic!("openssl: {e}"));
+    assert!(out.status.success(), "openssl: {}", String::from_utf8_lossy(&out.stderr));
+    // SEQUENCE { INTEGER r, INTEGER s }, each big-endian, minimal, perhaps with a leading zero.
+    let der = out.stdout;
+    assert_eq!(der.first(), Some(&0x30), "not a DER signature");
+    let (mut at, mut rs) = (2, [0u8; 64]);
+    for half in rs.chunks_mut(32) {
+        assert_eq!(der[at], 0x02, "not a DER integer");
+        let len = der[at + 1] as usize;
+        let mut v = &der[at + 2..at + 2 + len];
+        while v.len() > 32 && v[0] == 0 { v = &v[1..]; }
+        half[32 - v.len()..].copy_from_slice(v);
+        at += 2 + len;
+    }
+    rs
+}
+
+/// Goal 4 of milestone 4b, the refusal half: an update whose manifest names the image's true
+/// size, CRC-32 and SHA-256 but carries a signature no key made. oxidrive refuses it on the
+/// signature over the manifest alone, before the card is taken, and nothing boots.
 #[test]
-#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto; fails until the P4's AXI GDMA serves SHA's DMA mode"]
+#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
 fn external_oxidrive_refuses_an_unsigned_update() {
     let mut r = rig("oxidrive-ota.img", 4 << 30, false);
     let end = Rig::env_secs("OXIDRIVE_SECONDS", 60) * 1_000_000_000;
     while r.cs.now_ns < end && !r.p4_has("session ready") { let t = r.cs.now_ns + 1_000_000_000; r.run_to(t); }
     assert!(r.p4_has("session ready"), "no MQTT session");
     let version = "0.1.0-0000001";
-    stage_update(&r, version);
+    stage_update(&r, version, false);
     r.mqtt.client.publish(&format!("oxidrive/{}/cmd", r.id), &format!("update {version}")).unwrap();
     while r.cs.now_ns < end && !r.p4_has("signature did not verify") { let t = r.cs.now_ns + 1_000_000_000; r.run_to(t); }
     let t = r.cs.now_ns + 3_000_000_000;
     r.run_to(t);
     for l in r.p4_lines().iter().filter(|l| l.contains("ota") || l.contains("supervisor")) { eprintln!("[oxidrive]   {l}"); }
     r.report(10);
-    assert!(r.p4_has("supervisor: card taken for a firmware update"), "the update never took the card");
-    assert!(r.p4_has("signature did not verify"), "not refused on the signature (SHA's DMA mode on the P4 is not modelled)");
-    assert!(r.p4_has("supervisor: card returned to the car"), "the card did not come back");
+    assert!(r.p4_has("signature did not verify"), "not refused on the signature");
+    assert!(!r.p4_has("supervisor: card taken for a firmware update"), "the forged update took the card");
     assert_eq!(r.cs.summary.p4_resets, 0, "nothing booted");
 }
 
@@ -509,12 +531,12 @@ fn ota_state(r: &mut Rig, phase: &str, secs: u64) -> Option<String> {
 /// `cancelled`. Then the same update, sent after the cancel, takes the card: the cancel withdrew
 /// only what came before it, and without it the update would have gone ahead.
 #[test]
-#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR (a build with update_cancel), ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR (a build with update_cancel), OXI_OTA_KEY_DIR (the throwaway key that build embeds) and openssl, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
 fn external_oxidrive_cancel_queued_behind_an_update_now_wins() {
     let end = Rig::env_secs("OXIDRIVE_SECONDS", 150) * 1_000_000_000;
     let mut r = queue_rig("oxidrive-cancel.img", end);
     let version = "0.1.0-0000002";
-    stage_update(&r, version);
+    stage_update(&r, version, true);
     let mark = r.lines.len();
     away(&mut r, |mq, cmd| {
         mq.publish_v5(cmd, &format!("update {version} now"), Some(300)).unwrap();
@@ -542,12 +564,12 @@ fn external_oxidrive_cancel_queued_behind_an_update_now_wins() {
 /// the expiry. The broker drops it; `update_status`, published after it, is delivered and shows
 /// the queue reached the device.
 #[test]
-#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR (a build with a persistent MQTT session), ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR (a build with a persistent MQTT session), OXI_OTA_KEY_DIR (the throwaway key that build embeds) and openssl, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
 fn external_oxidrive_never_sees_an_update_now_that_expired_while_it_was_away() {
     let end = Rig::env_secs("OXIDRIVE_SECONDS", 120) * 1_000_000_000;
     let mut r = queue_rig("oxidrive-expired.img", end);
     let version = "0.1.0-0000003";
-    stage_update(&r, version);
+    stage_update(&r, version, true);
     let mark = r.lines.len();
     away(&mut r, |mq, cmd| {
         mq.publish_v5(cmd, &format!("update {version} now"), Some(2)).unwrap();
@@ -567,16 +589,17 @@ fn external_oxidrive_never_sees_an_update_now_that_expired_while_it_was_away() {
 
 /// A cancel that arrives while the update holds the card: `update V now` sent while connected,
 /// `update_cancel V` once the card is taken. The supervisor stops the update and gives the card
-/// back at once. The download itself never finishes here (the P4 model does not serve SHA's DMA
-/// mode; see `external_oxidrive_refuses_an_unsigned_update`), so the checks the SMB thread makes
-/// itself, between reads and before it sets the boot partition, are not reached.
+/// back at once. The download itself never finishes here: the firmware hashes it with the SHA
+/// accelerator in DMA mode, which on the P4 goes through the AXI GDMA (not modelled), so
+/// SHA_BUSY (0x50091018) never clears. The checks the SMB thread makes itself, between reads and
+/// before it sets the boot partition, are not reached.
 #[test]
-#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR (a build with update_cancel), ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
+#[ignore = "needs the oxidrive images and nvs.csv under OXIDRIVE_DIR (a build with update_cancel), OXI_OTA_KEY_DIR (the throwaway key that build embeds) and openssl, ESP-IDF's nvs_partition_gen.py, samba and mosquitto"]
 fn external_oxidrive_cancel_gives_back_the_card_an_update_holds() {
     let end = Rig::env_secs("OXIDRIVE_SECONDS", 120) * 1_000_000_000;
     let mut r = queue_rig("oxidrive-cancel-writing.img", end);
     let version = "0.1.0-0000004";
-    stage_update(&r, version);
+    stage_update(&r, version, true);
     let cmd = format!("oxidrive/{}/cmd", r.id);
     let mark = r.lines.len();
     r.mqtt.client.publish_v5(&cmd, &format!("update {version} now"), Some(300)).unwrap();
