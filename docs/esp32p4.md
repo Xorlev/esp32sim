@@ -1265,6 +1265,61 @@ one's close sends the FIN; a client that half-closes reads 0 from the relay at o
 10 s for nothing before), as `a_relay_passes_goes_deaf_one_way_and_cuts` now checks. The cut
 test never noticed, because `cut` closes everything held.
 
+**A share that misbehaves** (`cli/tests/oxidrive_share_faults.rs`). The same car as `smb_fault`
+(saved events, then a RecentClips clip written every 500 ms, so the firmware archives in shared
+passes a minute apart, the first forced over MQTT), against a share that misbehaves in one way
+per test. New knobs: `Relay::start_smb` reads what the client sends as SMB2 messages, and a
+`Trap` closes the connection at the first matching request, before passing it on or, with
+`after`, once it has been carried out, so its reply is lost (`smb2::renames_to`, `smb2::is_create`;
+`a_relay_trap_ends_a_connection_at_one_smb2_request` checks it in CI). `nat::Shape`, set through
+`RigOpts::smb_rate` and `smb_connect_delay_ms`, holds the share's port to a byte rate each way
+and delays its handshakes, in emulated time, so the figures do not move with the host's load.
+`OXIDRIVE_NTP_FROM_S` (`VirtualNet::ntp_from_us`) holds the network's NTP answers back, which
+places the clock's first step. Each test asserts what a firmware that handles the fault does;
+on an older build it fails, and its printout shows what that build did instead. Results on
+teslausb-p4 eb81ae4 (branch smb-followups before the second review) and on 39fe424:
+
+| test | eb81ae4 | 39fe424 |
+| --- | --- | --- |
+| `keeps_its_checksums_when_a_manifest_save_dies_at_the_rename`: after a clean pass, the first rename onto `.oxidrive-index.tsv` ends the connection unforwarded; a power cut; a reboot | the manifest after the reboot has no checksum for the 3 events archived before the cut | `index: no manifest; 4 entries from .oxidrive-index.tsv.part (4), .oxidrive-index.tsv.prev (3)`; all 3 checksums kept |
+| `does_not_save_over_a_manifest_too_large_to_load`: 4,239,010 bytes of rows on the share | `index: 4239010 bytes is not a manifest, ignoring it`, then saved over: 174 bytes | not loaded, said so; the file unchanged; the events archived |
+| `keeps_the_rows_of_a_manifest_with_a_bad_byte`: 500 rows and one with 0xff 0xfe in its path | `index: not text, continuing without it`; 0 of the 500 rows kept | 500 of 500 kept |
+| `shared_pass_ends_when_its_smb_link_goes_half_open` (`oxidrive_services.rs`, now also: no pass after the restore finds no session) | f08bb82: the faulted pass ends 240.2 s after the fault and nothing reconnects; 3 of 8. eb81ae4: 63.0 s; no pass without a session after the restore; 5 of 8 by the 360 s deadline, its first pass having met the clock's first step and backed off | 62.9 s; reconnected 263.2 s; 8 of 8 at 301.3 s |
+| `verifies_a_large_clip_over_a_slow_link`: 100 kB/s, a 20 MiB event and a small one | the resumed part's read-back is given up at 120 s (556.6 s); the next pass finds the SMB thread still digesting (`no SMB session`) and backs off; the one after re-verifies and is given up at 120 s again (798.6 s); not on the share by 900 s | read back in one call over 239 s; archived at 556.0 s with its checksum; no call given up, no late-reply warning |
+| `backs_off_from_a_nas_that_drops_every_session`: every session ended at its first CREATE for 300 s | 5 passes lost, 60-61 s apart; 1 clip deferred on strikes; all archived at 402.7 s | 2 passes lost, 120 s apart; none deferred; all archived at 471.1 s |
+| `waits_out_a_clip_whose_stat_is_refused`: one event directory on the share mode 000 | refused in 6 of 6 passes, never deferred; `backlog_retry` not published | refused in 3 passes, then deferred; state `backlog` 1, `backlog_retry` 0 |
+| `replaces_an_archived_copy_that_does_not_match`: the event's rename passed on and its reply lost, a byte of the copy flipped | `does not match its part's checksum; recording none`; the damaged copy stays, with no checksum | removed at 147.7 s, sent again, on the share byte for byte at 198.3 s with its checksum |
+| `connects_with_its_request_timeout_off`: `SMB_TIMEOUT=0` builds, 350 ms handshakes, 10 boots | 4 of 10 first connects fail, `Timeout expired and no connection exists` | 0 of 10 |
+| the half-open test, `OXIDRIVE_NTP_FROM_S=20`: the first session opens before the clock is set | 9641a73 (the request timeout off until the session ends): the faulted pass ends 120.2 s after the fault, the SMB thread never comes back, 3 of 8 | the session takes its timeout at its first call after the clock is set (70.1 s); 62.9 s; 8 of 8 at 300.5 s |
+| `oxidrive_latency.rs`, the shared-pass test, `OXIDRIVE_NTP_FROM_S=20` | the pass never ends, 1 of 2 events (fc6a26f: `SMB2_STATUS_IO_TIMEOUT` at 41.3 s, 1 of 2) | connected with `0s request timeout`, the timeout taken mid-pass; 2 of 2 |
+
+The manifest test loses the session at the rename into place rather than having it refused:
+samba refuses that rename only by refusing the unlink before it, which needs the directory's
+write permission too, and the delete-pending state that refuses one without the other needs a
+client holding the manifest open with FILE_SHARE_DELETE, which neither libsmb2 nor smbclient
+opens with. The state on the share is the same. eb81ae4 passes the half-open test's new check
+because its 60 s request timeout ends the stuck call before the 120 s budget, so the replies a
+stuck worker left are never read there; the courier's host test is the proof of that fix. Each
+test runs about 5 to 15 minutes of emulated time, the slow link longer.
+
+**The latency test and the clock's first step.** On fb6b483 the shared-pass latency test failed
+in every run, and on fc6a26f in most, with the first upload stalled 60 s; smbd logged `Bad SMB2
+(sign_algo_id=1) signature for message` once in each of five failing runs checked and not in the
+passing one. The SMB stream, captured at the NAT, held a 64 KiB WRITE whose last 234 bytes were
+the next request's NetBIOS and SMB2 headers: the device sent a request short and the next one
+after it. Another failing run timed a write out 6 s after connecting.
+libsmb2 times requests by `time()`, and its sweep (`smb2_timeout_pdus`) takes an expired request
+out of the send queue even when it is half written. The test forces a pass 9 s after boot, and
+the clock's first SNTP step, which moves `time()` on by decades, lands within a few seconds of
+it: every request queued before the step expires at once. Whether the step met a request half
+written, one waiting for its reply, or the connect depended on the build's timing, which is why
+eb81ae4 passed it. `OXIDRIVE_NTP_FROM_S=20` puts the step inside the pass on every build, as the
+last row shows.
+
+**An update in flight.** No test makes an SMB call during an update: `Ota::busy` keeps windows,
+passes, crash uploads and trace uploads from starting, so the courier's new refusal during a
+job is not reachable from the rig. The update tests in `oxidrive_services.rs` pass on 39fe424.
+
 ## The temperature sensor
 
 LP_TSENS (0x5012F000, `esp32p4::periph::Tsens`) reads a fixed die temperature, 25 °C unless a
@@ -2543,6 +2598,22 @@ The save waited for a gap between bursts and the erase fitted in it. A car comma
 during it would have waited up to the rest of the 53 ms; this car's commands did not. The only
 other erase in the run is the bootloader's of `otadata` (0x2a000) 36 ms into the boot, before the
 car, in every run. 688 s wall.
+
+### An update with a boot's report unpublished
+
+`external_oxidrive_car_report_from_an_older_build_survives_the_update`: the car-report layout
+grew two counts after the first v1 layout (469 bytes), and a car that had not powered off since
+its last drive still held a 469-byte record for that drive. The older build
+(`OXIDRIVE_OLDER_REPORT_DIR`, `oxidrive-c4c538c`, which writes the first layout) boots, saves
+its boot's report and is not let publish it; the newer build (`OXIDRIVE_CAR_REPORT_DIR`) is
+written over its app at 0x30000, the rest of the flash and NVS kept, and the P4 loses power.
+
+| | eb81ae4 | the follow-up branch's head |
+| --- | --- | --- |
+| the newer build's boot | `car report: r1 unreadable (Length(466)); it will be replaced`, `0 kept` | `boot 2, 1 kept, 1 not yet published` |
+| `car_report/1` | never published | published 9.4 s into the new boot: `fw` 0.1.0-c4c538c, `seq` 1, the older counts as numbers, `connection_lost` and `no_session` null |
+
+`bin/car-report` prints `n/a` for the two. 80 s wall.
 
 ### A crash the first runs found
 
