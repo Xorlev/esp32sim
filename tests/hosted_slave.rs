@@ -77,7 +77,7 @@ pub fn known(first: &Slave) -> Vec<([u8; 32], u32, String)> {
 /// The app partitions' offsets, `ota_0` then `ota_1`, from the partition table at 0x8000.
 fn ota_slots(flash: &[u8]) -> [usize; 2] {
     let mut slots = [0x10000, 0x1f0000];
-    for e in flash.get(0x8000..0x8c00).unwrap_or(&[]).chunks_exact(32).take_while(|e| e[..2] == [0xaa, 0x50]) {
+    for e in flash.get(0x8000..0x8c00).unwrap_or(&[]).as_chunks::<32>().0.iter().take_while(|e| e[..2] == [0xaa, 0x50]) {
         if e[2] == 0x00 && (0x10..=0x11).contains(&e[3]) { slots[(e[3] - 0x10) as usize] = u32::from_le_bytes(e[4..8].try_into().unwrap()) as usize; }
     }
     slots

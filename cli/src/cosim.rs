@@ -86,8 +86,11 @@ pub struct Coproc {
     pub faults: FaultState,
     /// run after every reset, before the chip's first instruction: a test that installs a new
     /// image on the C6 points its stubs at the image the bootloader is about to load
-    pub on_reset: Option<Box<dyn FnMut(&mut C6Machine)>>,
+    pub on_reset: Option<ResetHook>,
 }
+
+/// What `Coproc::on_reset` runs.
+pub type ResetHook = Box<dyn FnMut(&mut C6Machine)>;
 
 impl Coproc {
     pub fn new(m: C6Machine) -> Self {
